@@ -31,19 +31,8 @@ export class ApiClient {
         ...(body != null ? { body: JSON.stringify(body) } : {}),
         signal: controller.signal,
       });
-      const text = await res.text();
-      let data;
-      try {
-        data = text ? JSON.parse(text) : {};
-      } catch (_) {
-        data = { message: text };
-      }
-      const okByCode = data.code === 0 || data.code === '0';
-      const okBySuccess = data.success === true;
-      if (!res.ok || (!okByCode && !okBySuccess)) {
-        const message = data.message || data.msg || data.error || text || '请求失败';
-        throw new Error(`HTTP ${res.status} ${method} ${url}: ${message}`);
-      }
+      const data = await res.json();
+      if (data.code !== 0) throw new Error(data.message || '请求失败');
       return data;
     } catch (e) {
       if (e && e.name === 'AbortError') {
@@ -57,9 +46,6 @@ export class ApiClient {
 
   getTestCase(id) { return this.request('GET', `/testcases/${id}?raw_values=1`); }
   saveSteps(id, steps) { return this.request('POST', `/testcases/${id}/steps`, { steps }); }
-  importRecording(payload) {
-    return this.request('POST', '/automation/automationUiScene/recordings/import', payload, { timeoutMs: 60000 });
-  }
   /**
    * 保存执行结果（30s 超时 + 1 次重试），避免大 payload 间歇性失败导致结果丢失。
    * 仅对超时和网络错误重试，业务错误（code !== 0）不重试。

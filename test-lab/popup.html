@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CueCast Popup</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 24px;
+      background: #f6f8fb;
+      color: #172033;
+      font: 14px/1.5 "Segoe UI", system-ui, sans-serif;
+    }
+    main {
+      display: grid;
+      gap: 14px;
+      max-width: 520px;
+    }
+    button {
+      width: fit-content;
+      min-height: 36px;
+      padding: 0 13px;
+      border: 1px solid #2457d6;
+      border-radius: 6px;
+      background: #2457d6;
+      color: #fff;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 800;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1 data-testid="popup-title">M5-B Popup</h1>
+    <strong data-testid="popup-status">Popup Ready</strong>
+    <button type="button" data-testid="popup-action">确认新窗口操作</button>
+  </main>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const name = params.get('name') || '';
+    if (name) {
+      document.title = `CueCast ${name} Popup`;
+      document.querySelector('[data-testid="popup-title"]').textContent = `${name} Popup`;
+      document.querySelector('[data-testid="popup-status"]').textContent = `${name} Ready`;
+    }
+    document.querySelector('[data-testid="popup-action"]').addEventListener('click', () => {
+      document.querySelector('[data-testid="popup-status"]').textContent = name ? `${name} Clicked` : 'Popup Clicked';
+    });
+  </script>
+</body>
+</html>

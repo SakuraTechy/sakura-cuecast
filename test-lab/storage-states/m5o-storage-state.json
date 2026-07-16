@@ -1,0 +1,14 @@
+{
+  "cookies": [],
+  "origins": [
+    {
+      "origin": "http://127.0.0.1:4207",
+      "localStorage": [
+        {
+          "name": "cuecast_storage_state",
+          "value": "m5o"
+        }
+      ]
+    }
+  ]
+}

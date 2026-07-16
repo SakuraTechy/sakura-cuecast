@@ -23,6 +23,22 @@ function trByLocale(locale, zh, en) {
   return normalizeLocale(locale) === 'en' ? (en || zh) : zh;
 }
 
+function formatPlatformDateTime(value = new Date()) {
+  const date = value instanceof Date ? value : new Date(value);
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day} ${values.hour}:${values.minute}:${values.second}`;
+}
+
 function localizePlaybackError(locale, message) {
   const msg = String(message || '');
   if (normalizeLocale(locale) !== 'en' || !msg) return msg;
@@ -132,12 +148,12 @@ async function readWindowBounds(windowId) {
 }
 
 async function resolveWindowPreference(input = {}) {
-  const mode = normalizeViewportMode(input.viewportMode || input.viewport_mode, 'maximized');
+  const mode = normalizeViewportMode(input.viewportMode ?? input.viewport_mode, 'maximized');
   if (mode === 'custom') {
     return {
       mode,
-      width: normalizeViewportDimension(input.viewportWidth || input.viewport_width, DEFAULT_VIEWPORT_WIDTH),
-      height: normalizeViewportDimension(input.viewportHeight || input.viewport_height, DEFAULT_VIEWPORT_HEIGHT),
+      width: normalizeViewportDimension(input.viewportWidth ?? input.viewport_width, DEFAULT_VIEWPORT_WIDTH),
+      height: normalizeViewportDimension(input.viewportHeight ?? input.viewport_height, DEFAULT_VIEWPORT_HEIGHT),
     };
   }
   if (mode === 'current') {
@@ -377,28 +393,57 @@ export class PlayerManager {
     let ctx = null;
     let playTabId = null;
 
+    const adminCaseKey = String(opts.adminCaseKey || '').trim();
+    const useAdminCase = Boolean(adminCaseKey) || String(opts.dataSource || '').trim().toLowerCase() === 'admin';
+    const sourceCaseKey = adminCaseKey || String(testCaseId || '').trim();
+    const runStartedAt = Date.now();
+    const safeCaseKey = sourceCaseKey.replace(/[^A-Za-z0-9._-]/g, '_') || 'case';
+    const runId = `${safeCaseKey}-${runStartedAt}`;
+    let playbackOutcome = null;
+    const executionSnapshot = {
+      project_environment_id: opts.projectEnvironmentId ?? '',
+      window_size_mode: opts.viewportMode ?? '',
+      viewport_width: opts.viewportWidth ?? null,
+      viewport_height: opts.viewportHeight ?? null,
+      page_error_check_enabled: opts.pageErrorCheckEnabled ?? null,
+    };
+
     try {
-      const res = await this.api.getTestCase(testCaseId);
+      const res = useAdminCase
+        ? await this.api.getAdminPlaywrightCase(sourceCaseKey, opts.projectEnvironmentId)
+        : await this.api.getTestCase(testCaseId);
       const testCase = res.data;
       const steps = testCase.steps || [];
       const windowPreference = await resolveWindowPreference({
-        viewportMode: opts.viewportMode || testCase.viewport_mode,
-        viewportWidth: opts.viewportWidth || testCase.viewport_width,
-        viewportHeight: opts.viewportHeight || testCase.viewport_height,
+        viewportMode: opts.viewportMode ?? testCase.window_size_mode ?? testCase.viewport_mode,
+        viewportWidth: opts.viewportWidth ?? testCase.viewport_width,
+        viewportHeight: opts.viewportHeight ?? testCase.viewport_height,
         sourceWindowId: opts.sourceWindowId,
       });
-      const pageErrorCheckEnabled = Number(testCase.page_error_check_enabled ?? 0) !== 0;
+      const pageErrorCheckEnabled = Number(opts.pageErrorCheckEnabled ?? testCase.page_error_check_enabled ?? 0) !== 0;
       const screenshotMode = String(testCase.screenshot_mode || '').trim().toLowerCase() === 'full_hd'
         ? 'full_hd'
         : 'standard';
+      Object.assign(executionSnapshot, {
+        project_environment_id: testCase.project_environment_id ?? opts.projectEnvironmentId ?? '',
+        project_environment_name: testCase.project_environment_name || '',
+        environment_origin: testCase.environment_origin || '',
+        effective_start_url: testCase.start_url || '',
+        window_size_mode: windowPreference.mode,
+        viewport_width: windowPreference.width ?? null,
+        viewport_height: windowPreference.height ?? null,
+        page_error_check_enabled: pageErrorCheckEnabled ? 1 : 0,
+      });
 
       if (!steps.length) {
-        return { ok: false, error: trByLocale(runLocale, '用例没有步骤', 'Case has no steps') };
+        playbackOutcome = { ok: false, error: trByLocale(runLocale, '用例没有步骤', 'Case has no steps') };
+        return playbackOutcome;
       }
 
       const startStepIndex = normalizeStartStepIndex(opts.startStepIndex, steps.length);
       if (startStepIndex < 0) {
-        return { ok: false, error: trByLocale(runLocale, '起始步骤超出用例步骤范围', 'Start step is outside the case step range') };
+        playbackOutcome = { ok: false, error: trByLocale(runLocale, '起始步骤超出用例步骤范围', 'Start step is outside the case step range') };
+        return playbackOutcome;
       }
       const stepStartUrl =
         startStepIndex > 0
@@ -407,10 +452,12 @@ export class PlayerManager {
       const targetUrl = resolvePlaybackStartUrl(startUrl || stepStartUrl, testCase);
 
       if (this.state.mode === 'recording') {
-        return { ok: false, error: trByLocale(runLocale, '正在录制，无法回放', 'Recording in progress, playback is unavailable') };
+        playbackOutcome = { ok: false, error: trByLocale(runLocale, '正在录制，无法回放', 'Recording in progress, playback is unavailable') };
+        return playbackOutcome;
       }
       if (this._playContexts.size >= MAX_CONCURRENT_PLAYS) {
-        return { ok: false, error: trByLocale(runLocale, '并发回放已达上限（5）', 'Concurrent playback limit reached (5)') };
+        playbackOutcome = { ok: false, error: trByLocale(runLocale, '并发回放已达上限（5）', 'Concurrent playback limit reached (5)') };
+        return playbackOutcome;
       }
 
       ctx = {
@@ -469,6 +516,10 @@ export class PlayerManager {
       }
 
       let cdpAvailable = await this._attachDebugger(playTabId, ctx);
+      if (useAdminCase && !cdpAvailable) {
+        // admin 入口定义为扩展 CDP 回放，不能静默降级 DOM 后仍报告成功；旧本地 mock 路径继续保留降级能力。
+        throw new Error(`admin 扩展 CDP 无法附加到回放标签页：${ctx.cdpAttachError || '未知错误'}`);
+      }
 
       try {
         await chrome.scripting.executeScript({
@@ -501,11 +552,27 @@ export class PlayerManager {
       let failureContext = null;
       const playbackScreenshots = new Array(steps.length).fill('');
       const aiSubtasksByStep = {};
+      const stepResults = [];
+      const appendStepResult = (step, index, status, startedAt, error = '') => {
+        stepResults.push({
+          step_id: step?.id ?? '',
+          step_index: index,
+          action_type: String(step?.action_type || '').trim().toLowerCase(),
+          description: step?.description || '',
+          target_selector: step?.target_selector || '',
+          target_xpath: step?.target_xpath || '',
+          status,
+          duration_ms: Math.max(0, Date.now() - startedAt),
+          ...(error ? { error } : {}),
+        });
+      };
 
       for (let i = startStepIndex; i < steps.length; i++) {
+        const stepStartedAt = Date.now();
         if (ctx.stopped) {
           errorMsg = trByLocale(ctx.locale, '用户手动停止', 'Stopped by user');
           errorStep = i;
+          appendStepResult(steps[i], i, 'skipped', stepStartedAt, errorMsg);
           break;
         }
 
@@ -568,7 +635,7 @@ export class PlayerManager {
                 beforeActionScreenshot: captureCurrentStep,
               });
             } catch (cdpErr) {
-              if (PlayerManager._isCdpForeignExtensionError(cdpErr)) {
+              if (PlayerManager._isCdpForeignExtensionError(cdpErr) && !useAdminCase) {
                 await this._detachDebugger(playTabId, ctx);
                 cdpAvailable = false;
                 await this._executeStepDOM(playTabId, executableStep, ctx.locale, runtimeNextStep);
@@ -585,6 +652,7 @@ export class PlayerManager {
           if (['click', 'navigate', 'ai_natural'].includes(String(executableStep.action_type || '').trim().toLowerCase())) {
             await this._waitForTabLoad(playTabId);
           }
+          appendStepResult(runtimeStep, i, 'passed', stepStartedAt);
         } catch (err) {
           const rawErrMsg = err && err.message ? err.message : String(err);
           errorMsg = localizePlaybackError(ctx.locale, rawErrMsg);
@@ -607,30 +675,95 @@ export class PlayerManager {
           } else {
             failureContext = { error_message: errorMsg, error_step_index: i, url: targetUrl, cdp_unavailable: true };
           }
+          appendStepResult(runtimeStep, i, 'failed', stepStartedAt, errorMsg);
           break;
         }
       }
 
+      // 未开始的步骤也要落库，平台才能区分“失败”与“未执行”。
+      const stepResultIndexes = new Set(stepResults.map((item) => item.step_index));
+      for (let i = 0; i < steps.length; i++) {
+        if (!stepResultIndexes.has(i)) {
+          appendStepResult(
+            steps[i],
+            i,
+            'skipped',
+            Date.now(),
+            i < startStepIndex ? 'Skipped before start step' : 'Skipped after playback stopped',
+          );
+        }
+      }
+      stepResults.sort((a, b) => a.step_index - b.step_index);
+
       const duration = Date.now() - startTime;
       const success = !errorMsg;
-      const executedStepIndexes = [];
-      for (let i = startStepIndex; i < steps.length; i++) executedStepIndexes.push(i);
+      playbackOutcome = { ok: success, duration, error: errorMsg || '' };
+      const executedStepIndexes = stepResults
+        .filter((item) => item.status !== 'skipped')
+        .map((item) => item.step_index);
+      const stepPass = stepResults.filter((item) => item.status === 'passed').length;
+      const stepFail = stepResults.filter((item) => item.status === 'failed').length;
+      const stepSkip = stepResults.filter((item) => item.status === 'skipped').length;
+      const caseResult = {
+        case_key: sourceCaseKey,
+        case_id: testCase.case_id || testCase.caseId || testCaseId,
+        case_name: testCase.name || '',
+        status: success ? 'passed' : 'failed',
+        duration_ms: duration,
+        step_total: stepResults.length,
+        step_pass: stepPass,
+        step_fail: stepFail,
+        step_skip: stepSkip,
+        steps: stepResults,
+      };
 
-      await this.api.saveResult(testCaseId, {
-        status: success ? 'success' : 'failed',
-        duration,
-        error_message: errorMsg || '',
-        error_step: errorStep,
-        detail: {
-          steps: steps.length,
-          start_step_index: startStepIndex,
-          executed_step_indexes: executedStepIndexes,
-          cdp_mode: cdpAvailable,
-          playback_screenshots: playbackScreenshots,
-          ai_subtasks_by_step: aiSubtasksByStep,
-          ...(failureContext ? { failure_context: failureContext } : {}),
-        },
-      });
+      const resultDetail = {
+        steps: steps.length,
+        start_step_index: startStepIndex,
+        executed_step_indexes: executedStepIndexes,
+        cdp_mode: cdpAvailable,
+        ...(ctx.cdpAttachError ? { cdp_attach_error: ctx.cdpAttachError } : {}),
+        // admin debugRecord 不直接写入截图 base64，避免结果 JSON 膨胀；截图数量仍用于诊断。
+        ...(useAdminCase
+          ? { playback_screenshot_count: playbackScreenshots.filter(Boolean).length }
+          : { playback_screenshots: playbackScreenshots }),
+        step_results: stepResults,
+        ai_subtasks_by_step: aiSubtasksByStep,
+        ...(failureContext ? { failure_context: failureContext } : {}),
+      };
+      if (useAdminCase) {
+        await this.api.saveAdminPlaywrightResult(sourceCaseKey, {
+          status: success ? 'passed' : 'failed',
+          success,
+          duration_ms: duration,
+          error: errorMsg || '',
+          // 保留 extension-cdp 执行器和原始诊断，admin 只负责存储/展示结果。
+          raw: {
+            executor: 'extension-cdp',
+            run_id: runId,
+            started_at: formatPlatformDateTime(runStartedAt),
+            finished_at: formatPlatformDateTime(),
+            case_key: sourceCaseKey,
+            case_id: testCaseId,
+            status: success ? 'passed' : 'failed',
+            success,
+            duration_ms: duration,
+            failed_step_index: errorStep,
+            error: errorMsg || '',
+            case_result: caseResult,
+            detail: resultDetail,
+            execution_config: executionSnapshot,
+          },
+        });
+      } else {
+        await this.api.saveResult(testCaseId, {
+          status: success ? 'success' : 'failed',
+          duration,
+          error_message: errorMsg || '',
+          error_step: errorStep,
+          detail: resultDetail,
+        });
+      }
 
       this._notifyPopup(
         success
@@ -646,20 +779,49 @@ export class PlayerManager {
           : trByLocale(ctx.locale, `#${testCaseId} 第 ${(errorStep ?? 0) + 1} 步: ${errorMsg}`, `#${testCaseId} Step ${(errorStep ?? 0) + 1}: ${errorMsg}`),
       );
 
-      return { ok: success, duration, error: errorMsg };
+      return playbackOutcome;
     } catch (err) {
       const rawMsg = err && err.message ? err.message : String(err);
       const msg = localizePlaybackError(ctx?.locale ?? runLocale, rawMsg);
+      playbackOutcome = { ok: false, error: msg };
+      // admin 读取、起始页或 CDP attach 在执行循环前失败时，也必须回传失败结果，避免中台一直显示旧状态。
+      if (useAdminCase && sourceCaseKey) {
+        const finishedAt = Date.now();
+        await this.api.saveAdminPlaywrightResult(sourceCaseKey, {
+          status: 'failed',
+          success: false,
+          duration_ms: finishedAt - runStartedAt,
+          error: msg,
+          raw: {
+            executor: 'extension-cdp',
+            run_id: runId,
+            started_at: formatPlatformDateTime(runStartedAt),
+            finished_at: formatPlatformDateTime(finishedAt),
+            case_key: sourceCaseKey,
+            case_id: testCaseId,
+            status: 'failed',
+            success: false,
+            startup_failure: true,
+            error: msg,
+            execution_config: executionSnapshot,
+          },
+        }).catch(() => {});
+      }
       if (msg && !rawMsg.includes('用户手动停止') && !msg.includes('Stopped by user')) {
         this._showNotification(
           trByLocale(ctx?.locale ?? runLocale, '回放无法启动或异常退出', 'Playback failed to start or exited abnormally'),
           msg.length > 180 ? `${msg.slice(0, 180)}…` : msg,
         );
       }
-      return { ok: false, error: msg };
+      return playbackOutcome;
     } finally {
       // 须始终广播 END（含拉取用例失败、无步骤等），否则中台顺序回放会一直等不到结束事件
-      this._broadcastPlayback({ type: 'AT_PLAYBACK_END', testCaseId });
+      this._broadcastPlayback({
+        type: 'AT_PLAYBACK_END',
+        testCaseId,
+        ...(useAdminCase ? { adminCaseKey: sourceCaseKey, executor: 'extension-cdp', runId } : {}),
+        ...(playbackOutcome || { ok: false, error: 'Playback ended without a result' }),
+      });
       if (ctx != null) {
         if (ctx.liveBroadcast) {
           this._playTabByCaseId.delete(ctx.testCaseId);
@@ -707,7 +869,8 @@ export class PlayerManager {
       ctx.debuggerAttached = true;
       return true;
     } catch (e) {
-      console.warn('[Player] CDP attach 失败，降级为 DOM 模式:', e.message);
+      ctx.cdpAttachError = e?.message || String(e);
+      console.warn('[Player] CDP attach 失败，降级为 DOM 模式:', ctx.cdpAttachError);
       ctx.debuggerAttached = false;
       return false;
     }

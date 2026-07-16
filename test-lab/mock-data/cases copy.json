@@ -1,0 +1,3880 @@
+{
+  "cases": {
+    "278": {
+      "id": 278,
+      "name": "测试",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "本地复刻 app.icuecast.com/testcases/278 的用例详情、录制和执行入口。",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.194Z",
+      "updated_at": "2026-07-06T13:40:33.600Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "click",
+          "target_selector": "#username",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "点击用户名输入框",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "input",
+          "target_selector": "#password",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "cuecast",
+          "value_masked": 1,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "输入密码到 password",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 3,
+          "action_type": "click",
+          "target_selector": "[data-testid=\"submit-login\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "提交表单",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 4,
+          "action_type": "assert_text",
+          "target_selector": "#statusText",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Submitted",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "断言提交状态",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "279": {
+      "id": 279,
+      "name": "M2 locator enhancement mock",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "M2 mock case for table context, overlay scoping, and custom select input.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.320Z",
+      "updated_at": "2026-07-06T13:40:34.789Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "click",
+          "target_selector": "button",
+          "target_xpath": "",
+          "locator_meta": {
+            "version": 1,
+            "candidates": [
+              {
+                "type": "table_cell_css",
+                "value": "button",
+                "score": 0.98
+              },
+              {
+                "type": "text_exact",
+                "value": "Run",
+                "score": 0.4
+              }
+            ],
+            "context": {
+              "table": {
+                "framework": "table",
+                "wrapper_index": 0,
+                "row_index": 1,
+                "col_index": 3,
+                "row_text": "Beta mapping Lin"
+              }
+            }
+          },
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Click Beta row Run button via table context",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "assert_text",
+          "target_selector": "#statusText",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Ran Beta mapping",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert table context click result",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 3,
+          "action_type": "click",
+          "target_selector": "[data-testid=\"open-m2-dialog\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Open M2 dialog",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 4,
+          "action_type": "click",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": {
+            "version": 1,
+            "candidates": [
+              {
+                "type": "text_exact",
+                "value": "Confirm",
+                "score": 0.95
+              }
+            ],
+            "context": {
+              "overlay": true
+            }
+          },
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Click Confirm inside overlay",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 5,
+          "action_type": "assert_text",
+          "target_selector": "#statusText",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "M2 Dialog Confirmed",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert overlay scoped click result",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 6,
+          "action_type": "input",
+          "target_selector": "[data-testid=\"m2-custom-select\"]",
+          "target_xpath": "",
+          "locator_meta": {
+            "version": 1,
+            "candidates": [
+              {
+                "type": "css_attr_data-testid",
+                "value": "[data-testid=\"m2-custom-select\"]",
+                "score": 0.99
+              }
+            ],
+            "context": {
+              "control_kind": "custom-select"
+            }
+          },
+          "value": "Enterprise",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Select custom Ant style option",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 7,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"json-payload\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Enterprise",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert custom select value",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "280": {
+      "id": 280,
+      "name": "M2 ambiguous locator mock",
+      "status": "failed",
+      "start_url": "http://127.0.0.1:4176/test-lab/target.html",
+      "description": "M2 mock case that should fail with LOCATOR_AMBIGUOUS.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-04T09:57:44.173Z",
+      "updated_at": "2026-07-04T09:58:04.560Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "click",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": {
+            "version": 1,
+            "candidates": [
+              {
+                "type": "text_exact",
+                "value": "Run",
+                "score": 0.9
+              }
+            ],
+            "context": {}
+          },
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4176/test-lab/target.html",
+          "description": "Ambiguous Run button should fail",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "281": {
+      "id": 281,
+      "name": "M5 advanced capability mock",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "M5 mock case for iframe locator context, file upload, download assertion, and JSON/API assertion.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.327Z",
+      "updated_at": "2026-07-06T13:40:37.306Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "click",
+          "target_selector": "[data-testid=\"iframe-run\"]",
+          "target_xpath": "",
+          "locator_meta": {
+            "version": 1,
+            "candidates": [
+              {
+                "type": "css_attr_data-testid",
+                "value": "[data-testid=\"iframe-run\"]",
+                "score": 0.99
+              }
+            ],
+            "context": {
+              "frame": {
+                "selector": "[data-testid=\"m5-iframe\"]"
+              }
+            }
+          },
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Click button inside iframe",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"iframe-status\"]",
+          "target_xpath": "",
+          "locator_meta": {
+            "version": 1,
+            "candidates": [
+              {
+                "type": "css_attr_data-testid",
+                "value": "[data-testid=\"iframe-status\"]",
+                "score": 0.99
+              }
+            ],
+            "context": {
+              "frame": {
+                "selector": "[data-testid=\"m5-iframe\"]"
+              }
+            }
+          },
+          "value": "Iframe Clicked",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert iframe status",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 3,
+          "action_type": "file_upload",
+          "target_selector": "[data-testid=\"m5-file-input\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "test-lab/upload-fixtures/m5-upload.txt",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Upload fixture file",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 4,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5-upload-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "m5-upload.txt",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert uploaded filename",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 5,
+          "action_type": "assert_download",
+          "target_selector": "[data-testid=\"m5-download\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"filename\":\"m5-sample.txt\",\"contains\":\"CueCast M5 download fixture\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert download file",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 6,
+          "action_type": "assert_json",
+          "target_selector": "[data-testid=\"json-payload\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"caseId\":278,\"status\":\"ready\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert page JSON subset",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 7,
+          "action_type": "assert_json",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"path\":\"/m5/status\",\"expected\":{\"code\":0,\"data\":{\"stage\":\"M5\",\"ready\":true}}}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert API JSON subset",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "282": {
+      "id": 282,
+      "name": "M5-B advanced capability mock",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "M5-B mock case for Monaco-like editor input, tree semantic locator, and popup page switching.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.333Z",
+      "updated_at": "2026-07-06T13:40:38.648Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "input",
+          "target_selector": "[data-testid=\"m5b-monaco\"]",
+          "target_xpath": "",
+          "locator_meta": {
+            "version": 1,
+            "candidates": [
+              {
+                "type": "css_attr_data-testid",
+                "value": "[data-testid=\"m5b-monaco\"]",
+                "score": 0.99
+              }
+            ],
+            "context": {
+              "control_kind": "monaco"
+            }
+          },
+          "value": "const stage = \"M5-B\";",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Input Monaco-like editor",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5b-editor-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "M5-B",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert editor input status",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 3,
+          "action_type": "click",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": {
+            "version": 1,
+            "candidates": [
+              {
+                "type": "tree_item_text",
+                "value": "Settings",
+                "score": 0.99
+              }
+            ],
+            "context": {
+              "tree": {
+                "selector": "[data-testid=\"m5b-tree\"]",
+                "item_selector": "[data-tree-node=\"true\"]"
+              }
+            }
+          },
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Click Settings tree node semantically",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 4,
+          "action_type": "assert_text",
+          "target_selector": "#statusText",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Tree Selected Settings",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert tree click result",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 5,
+          "action_type": "click_open_page",
+          "target_selector": "[data-testid=\"m5b-open-popup\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Open popup page and switch active page",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 6,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"popup-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Popup Ready",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert popup page status",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 7,
+          "action_type": "click",
+          "target_selector": "[data-testid=\"popup-action\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Click popup action",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 8,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"popup-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Popup Clicked",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert popup action result",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "283": {
+      "id": 283,
+      "name": "M5-C export and network mock",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "M5-C mock case for network mock and API JSON assertion with POST body.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.338Z",
+      "updated_at": "2026-07-06T13:40:39.877Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "network_mock",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"url\":\"**/api/m5c/profile\",\"status\":200,\"json\":{\"name\":\"Mocked Ada\",\"tier\":\"Pro\"}}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Mock profile API response",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "click",
+          "target_selector": "[data-testid=\"m5c-fetch-profile\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Fetch mocked profile",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 3,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5c-network-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Mocked Ada Pro",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert mocked profile rendered",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 4,
+          "action_type": "assert_json",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"path\":\"/m5c/echo\",\"method\":\"POST\",\"json\":{\"requestId\":\"m5c\",\"enabled\":true},\"expected\":{\"code\":0,\"data\":{\"requestId\":\"m5c\",\"enabled\":true}}}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert POST API JSON subset",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "284": {
+      "id": 284,
+      "name": "M5-F request assertion mock",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "M5-F mock case for asserting outbound request URL, method, and body.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.342Z",
+      "updated_at": "2026-07-06T13:40:40.733Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "assert_request",
+          "target_selector": "[data-testid=\"m5f-send-audit\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"url\":\"**/api/m5f/audit\",\"method\":\"POST\",\"postDataContains\":\"audit-m5f\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert audit POST request while clicking send button",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5f-request-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Audit accepted audit-m5f",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert request response rendered",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "285": {
+      "id": 285,
+      "name": "M5-G network delay and request count mock",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "M5-G mock case for delayed network mock and request count assertion.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.346Z",
+      "updated_at": "2026-07-06T13:40:42.951Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "network_mock",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"url\":\"**/api/m5g/delayed\",\"status\":200,\"delayMs\":120,\"json\":{\"message\":\"Delayed Mock\"}}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Mock delayed API response",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "click",
+          "target_selector": "[data-testid=\"m5g-fetch-delayed\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Fetch delayed mocked API",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 3,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5g-delay-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Delayed Mock",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert delayed mock response",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 4,
+          "action_type": "click",
+          "target_selector": "[data-testid=\"m5g-send-pings\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Send two ping requests",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 5,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5g-ping-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Pings sent 2",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert pings completed",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 6,
+          "action_type": "assert_request_count",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"url\":\"**/api/m5g/ping\",\"method\":\"POST\",\"postDataContains\":\"ping-m5g\",\"count\":2}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert exactly two ping POST requests",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "286": {
+      "id": 286,
+      "name": "M5-H response assertion and abort mock",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "M5-H mock case for response body assertion and network abort failure injection.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.351Z",
+      "updated_at": "2026-07-06T13:40:43.679Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "assert_response",
+          "target_selector": "[data-testid=\"m5h-fetch-health\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"url\":\"**/api/m5h/health\",\"method\":\"GET\",\"status\":200,\"json\":{\"code\":0,\"data\":{\"stage\":\"M5-H\",\"healthy\":true}}}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert health response JSON while clicking fetch button",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5h-health-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "M5-H healthy",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert health response rendered",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 3,
+          "action_type": "network_mock",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"url\":\"**/api/m5h/fail\",\"abort\":\"failed\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Abort failure API request",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 4,
+          "action_type": "click",
+          "target_selector": "[data-testid=\"m5h-fetch-fail\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Trigger aborted API request",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 5,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5h-fail-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Abort handled",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert aborted request handled by page",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "287": {
+      "id": 287,
+      "name": "M5-I response snapshot mock",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "M5-I mock case for saving response body and metadata snapshots.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.356Z",
+      "updated_at": "2026-07-06T13:40:45.038Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "assert_response",
+          "target_selector": "[data-testid=\"m5i-fetch-profile\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"url\":\"**/api/m5i/profile\",\"method\":\"GET\",\"status\":200,\"json\":{\"code\":0,\"data\":{\"stage\":\"M5-I\",\"name\":\"Snapshot Ada\"}},\"snapshot\":true,\"snapshotName\":\"m5i-profile\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert profile response and save snapshot",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5i-profile-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Snapshot Ada M5-I",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert snapshot response rendered",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "288": {
+      "id": 288,
+      "name": "M5-J response baseline mock",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "M5-J mock case for comparing response body against a baseline file.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.360Z",
+      "updated_at": "2026-07-06T13:40:45.803Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "assert_response",
+          "target_selector": "[data-testid=\"m5j-fetch-profile\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"url\":\"**/api/m5j/profile\",\"method\":\"GET\",\"status\":200,\"baselinePath\":\"test-lab/response-baselines/m5j-profile.json\",\"baselineMode\":\"exact\",\"snapshot\":true,\"snapshotName\":\"m5j-profile\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert profile response matches baseline and save snapshot",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5j-profile-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Baseline Ada M5-J",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert baseline response rendered",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "289": {
+      "id": 289,
+      "name": "M5-K network replay mock",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "M5-K mock case for replaying multiple network responses from a fixture file.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.367Z",
+      "updated_at": "2026-07-06T13:40:47.550Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "network_replay",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"path\":\"test-lab/network-fixtures/m5k-replay.json\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Register network replay fixture",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "click",
+          "target_selector": "[data-testid=\"m5k-fetch-replay\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Fetch replayed profile and settings",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 3,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5k-replay-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Replay Ada Replay Enabled",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert replayed responses rendered",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 4,
+          "action_type": "assert_request_count",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"url\":\"**/api/m5k/*\",\"method\":\"GET\",\"count\":2}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert both replayed requests were sent",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "290": {
+      "id": 290,
+      "name": "M5-L advanced upload and download mock",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "M5-L mock case for multi-file upload and advanced download assertions.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.372Z",
+      "updated_at": "2026-07-06T13:40:49.569Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "file_upload",
+          "target_selector": "[data-testid=\"m5-file-input\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"files\":[\"test-lab/upload-fixtures/m5-upload.txt\",\"test-lab/upload-fixtures/m5-upload-extra.txt\"]}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Upload two fixture files",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5-upload-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Uploaded 2 files: m5-upload.txt, m5-upload-extra.txt",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert multi-file upload status",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 3,
+          "action_type": "assert_download",
+          "target_selector": "[data-testid=\"m5-advanced-download\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"filename\":\"m5-advanced.txt\",\"contains\":\"M5-L advanced download fixture\",\"mime\":\"text/plain\",\"minBytes\":80,\"sha256\":\"ff4e7777939bfad25b12ea6b64ed5bbcab2e1bd7e87fe834a980efc18f593e36\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert advanced download metadata and hash",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "291": {
+      "id": 291,
+      "name": "M5-N multi-window switching mock",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "M5-N mock case for switching between main and popup pages, then closing popup and returning to main page.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.375Z",
+      "updated_at": "2026-07-06T13:40:51.472Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "click_open_page",
+          "target_selector": "[data-testid=\"m5b-open-popup\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Open popup page and switch active page",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"popup-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Popup Ready",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert popup page is active",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 3,
+          "action_type": "switch_page",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"target\":\"main\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Switch back to main page",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 4,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5b-editor-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Editor Empty",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert main page is active again",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 5,
+          "action_type": "switch_page",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"urlContains\":\"popup.html\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Switch to popup by URL substring",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 6,
+          "action_type": "click",
+          "target_selector": "[data-testid=\"popup-action\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Click popup action after explicit switch",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 7,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"popup-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Popup Clicked",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert popup action result",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 8,
+          "action_type": "close_page",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"target\":\"current\",\"fallback\":\"main\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Close popup and return to main page",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 9,
+          "action_type": "assert_text",
+          "target_selector": "#statusText",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Ready",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert main page remains active after popup close",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "292": {
+      "id": 292,
+      "name": "M5-O multi-popup disambiguation mock",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "M5-O mock case for opening two popups and selecting the intended page by title and URL.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.381Z",
+      "updated_at": "2026-07-06T13:40:54.407Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "click_open_page",
+          "target_selector": "[data-testid=\"m5o-open-alpha-popup\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Open Alpha popup",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "switch_page",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"target\":\"main\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Return to main page before opening another popup",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 3,
+          "action_type": "click_open_page",
+          "target_selector": "[data-testid=\"m5o-open-beta-popup\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Open Beta popup",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 4,
+          "action_type": "switch_page",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"titleContains\":\"Alpha Popup\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Switch to Alpha popup by title",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 5,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"popup-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Alpha Ready",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert Alpha popup selected",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 6,
+          "action_type": "switch_page",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"urlContains\":\"name=Beta\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Switch to Beta popup by URL",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 7,
+          "action_type": "click",
+          "target_selector": "[data-testid=\"popup-action\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Click Beta popup action",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 8,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"popup-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Beta Clicked",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert Beta popup action",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 9,
+          "action_type": "close_page",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"urlContains\":\"name=Beta\",\"fallback\":{\"titleContains\":\"Alpha Popup\"}}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Close Beta and fallback to Alpha",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 10,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"popup-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Alpha Ready",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert Alpha remains active after Beta close",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 11,
+          "action_type": "close_page",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"target\":\"current\",\"fallback\":\"main\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Close Alpha and return to main",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 12,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5o-window-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Beta Requested",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert main page active after closing popups",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "293": {
+      "id": 293,
+      "name": "M5-O advanced tree mock",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "M5-O mock case for expandable tree and checkbox tree item selection.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.385Z",
+      "updated_at": "2026-07-06T13:40:53.716Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "click",
+          "target_selector": "[data-testid=\"m5o-expand-tree\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Expand advanced tree nodes",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "click",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": {
+            "candidates": [
+              {
+                "type": "tree_item_text",
+                "value": "Ops Alerts",
+                "score": 0.99
+              }
+            ],
+            "context": {
+              "tree": {
+                "selector": "[data-testid=\"m5o-tree\"]",
+                "item_selector": "[data-tree-node=\"true\"]"
+              }
+            }
+          },
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Click Ops Alerts checkbox tree node semantically",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 3,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5o-tree-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Tree Checked Ops Alerts",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert checkbox tree node changed state",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "294": {
+      "id": 294,
+      "name": "M5-O Monaco shortcut mock",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "M5-O mock case for multiline Monaco-like input and keyboard shortcut handling.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.389Z",
+      "updated_at": "2026-07-06T13:40:56.031Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "input",
+          "target_selector": "[data-testid=\"m5o-monaco\"]",
+          "target_xpath": "",
+          "locator_meta": {
+            "candidates": [
+              {
+                "type": "css_attr_data-testid",
+                "value": "[data-testid=\"m5o-monaco\"]",
+                "score": 0.99
+              }
+            ],
+            "context": {
+              "control_kind": "monaco"
+            }
+          },
+          "value": "function run() {\n  return \"M5-O\";\n}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Input multiline editor content",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "key",
+          "target_selector": "",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Control+S",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Trigger save shortcut in editor",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 3,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5o-editor-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Saved",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert editor shortcut feedback",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "295": {
+      "id": 295,
+      "name": "M5-O hidden upload and binary download mock",
+      "status": "passed",
+      "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+      "description": "M5-O mock case for proxy hidden file input and binary download metadata assertion.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:40:30.393Z",
+      "updated_at": "2026-07-06T13:40:58.401Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "file_upload",
+          "target_selector": "[data-testid=\"m5o-upload-proxy\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"files\":[\"test-lab/upload-fixtures/m5-upload.txt\"],\"inputSelector\":\"[data-testid=\\\"m5o-hidden-upload-input\\\"]\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Upload through hidden input proxy button",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "assert_text",
+          "target_selector": "[data-testid=\"m5o-upload-status\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Proxy Uploaded m5-upload.txt",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert proxy upload status",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 3,
+          "action_type": "assert_download",
+          "target_selector": "[data-testid=\"m5o-binary-download\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{\"filename\":\"m5o-binary.bin\",\"mime\":\"application/octet-stream\",\"minBytes\":70,\"maxBytes\":90,\"sha256\":\"805b36dafcef1f12e4c8ca3e9b6b5eb1673e7eaca5047509f6103d202d05f60b\"}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4206/test-lab/target.html",
+          "description": "Assert binary download metadata and hash",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
+    "296": {
+      "id": 296,
+      "name": "M5-O export e2e smoke mock",
+      "status": "not_run",
+      "start_url": "http://127.0.0.1:4207/test-lab/target.html",
+      "description": "M5-O mock case used to execute exported Playwright script end to end.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 1,
+      "created_at": "2026-07-06T13:46:26.754Z",
+      "updated_at": "2026-07-06T13:46:26.755Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "input",
+          "target_selector": "[data-testid=\"username\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "export-smoke",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4207/test-lab/target.html",
+          "description": "Input username for export e2e smoke",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "click",
+          "target_selector": "[data-testid=\"submit-login\"]",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4207/test-lab/target.html",
+          "description": "Submit form in export e2e smoke",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 3,
+          "action_type": "assert_text",
+          "target_selector": "#statusText",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "Submitted",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4207/test-lab/target.html",
+          "description": "Assert export e2e smoke result",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    }
+  },
+  "results": {
+    "278": [
+      {
+        "id": 1783345233600,
+        "test_case_id": 278,
+        "status": "passed",
+        "success": true,
+        "duration": 2495,
+        "error": "",
+        "created_at": "2026-07-06T13:40:33.600Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 2495,
+          "error": "",
+          "raw": {
+            "case_id": 278,
+            "run_id": "278-20260706-214031",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:31.113Z",
+            "finished_at": "2026-07-06T13:40:33.608Z",
+            "duration_ms": 2495,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 385,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "input",
+                "status": "passed",
+                "duration_ms": 333,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 2,
+                "step_id": 3,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 297,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 3,
+                "step_id": 4,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 289,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\278-20260706-214031",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\278-20260706-214031\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\278-20260706-214031\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\278-20260706-214031\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\278-20260706-214031\\report.html"
+            },
+            "raw": {
+              "case_name": "测试",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 0
+            }
+          }
+        }
+      }
+    ],
+    "279": [
+      {
+        "id": 1783345234789,
+        "test_case_id": 279,
+        "status": "passed",
+        "success": true,
+        "duration": 3661,
+        "error": "",
+        "created_at": "2026-07-06T13:40:34.789Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 3661,
+          "error": "",
+          "raw": {
+            "case_id": 279,
+            "run_id": "279-20260706-214031",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:31.132Z",
+            "finished_at": "2026-07-06T13:40:34.793Z",
+            "duration_ms": 3661,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 436,
+                "locator_source": "table:locator_meta.candidates[0]",
+                "locator_type": "table_cell_css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 269,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 2,
+                "step_id": 3,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 296,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 3,
+                "step_id": 4,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 352,
+                "locator_source": "overlay:locator_meta.candidates[0]",
+                "locator_type": "text_exact",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 4,
+                "step_id": 5,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 269,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 5,
+                "step_id": 6,
+                "action_type": "input",
+                "status": "passed",
+                "duration_ms": 515,
+                "locator_source": "locator_meta.candidates[0]",
+                "locator_type": "css_attr_data-testid",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 6,
+                "step_id": 7,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 282,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\279-20260706-214031",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\279-20260706-214031\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\279-20260706-214031\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\279-20260706-214031\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\279-20260706-214031\\report.html"
+            },
+            "raw": {
+              "case_name": "M2 locator enhancement mock",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 0
+            }
+          }
+        }
+      }
+    ],
+    "280": [
+      {
+        "id": 1783159084560,
+        "test_case_id": 280,
+        "status": "failed",
+        "success": false,
+        "duration": 723,
+        "error": "Locator resolved to multiple visible elements",
+        "created_at": "2026-07-04T09:58:04.560Z",
+        "raw": {
+          "status": "failed",
+          "success": false,
+          "duration_ms": 723,
+          "error": "Locator resolved to multiple visible elements",
+          "raw": {
+            "case_id": 280,
+            "run_id": "280-20260704-175803",
+            "executor": "playwright-runner",
+            "status": "failed",
+            "success": false,
+            "started_at": "2026-07-04T09:58:03.835Z",
+            "finished_at": "2026-07-04T09:58:04.558Z",
+            "duration_ms": 723,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": 0,
+            "error": "Locator resolved to multiple visible elements",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "click",
+                "status": "failed",
+                "duration_ms": 72,
+                "error": "Locator resolved to multiple visible elements",
+                "error_code": "LOCATOR_AMBIGUOUS",
+                "locator_source": "locator_meta.candidates[0]",
+                "locator_type": "text_exact",
+                "details": {
+                  "source": "locator_meta.candidates[0]",
+                  "locatorType": "text_exact",
+                  "locatorValue": "Run",
+                  "matchedCount": 3,
+                  "visibleCount": 3,
+                  "candidates": [
+                    {
+                      "index": 0,
+                      "text": "Run",
+                      "visible": true
+                    },
+                    {
+                      "index": 1,
+                      "text": "Run",
+                      "visible": true
+                    },
+                    {
+                      "index": 2,
+                      "text": "Run",
+                      "visible": true
+                    }
+                  ]
+                }
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\280-20260704-175803",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\280-20260704-175803\\result.json",
+              "screenshots": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\280-20260704-175803\\screenshots\\failure.png"
+              ],
+              "videos": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\280-20260704-175803\\page@88c0e9ae683af2a3cc9236bcbaa4c1e6.webm"
+              ],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\280-20260704-175803\\logs\\console.json"
+              ],
+              "dom_snapshots": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\280-20260704-175803\\dom\\failure-text.txt"
+              ],
+              "failure_screenshot": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\280-20260704-175803\\screenshots\\failure.png",
+              "failure_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\280-20260704-175803\\failure.html",
+              "failure_text": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\280-20260704-175803\\dom\\failure-text.txt",
+              "trace": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\280-20260704-175803\\trace.zip",
+              "video": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\280-20260704-175803\\page@88c0e9ae683af2a3cc9236bcbaa4c1e6.webm",
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\280-20260704-175803\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\280-20260704-175803\\report.html"
+            },
+            "raw": {
+              "case_name": "M2 ambiguous locator mock",
+              "start_url": "http://127.0.0.1:4176/test-lab/target.html",
+              "console_event_count": 0
+            },
+            "error_code": "LOCATOR_AMBIGUOUS",
+            "error_details": {
+              "source": "locator_meta.candidates[0]",
+              "locatorType": "text_exact",
+              "locatorValue": "Run",
+              "matchedCount": 3,
+              "visibleCount": 3,
+              "candidates": [
+                {
+                  "index": 0,
+                  "text": "Run",
+                  "visible": true
+                },
+                {
+                  "index": 1,
+                  "text": "Run",
+                  "visible": true
+                },
+                {
+                  "index": 2,
+                  "text": "Run",
+                  "visible": true
+                }
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "281": [
+      {
+        "id": 1783345237306,
+        "test_case_id": 281,
+        "status": "passed",
+        "success": true,
+        "duration": 3086,
+        "error": "",
+        "created_at": "2026-07-06T13:40:37.306Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 3086,
+          "error": "",
+          "raw": {
+            "case_id": 281,
+            "run_id": "281-20260706-214034",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:34.228Z",
+            "finished_at": "2026-07-06T13:40:37.314Z",
+            "duration_ms": 3086,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 389,
+                "locator_source": "frame:locator_meta.candidates[0]",
+                "locator_type": "css_attr_data-testid",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 290,
+                "locator_source": "frame:locator_meta.candidates[0]",
+                "locator_type": "css_attr_data-testid",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 2,
+                "step_id": 3,
+                "action_type": "file_upload",
+                "status": "passed",
+                "duration_ms": 329,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1,
+                "uploaded_files": [
+                  "D:\\King\\sakura\\sakura-cuecast\\test-lab\\upload-fixtures\\m5-upload.txt"
+                ],
+                "upload_input_selector": "",
+                "upload_via_proxy": false
+              },
+              {
+                "step_index": 3,
+                "step_id": 4,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 277,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 4,
+                "step_id": 5,
+                "action_type": "assert_download",
+                "status": "passed",
+                "duration_ms": 415,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1,
+                "downloaded_file": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\281-20260706-214034\\downloads\\m5-sample.txt",
+                "downloaded_filename": "m5-sample.txt",
+                "downloaded_bytes": 28,
+                "downloaded_sha256": null,
+                "downloaded_mime": "text/plain"
+              },
+              {
+                "step_index": 5,
+                "step_id": 6,
+                "action_type": "assert_json",
+                "status": "passed",
+                "duration_ms": 267,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 6,
+                "step_id": 7,
+                "action_type": "assert_json",
+                "status": "passed",
+                "duration_ms": 262,
+                "locator_source": "api:assert_json",
+                "locator_type": "json_api",
+                "matched_count": null,
+                "visible_count": null
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\281-20260706-214034",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\281-20260706-214034\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\281-20260706-214034\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\281-20260706-214034\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\281-20260706-214034\\report.html"
+            },
+            "raw": {
+              "case_name": "M5 advanced capability mock",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 0
+            }
+          }
+        }
+      }
+    ],
+    "282": [
+      {
+        "id": 1783345238648,
+        "test_case_id": 282,
+        "status": "passed",
+        "success": true,
+        "duration": 3219,
+        "error": "",
+        "created_at": "2026-07-06T13:40:38.648Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 3219,
+          "error": "",
+          "raw": {
+            "case_id": 282,
+            "run_id": "282-20260706-214035",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:35.435Z",
+            "finished_at": "2026-07-06T13:40:38.654Z",
+            "duration_ms": 3219,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "input",
+                "status": "passed",
+                "duration_ms": 407,
+                "locator_source": "locator_meta.candidates[0]",
+                "locator_type": "css_attr_data-testid",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 272,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 2,
+                "step_id": 3,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 287,
+                "locator_source": "tree:locator_meta.candidates[0]",
+                "locator_type": "tree_item_text",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 3,
+                "step_id": 4,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 271,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 4,
+                "step_id": 5,
+                "action_type": "click_open_page",
+                "status": "passed",
+                "duration_ms": 343,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1,
+                "opened_page_url": "http://127.0.0.1:4206/test-lab/popup.html"
+              },
+              {
+                "step_index": 5,
+                "step_id": 6,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 273,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 6,
+                "step_id": 7,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 291,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 7,
+                "step_id": 8,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 281,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\282-20260706-214035",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\282-20260706-214035\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\282-20260706-214035\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\282-20260706-214035\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\282-20260706-214035\\report.html"
+            },
+            "raw": {
+              "case_name": "M5-B advanced capability mock",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 0
+            }
+          }
+        }
+      }
+    ],
+    "283": [
+      {
+        "id": 1783345239877,
+        "test_case_id": 283,
+        "status": "passed",
+        "success": true,
+        "duration": 2035,
+        "error": "",
+        "created_at": "2026-07-06T13:40:39.877Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 2035,
+          "error": "",
+          "raw": {
+            "case_id": 283,
+            "run_id": "283-20260706-214037",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:37.843Z",
+            "finished_at": "2026-07-06T13:40:39.878Z",
+            "duration_ms": 2035,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "network_mock",
+                "status": "passed",
+                "duration_ms": 273,
+                "locator_source": "",
+                "locator_type": "",
+                "matched_count": null,
+                "visible_count": null,
+                "network_mock_url": "**/api/m5c/profile",
+                "network_mock_status": 200,
+                "network_mock_abort": ""
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 358,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 2,
+                "step_id": 3,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 286,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 3,
+                "step_id": 4,
+                "action_type": "assert_json",
+                "status": "passed",
+                "duration_ms": 270,
+                "locator_source": "api:assert_json",
+                "locator_type": "json_api",
+                "matched_count": null,
+                "visible_count": null
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\283-20260706-214037",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\283-20260706-214037\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\283-20260706-214037\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\283-20260706-214037\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\283-20260706-214037\\report.html"
+            },
+            "raw": {
+              "case_name": "M5-C export and network mock",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 0
+            }
+          }
+        }
+      }
+    ],
+    "284": [
+      {
+        "id": 1783345240733,
+        "test_case_id": 284,
+        "status": "passed",
+        "success": true,
+        "duration": 1451,
+        "error": "",
+        "created_at": "2026-07-06T13:40:40.733Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 1451,
+          "error": "",
+          "raw": {
+            "case_id": 284,
+            "run_id": "284-20260706-214039",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:39.275Z",
+            "finished_at": "2026-07-06T13:40:40.726Z",
+            "duration_ms": 1451,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "assert_request",
+                "status": "passed",
+                "duration_ms": 375,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1,
+                "request_url": "http://127.0.0.1:4206/api/m5f/audit",
+                "request_method": "POST"
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 272,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\284-20260706-214039",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\284-20260706-214039\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\284-20260706-214039\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\284-20260706-214039\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\284-20260706-214039\\report.html"
+            },
+            "raw": {
+              "case_name": "M5-F request assertion mock",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 0
+            }
+          }
+        }
+      }
+    ],
+    "285": [
+      {
+        "id": 1783345242951,
+        "test_case_id": 285,
+        "status": "passed",
+        "success": true,
+        "duration": 2514,
+        "error": "",
+        "created_at": "2026-07-06T13:40:42.951Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 2514,
+          "error": "",
+          "raw": {
+            "case_id": 285,
+            "run_id": "285-20260706-214040",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:40.438Z",
+            "finished_at": "2026-07-06T13:40:42.952Z",
+            "duration_ms": 2514,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "network_mock",
+                "status": "passed",
+                "duration_ms": 263,
+                "locator_source": "",
+                "locator_type": "",
+                "matched_count": null,
+                "visible_count": null,
+                "network_mock_url": "**/api/m5g/delayed",
+                "network_mock_status": 200,
+                "network_mock_abort": ""
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 339,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 2,
+                "step_id": 3,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 282,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 3,
+                "step_id": 4,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 315,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 4,
+                "step_id": 5,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 279,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 5,
+                "step_id": 6,
+                "action_type": "assert_request_count",
+                "status": "passed",
+                "duration_ms": 259,
+                "locator_source": "",
+                "locator_type": "",
+                "matched_count": null,
+                "visible_count": null,
+                "request_count": 2,
+                "request_count_url": "**/api/m5g/ping"
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\285-20260706-214040",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\285-20260706-214040\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\285-20260706-214040\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\285-20260706-214040\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\285-20260706-214040\\report.html"
+            },
+            "raw": {
+              "case_name": "M5-G network delay and request count mock",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 0
+            }
+          }
+        }
+      }
+    ],
+    "286": [
+      {
+        "id": 1783345243679,
+        "test_case_id": 286,
+        "status": "passed",
+        "success": true,
+        "duration": 2242,
+        "error": "",
+        "created_at": "2026-07-06T13:40:43.679Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 2242,
+          "error": "",
+          "raw": {
+            "case_id": 286,
+            "run_id": "286-20260706-214041",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:41.442Z",
+            "finished_at": "2026-07-06T13:40:43.684Z",
+            "duration_ms": 2242,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "assert_response",
+                "status": "passed",
+                "duration_ms": 356,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1,
+                "response_url": "http://127.0.0.1:4206/api/m5h/health",
+                "response_status": 200,
+                "response_body_bytes": 74
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 276,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 2,
+                "step_id": 3,
+                "action_type": "network_mock",
+                "status": "passed",
+                "duration_ms": 260,
+                "locator_source": "",
+                "locator_type": "",
+                "matched_count": null,
+                "visible_count": null,
+                "network_mock_url": "**/api/m5h/fail",
+                "network_mock_status": 200,
+                "network_mock_abort": "failed"
+              },
+              {
+                "step_index": 3,
+                "step_id": 4,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 282,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 4,
+                "step_id": 5,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 274,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\286-20260706-214041",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\286-20260706-214041\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\286-20260706-214041\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\286-20260706-214041\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\286-20260706-214041\\report.html"
+            },
+            "raw": {
+              "case_name": "M5-H response assertion and abort mock",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 2
+            }
+          }
+        }
+      }
+    ],
+    "287": [
+      {
+        "id": 1783345245038,
+        "test_case_id": 287,
+        "status": "passed",
+        "success": true,
+        "duration": 1496,
+        "error": "",
+        "created_at": "2026-07-06T13:40:45.038Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 1496,
+          "error": "",
+          "raw": {
+            "case_id": 287,
+            "run_id": "287-20260706-214043",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:43.547Z",
+            "finished_at": "2026-07-06T13:40:45.043Z",
+            "duration_ms": 1496,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "assert_response",
+                "status": "passed",
+                "duration_ms": 389,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1,
+                "response_url": "http://127.0.0.1:4206/api/m5i/profile",
+                "response_status": 200,
+                "response_body_bytes": 83,
+                "response_snapshot": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\287-20260706-214043\\responses\\m5i-profile.json",
+                "response_snapshot_meta": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\287-20260706-214043\\responses\\m5i-profile.meta.json"
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 274,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\287-20260706-214043",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\287-20260706-214043\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\287-20260706-214043\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\287-20260706-214043\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\287-20260706-214043\\report.html"
+            },
+            "raw": {
+              "case_name": "M5-I response snapshot mock",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 0
+            }
+          }
+        }
+      }
+    ],
+    "288": [
+      {
+        "id": 1783345245803,
+        "test_case_id": 288,
+        "status": "passed",
+        "success": true,
+        "duration": 1386,
+        "error": "",
+        "created_at": "2026-07-06T13:40:45.803Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 1386,
+          "error": "",
+          "raw": {
+            "case_id": 288,
+            "run_id": "288-20260706-214044",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:44.412Z",
+            "finished_at": "2026-07-06T13:40:45.798Z",
+            "duration_ms": 1386,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "assert_response",
+                "status": "passed",
+                "duration_ms": 363,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1,
+                "response_url": "http://127.0.0.1:4206/api/m5j/profile",
+                "response_status": 200,
+                "response_body_bytes": 83,
+                "response_baseline": "D:\\King\\sakura\\sakura-cuecast\\test-lab\\response-baselines\\m5j-profile.json",
+                "response_baseline_mode": "exact",
+                "response_baseline_matched": true,
+                "response_snapshot": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\288-20260706-214044\\responses\\m5j-profile.json",
+                "response_snapshot_meta": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\288-20260706-214044\\responses\\m5j-profile.meta.json"
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 276,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\288-20260706-214044",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\288-20260706-214044\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\288-20260706-214044\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\288-20260706-214044\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\288-20260706-214044\\report.html"
+            },
+            "raw": {
+              "case_name": "M5-J response baseline mock",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 0
+            }
+          }
+        }
+      }
+    ],
+    "289": [
+      {
+        "id": 1783345247550,
+        "test_case_id": 289,
+        "status": "passed",
+        "success": true,
+        "duration": 1942,
+        "error": "",
+        "created_at": "2026-07-06T13:40:47.550Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 1942,
+          "error": "",
+          "raw": {
+            "case_id": 289,
+            "run_id": "289-20260706-214045",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:45.605Z",
+            "finished_at": "2026-07-06T13:40:47.547Z",
+            "duration_ms": 1942,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "network_replay",
+                "status": "passed",
+                "duration_ms": 265,
+                "locator_source": "",
+                "locator_type": "",
+                "matched_count": null,
+                "visible_count": null,
+                "network_replay_path": "D:\\King\\sakura\\sakura-cuecast\\test-lab\\network-fixtures\\m5k-replay.json",
+                "network_replay_entries": 2
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 365,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 2,
+                "step_id": 3,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 297,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 3,
+                "step_id": 4,
+                "action_type": "assert_request_count",
+                "status": "passed",
+                "duration_ms": 266,
+                "locator_source": "",
+                "locator_type": "",
+                "matched_count": null,
+                "visible_count": null,
+                "request_count": 2,
+                "request_count_url": "**/api/m5k/*"
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\289-20260706-214045",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\289-20260706-214045\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\289-20260706-214045\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\289-20260706-214045\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\289-20260706-214045\\report.html"
+            },
+            "raw": {
+              "case_name": "M5-K network replay mock",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 0
+            }
+          }
+        }
+      }
+    ],
+    "290": [
+      {
+        "id": 1783345249569,
+        "test_case_id": 290,
+        "status": "passed",
+        "success": true,
+        "duration": 3121,
+        "error": "",
+        "created_at": "2026-07-06T13:40:49.569Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 3121,
+          "error": "",
+          "raw": {
+            "case_id": 290,
+            "run_id": "290-20260706-214046",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:46.450Z",
+            "finished_at": "2026-07-06T13:40:49.571Z",
+            "duration_ms": 3121,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "file_upload",
+                "status": "passed",
+                "duration_ms": 354,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1,
+                "uploaded_files": [
+                  "D:\\King\\sakura\\sakura-cuecast\\test-lab\\upload-fixtures\\m5-upload.txt",
+                  "D:\\King\\sakura\\sakura-cuecast\\test-lab\\upload-fixtures\\m5-upload-extra.txt"
+                ],
+                "upload_input_selector": "",
+                "upload_via_proxy": false
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 267,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 2,
+                "step_id": 3,
+                "action_type": "assert_download",
+                "status": "passed",
+                "duration_ms": 1776,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1,
+                "downloaded_file": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\290-20260706-214046\\downloads\\m5-advanced.txt",
+                "downloaded_filename": "m5-advanced.txt",
+                "downloaded_bytes": 104,
+                "downloaded_sha256": "ff4e7777939bfad25b12ea6b64ed5bbcab2e1bd7e87fe834a980efc18f593e36",
+                "downloaded_mime": "text/plain"
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\290-20260706-214046",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\290-20260706-214046\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\290-20260706-214046\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\290-20260706-214046\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\290-20260706-214046\\report.html"
+            },
+            "raw": {
+              "case_name": "M5-L advanced upload and download mock",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 0
+            }
+          }
+        }
+      }
+    ],
+    "291": [
+      {
+        "id": 1783345251472,
+        "test_case_id": 291,
+        "status": "passed",
+        "success": true,
+        "duration": 3353,
+        "error": "",
+        "created_at": "2026-07-06T13:40:51.472Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 3353,
+          "error": "",
+          "raw": {
+            "case_id": 291,
+            "run_id": "291-20260706-214048",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:48.122Z",
+            "finished_at": "2026-07-06T13:40:51.475Z",
+            "duration_ms": 3353,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "click_open_page",
+                "status": "passed",
+                "duration_ms": 388,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1,
+                "opened_page_url": "http://127.0.0.1:4206/test-lab/popup.html"
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 279,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 2,
+                "step_id": 3,
+                "action_type": "switch_page",
+                "status": "passed",
+                "duration_ms": 262,
+                "locator_source": "",
+                "locator_type": "",
+                "matched_count": null,
+                "visible_count": null,
+                "switched_page_url": "http://127.0.0.1:4206/test-lab/target.html",
+                "switched_page_title": "CueCast Target",
+                "switched_page_index": 0
+              },
+              {
+                "step_index": 3,
+                "step_id": 4,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 274,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 4,
+                "step_id": 5,
+                "action_type": "switch_page",
+                "status": "passed",
+                "duration_ms": 265,
+                "locator_source": "",
+                "locator_type": "",
+                "matched_count": null,
+                "visible_count": null,
+                "switched_page_url": "http://127.0.0.1:4206/test-lab/popup.html",
+                "switched_page_title": "CueCast Popup",
+                "switched_page_index": 1
+              },
+              {
+                "step_index": 5,
+                "step_id": 6,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 299,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 6,
+                "step_id": 7,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 288,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 7,
+                "step_id": 8,
+                "action_type": "close_page",
+                "status": "passed",
+                "duration_ms": 332,
+                "locator_source": "",
+                "locator_type": "",
+                "matched_count": null,
+                "visible_count": null,
+                "closed_page_url": "http://127.0.0.1:4206/test-lab/popup.html",
+                "closed_page_title": "CueCast Popup",
+                "active_page_url": "http://127.0.0.1:4206/test-lab/target.html",
+                "active_page_title": "CueCast Target",
+                "active_page_index": 0
+              },
+              {
+                "step_index": 8,
+                "step_id": 9,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 278,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\291-20260706-214048",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\291-20260706-214048\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\291-20260706-214048\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\291-20260706-214048\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\291-20260706-214048\\report.html"
+            },
+            "raw": {
+              "case_name": "M5-N multi-window switching mock",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 0
+            }
+          }
+        }
+      }
+    ],
+    "292": [
+      {
+        "id": 1783345254407,
+        "test_case_id": 292,
+        "status": "passed",
+        "success": true,
+        "duration": 4266,
+        "error": "",
+        "created_at": "2026-07-06T13:40:54.407Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 4266,
+          "error": "",
+          "raw": {
+            "case_id": 292,
+            "run_id": "292-20260706-214050",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:50.143Z",
+            "finished_at": "2026-07-06T13:40:54.409Z",
+            "duration_ms": 4266,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "click_open_page",
+                "status": "passed",
+                "duration_ms": 391,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1,
+                "opened_page_url": "http://127.0.0.1:4206/test-lab/popup.html?name=Alpha"
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "switch_page",
+                "status": "passed",
+                "duration_ms": 260,
+                "locator_source": "",
+                "locator_type": "",
+                "matched_count": null,
+                "visible_count": null,
+                "switched_page_url": "http://127.0.0.1:4206/test-lab/target.html",
+                "switched_page_title": "CueCast Target",
+                "switched_page_index": 0
+              },
+              {
+                "step_index": 2,
+                "step_id": 3,
+                "action_type": "click_open_page",
+                "status": "passed",
+                "duration_ms": 323,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1,
+                "opened_page_url": "http://127.0.0.1:4206/test-lab/popup.html?name=Beta"
+              },
+              {
+                "step_index": 3,
+                "step_id": 4,
+                "action_type": "switch_page",
+                "status": "passed",
+                "duration_ms": 263,
+                "locator_source": "",
+                "locator_type": "",
+                "matched_count": null,
+                "visible_count": null,
+                "switched_page_url": "http://127.0.0.1:4206/test-lab/popup.html?name=Alpha",
+                "switched_page_title": "CueCast Alpha Popup",
+                "switched_page_index": 1
+              },
+              {
+                "step_index": 4,
+                "step_id": 5,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 272,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 5,
+                "step_id": 6,
+                "action_type": "switch_page",
+                "status": "passed",
+                "duration_ms": 263,
+                "locator_source": "",
+                "locator_type": "",
+                "matched_count": null,
+                "visible_count": null,
+                "switched_page_url": "http://127.0.0.1:4206/test-lab/popup.html?name=Beta",
+                "switched_page_title": "CueCast Beta Popup",
+                "switched_page_index": 2
+              },
+              {
+                "step_index": 6,
+                "step_id": 7,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 335,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 7,
+                "step_id": 8,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 266,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 8,
+                "step_id": 9,
+                "action_type": "close_page",
+                "status": "passed",
+                "duration_ms": 314,
+                "locator_source": "",
+                "locator_type": "",
+                "matched_count": null,
+                "visible_count": null,
+                "closed_page_url": "http://127.0.0.1:4206/test-lab/popup.html?name=Beta",
+                "closed_page_title": "CueCast Beta Popup",
+                "active_page_url": "http://127.0.0.1:4206/test-lab/popup.html?name=Alpha",
+                "active_page_title": "CueCast Alpha Popup",
+                "active_page_index": 1
+              },
+              {
+                "step_index": 9,
+                "step_id": 10,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 271,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 10,
+                "step_id": 11,
+                "action_type": "close_page",
+                "status": "passed",
+                "duration_ms": 329,
+                "locator_source": "",
+                "locator_type": "",
+                "matched_count": null,
+                "visible_count": null,
+                "closed_page_url": "http://127.0.0.1:4206/test-lab/popup.html?name=Alpha",
+                "closed_page_title": "CueCast Alpha Popup",
+                "active_page_url": "http://127.0.0.1:4206/test-lab/target.html",
+                "active_page_title": "CueCast Target",
+                "active_page_index": 0
+              },
+              {
+                "step_index": 11,
+                "step_id": 12,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 280,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\292-20260706-214050",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\292-20260706-214050\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\292-20260706-214050\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\292-20260706-214050\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\292-20260706-214050\\report.html"
+            },
+            "raw": {
+              "case_name": "M5-O multi-popup disambiguation mock",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 0
+            }
+          }
+        }
+      }
+    ],
+    "293": [
+      {
+        "id": 1783345253716,
+        "test_case_id": 293,
+        "status": "passed",
+        "success": true,
+        "duration": 1624,
+        "error": "",
+        "created_at": "2026-07-06T13:40:53.716Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 1624,
+          "error": "",
+          "raw": {
+            "case_id": 293,
+            "run_id": "293-20260706-214052",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:52.098Z",
+            "finished_at": "2026-07-06T13:40:53.722Z",
+            "duration_ms": 1624,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 349,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "click",
+                "status": "passed",
+                "duration_ms": 297,
+                "locator_source": "tree:locator_meta.candidates[0]",
+                "locator_type": "tree_item_text",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 2,
+                "step_id": 3,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 273,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\293-20260706-214052",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\293-20260706-214052\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\293-20260706-214052\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\293-20260706-214052\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\293-20260706-214052\\report.html"
+            },
+            "raw": {
+              "case_name": "M5-O advanced tree mock",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 0
+            }
+          }
+        }
+      }
+    ],
+    "294": [
+      {
+        "id": 1783345256031,
+        "test_case_id": 294,
+        "status": "passed",
+        "success": true,
+        "duration": 1771,
+        "error": "",
+        "created_at": "2026-07-06T13:40:56.031Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 1771,
+          "error": "",
+          "raw": {
+            "case_id": 294,
+            "run_id": "294-20260706-214054",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:54.257Z",
+            "finished_at": "2026-07-06T13:40:56.028Z",
+            "duration_ms": 1771,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "input",
+                "status": "passed",
+                "duration_ms": 431,
+                "locator_source": "locator_meta.candidates[0]",
+                "locator_type": "css_attr_data-testid",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "key",
+                "status": "passed",
+                "duration_ms": 263,
+                "locator_source": "",
+                "locator_type": "",
+                "matched_count": null,
+                "visible_count": null
+              },
+              {
+                "step_index": 2,
+                "step_id": 3,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 289,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\294-20260706-214054",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\294-20260706-214054\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\294-20260706-214054\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\294-20260706-214054\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\294-20260706-214054\\report.html"
+            },
+            "raw": {
+              "case_name": "M5-O Monaco shortcut mock",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 0
+            }
+          }
+        }
+      }
+    ],
+    "295": [
+      {
+        "id": 1783345258401,
+        "test_case_id": 295,
+        "status": "passed",
+        "success": true,
+        "duration": 3174,
+        "error": "",
+        "created_at": "2026-07-06T13:40:58.401Z",
+        "raw": {
+          "status": "passed",
+          "success": true,
+          "duration_ms": 3174,
+          "error": "",
+          "raw": {
+            "case_id": 295,
+            "run_id": "295-20260706-214055",
+            "executor": "playwright-runner",
+            "status": "passed",
+            "success": true,
+            "started_at": "2026-07-06T13:40:55.228Z",
+            "finished_at": "2026-07-06T13:40:58.402Z",
+            "duration_ms": 3174,
+            "browser": "chromium",
+            "headless": true,
+            "failed_step_index": null,
+            "error": "",
+            "steps": [
+              {
+                "step_index": 0,
+                "step_id": 1,
+                "action_type": "file_upload",
+                "status": "passed",
+                "duration_ms": 342,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1,
+                "uploaded_files": [
+                  "D:\\King\\sakura\\sakura-cuecast\\test-lab\\upload-fixtures\\m5-upload.txt"
+                ],
+                "upload_input_selector": "[data-testid=\"m5o-hidden-upload-input\"]",
+                "upload_via_proxy": true
+              },
+              {
+                "step_index": 1,
+                "step_id": 2,
+                "action_type": "assert_text",
+                "status": "passed",
+                "duration_ms": 281,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1
+              },
+              {
+                "step_index": 2,
+                "step_id": 3,
+                "action_type": "assert_download",
+                "status": "passed",
+                "duration_ms": 1783,
+                "locator_source": "target_selector",
+                "locator_type": "css",
+                "matched_count": 1,
+                "visible_count": 1,
+                "downloaded_file": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\295-20260706-214055\\downloads\\m5o-binary.bin",
+                "downloaded_filename": "m5o-binary.bin",
+                "downloaded_bytes": 74,
+                "downloaded_sha256": "805b36dafcef1f12e4c8ca3e9b6b5eb1673e7eaca5047509f6103d202d05f60b",
+                "downloaded_mime": "application/octet-stream"
+              }
+            ],
+            "artifacts": {
+              "run_dir": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\295-20260706-214055",
+              "result_json": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\295-20260706-214055\\result.json",
+              "screenshots": [],
+              "videos": [],
+              "logs": [
+                "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\295-20260706-214055\\logs\\console.json"
+              ],
+              "dom_snapshots": [],
+              "console_log": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\295-20260706-214055\\logs\\console.json",
+              "report_html": "D:\\King\\sakura-playwright\\playwright-runner-artifacts\\runs\\295-20260706-214055\\report.html"
+            },
+            "raw": {
+              "case_name": "M5-O hidden upload and binary download mock",
+              "start_url": "http://127.0.0.1:4206/test-lab/target.html",
+              "console_event_count": 0
+            }
+          }
+        }
+      }
+    ],
+    "296": []
+  }
+}

@@ -1,0 +1,2 @@
+CueCast M5-L advanced download fixture
+This file is used to verify MIME, byte size, and SHA-256 checks.

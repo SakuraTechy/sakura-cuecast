@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CueCast Runner Launch</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0d10;
+      --panel: #15181d;
+      --line: #2c313a;
+      --text: #f4f7fb;
+      --muted: #9da7b7;
+      --accent: #f5ff4d;
+      --ok: #53f59f;
+      --warn: #ffcb57;
+      --bad: #ff6b6b;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    main {
+      width: min(960px, calc(100vw - 40px));
+      margin: 0 auto;
+      padding: 40px 0;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding-bottom: 22px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.7;
+    }
+
+    .status {
+      min-width: 116px;
+      padding: 10px 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      text-align: center;
+      font-weight: 700;
+      color: var(--accent);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin: 24px 0;
+    }
+
+    .notice {
+      margin: 24px 0 0;
+      padding: 16px;
+      border: 1px solid rgba(255, 203, 87, .55);
+      border-radius: 8px;
+      background: rgba(255, 203, 87, .08);
+      color: var(--text);
+    }
+
+    .notice strong {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--warn);
+    }
+
+    .item, .log {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 16px;
+    }
+
+    .item span {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .item strong {
+      overflow-wrap: anywhere;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin: 24px 0;
+    }
+
+    button, a.button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 38px;
+      padding: 0 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #1b2027;
+      color: var(--text);
+      font: inherit;
+      font-weight: 700;
+      text-decoration: none;
+      cursor: pointer;
+    }
+
+    button.primary {
+      background: var(--accent);
+      color: #060708;
+      border-color: var(--accent);
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: .55;
+    }
+
+    pre {
+      min-height: 180px;
+      max-height: 360px;
+      overflow: auto;
+      margin: 0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      color: #d7dee9;
+      font: 13px/1.6 Consolas, "Cascadia Mono", monospace;
+    }
+
+    [data-state="passed"] {
+      color: var(--ok);
+    }
+
+    [data-state="failed"], [data-state="infrastructure_failed"] {
+      color: var(--bad);
+    }
+
+    [data-state="running"], [data-state="queued"] {
+      color: var(--accent);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Playwright Runner 回放启动页</h1>
+        <p>此页面由点击操作直接打开，负责启动 Playwright Runner 并显示执行状态。</p>
+      </div>
+      <div class="status" id="status" data-state="queued">准备中</div>
+    </header>
+
+    <section class="actions">
+      <button class="primary" type="button" id="focusBtn" disabled>尝试定位 Runner 窗口</button>
+      <button type="button" id="refreshBtn">刷新状态</button>
+      <a class="button" id="caseLink" href="/testcases/278">返回用例</a>
+    </section>
+    
+    <section class="notice">
+      <strong>有头浏览器窗口可能不会被 Windows 自动切到前台</strong>
+      <p>Runner 会自动尝试定位窗口；如果 Chromium 已出现在任务栏但没有切过来，请手动点击任务栏中的 Runner Chromium 图标。自动回放仍会继续执行，状态和产物会在本页更新。</p>
+    </section>
+
+    <section class="grid">
+      <div class="item"><span>用例</span><strong id="caseId">-</strong></div>
+      <div class="item"><span>Job</span><strong id="jobId">-</strong></div>
+      <div class="item"><span>Runner PID</span><strong id="pid">-</strong></div>
+      <div class="item"><span>模式</span><strong id="mode">headed</strong></div>
+    </section>
+
+    <section class="log">
+      <pre id="log">正在启动 Runner...</pre>
+    </section>
+  </main>
+
+  <script src="/test-lab/runner-launch.js"></script>
+</body>
+</html>

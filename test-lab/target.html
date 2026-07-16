@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CueCast Target</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172033;
+      --muted: #677085;
+      --line: #dfe4ee;
+      --accent: #2457d6;
+      --ok: #147a43;
+      --danger: #bf3434;
+      font-family: Inter, "Segoe UI", system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #f5f7fb;
+      color: var(--ink);
+      font-size: 14px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 58px;
+      padding: 0 28px;
+      border-bottom: 1px solid var(--line);
+      background: #fff;
+    }
+    main {
+      display: grid;
+      grid-template-columns: 360px minmax(0, 1fr);
+      gap: 20px;
+      padding: 24px;
+    }
+    section {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    .panel {
+      display: grid;
+      gap: 14px;
+      padding: 18px;
+    }
+    h1, h2 {
+      margin: 0;
+      line-height: 1.2;
+    }
+    h1 { font-size: 18px; }
+    h2 { font-size: 16px; }
+    label {
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-weight: 700;
+    }
+    input, select, textarea {
+      width: 100%;
+      min-height: 38px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      font: inherit;
+    }
+    textarea { min-height: 96px; resize: vertical; }
+    button {
+      min-height: 36px;
+      padding: 0 13px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      font-weight: 800;
+    }
+    button.primary {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #fff;
+    }
+    .inline {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(120px, 1fr));
+      gap: 12px;
+    }
+    .metric {
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f8fafc;
+    }
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .metric strong {
+      display: block;
+      margin-top: 5px;
+      font-size: 19px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    th, td {
+      padding: 10px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+    }
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+    tr:last-child td { border-bottom: 0; }
+    .toast {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      min-width: 260px;
+      padding: 13px 15px;
+      border: 1px solid #b8dfc7;
+      border-radius: 8px;
+      background: #edfff4;
+      color: var(--ok);
+      box-shadow: 0 16px 44px rgba(30, 41, 59, 0.18);
+    }
+    .ant-select,
+    .el-select {
+      position: relative;
+      width: 100%;
+      min-height: 38px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+    }
+    .ant-select-dropdown,
+    .el-select-dropdown {
+      position: fixed;
+      z-index: 1000;
+      display: none;
+      min-width: 220px;
+      padding: 6px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      box-shadow: 0 16px 44px rgba(30, 41, 59, 0.18);
+    }
+    .ant-select-dropdown.open,
+    .el-select-dropdown.open {
+      display: grid;
+      gap: 4px;
+    }
+    .ant-select-item-option,
+    .el-select-dropdown__item {
+      padding: 8px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .ant-select-item-option:hover,
+    .el-select-dropdown__item:hover {
+      background: #eef3ff;
+    }
+    dialog {
+      width: min(460px, calc(100vw - 30px));
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 18px 48px rgba(30, 41, 59, 0.25);
+    }
+    dialog::backdrop { background: rgba(15, 23, 42, 0.38); }
+    pre {
+      overflow: auto;
+      margin: 0;
+      padding: 14px;
+      border-radius: 8px;
+      background: #111827;
+      color: #e5edff;
+    }
+    iframe {
+      width: 100%;
+      min-height: 150px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    .monaco-editor {
+      min-height: 120px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #0f172a;
+      color: #dbeafe;
+      font: 13px/1.5 Consolas, monospace;
+    }
+    .monaco-editor [contenteditable="true"] {
+      min-height: 118px;
+      padding: 12px;
+      outline: none;
+      white-space: pre-wrap;
+    }
+    [data-tree="true"] {
+      display: grid;
+      gap: 4px;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f8fafc;
+    }
+    [data-tree-node="true"] {
+      padding: 8px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    [data-tree-node="true"]:hover {
+      background: #eef3ff;
+    }
+    .hidden-upload-input {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+    [data-testid="m5o-tree-children"][hidden] {
+      display: none;
+    }
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; padding: 14px; }
+      .summary { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>CueCast Target Workspace</h1>
+    <div class="inline">
+      <button type="button" data-testid="open-dialog">打开弹窗</button>
+      <button type="button" data-testid="open-m2-dialog">Open M2 Dialog</button>
+      <button type="button" data-testid="show-toast" class="primary">显示提示</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel" aria-label="Account form">
+      <h2>登录与资料</h2>
+      <label>用户名<input id="username" data-testid="username" name="username" type="text" value="demo"></label>
+      <label>密码<input id="password" data-testid="password" name="password" type="password" autocomplete="current-password"></label>
+      <label>角色<select id="role" data-testid="role"><option>QA Lead</option><option>Developer</option><option>Product Manager</option></select></label>
+      <label>M2 Custom Select
+        <div id="m2CustomSelect" class="ant-select" role="combobox" aria-haspopup="listbox" data-testid="m2-custom-select" data-control-kind="custom-select">Starter</div>
+      </label>
+      <label>备注<textarea id="notes" data-testid="notes">Use this area to validate long text input.</textarea></label>
+      <div class="inline">
+        <label class="inline"><input id="remember" data-testid="remember" type="checkbox" checked> 记住我</label>
+        <button type="button" class="primary" data-testid="submit-login">提交</button>
+        <button type="button" data-testid="outside-confirm">Confirm</button>
+      </div>
+    </section>
+
+    <section class="panel" aria-label="Scenario board">
+      <h2>场景数据</h2>
+      <div class="summary">
+        <div class="metric"><span>Case</span><strong>278</strong></div>
+        <div class="metric"><span>Status</span><strong id="statusText">Ready</strong></div>
+        <div class="metric"><span>Owner</span><strong>Avery</strong></div>
+        <div class="metric"><span>Plan</span><strong>Starter</strong></div>
+      </div>
+
+      <label>筛选<input id="tableFilter" data-testid="table-filter" type="search" placeholder="Search rows"></label>
+
+      <table data-testid="scenario-table">
+        <thead><tr><th>Name</th><th>Owner</th><th>Priority</th><th>Action</th></tr></thead>
+        <tbody>
+          <tr><td>Alpha checkout</td><td>Avery</td><td><select data-testid="priority-alpha"><option>High</option><option>Medium</option><option>Low</option></select></td><td><button type="button">Run</button></td></tr>
+          <tr><td>Beta mapping</td><td>Lin</td><td><select data-testid="priority-beta"><option>Medium</option><option>High</option><option>Low</option></select></td><td><button type="button">Run</button></td></tr>
+          <tr><td>Gamma sync</td><td>Morgan</td><td><select data-testid="priority-gamma"><option>Low</option><option>Medium</option><option>High</option></select></td><td><button type="button">Run</button></td></tr>
+        </tbody>
+      </table>
+
+      <pre id="jsonPayload" data-testid="json-payload">{"caseId":278,"status":"ready","owner":"Avery","features":["record","play","assert"]}</pre>
+
+      <h2>M5 高级能力</h2>
+      <label>文件上传<input id="m5FileInput" data-testid="m5-file-input" type="file" multiple></label>
+      <div class="inline">
+        <strong data-testid="m5-upload-status">No file selected</strong>
+        <a href="/test-lab/downloads/m5-sample.txt" download="m5-sample.txt" data-testid="m5-download">下载样例</a>
+        <a href="/test-lab/downloads/m5-advanced.txt" download="m5-advanced.txt" data-testid="m5-advanced-download">下载高级样例</a>
+      </div>
+      <iframe
+        title="M5 iframe target"
+        data-testid="m5-iframe"
+        srcdoc="<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><style>body{font:14px Segoe UI, sans-serif;margin:16px;color:#172033}button{min-height:34px;padding:0 12px;border:1px solid #dfe4ee;border-radius:6px;background:#2457d6;color:white;font-weight:800}</style></head><body><p data-testid='iframe-status'>Iframe Ready</p><button type='button' data-testid='iframe-run' onclick=&quot;document.querySelector('[data-testid=iframe-status]').textContent='Iframe Clicked'&quot;>Run iframe action</button></body></html>">
+      </iframe>
+
+      <h2>M5-B 高级能力</h2>
+      <div id="m5bMonaco" class="monaco-editor" data-testid="m5b-monaco" data-control-kind="monaco">
+        <div class="view-line" contenteditable="true" role="textbox" aria-label="Editor content">const stage = "draft";</div>
+      </div>
+      <strong data-testid="m5b-editor-status">Editor Empty</strong>
+      <div role="tree" data-tree="true" data-testid="m5b-tree">
+        <div role="treeitem" data-tree-node="true" data-node-key="dashboard">Dashboard</div>
+        <div role="treeitem" data-tree-node="true" data-node-key="settings">Settings</div>
+        <div role="treeitem" data-tree-node="true" data-node-key="reports">Reports</div>
+      </div>
+      <button type="button" data-testid="m5b-open-popup">打开新窗口</button>
+
+      <h2>M5-C 网络能力</h2>
+      <button type="button" data-testid="m5c-fetch-profile">获取网络资料</button>
+      <strong data-testid="m5c-network-status">Network Idle</strong>
+
+      <h2>M5-F 请求断言</h2>
+      <button type="button" data-testid="m5f-send-audit">发送审计请求</button>
+      <strong data-testid="m5f-request-status">Audit Idle</strong>
+
+      <h2>M5-G 网络计数</h2>
+      <button type="button" data-testid="m5g-fetch-delayed">获取延迟响应</button>
+      <strong data-testid="m5g-delay-status">Delay Idle</strong>
+      <button type="button" data-testid="m5g-send-pings">发送两次 Ping</button>
+      <strong data-testid="m5g-ping-status">Pings Idle</strong>
+
+      <h2>M5-H 响应断言</h2>
+      <button type="button" data-testid="m5h-fetch-health">获取健康响应</button>
+      <strong data-testid="m5h-health-status">Health Idle</strong>
+      <button type="button" data-testid="m5h-fetch-fail">触发失败请求</button>
+      <strong data-testid="m5h-fail-status">Failure Idle</strong>
+
+      <h2>M5-I 响应快照</h2>
+      <button type="button" data-testid="m5i-fetch-profile">获取快照响应</button>
+      <strong data-testid="m5i-profile-status">Snapshot Idle</strong>
+
+      <h2>M5-J 基线对比</h2>
+      <button type="button" data-testid="m5j-fetch-profile">获取基线响应</button>
+      <strong data-testid="m5j-profile-status">Baseline Idle</strong>
+
+      <h2>M5-K 网络回放</h2>
+      <button type="button" data-testid="m5k-fetch-replay">获取回放响应</button>
+      <strong data-testid="m5k-replay-status">Replay Idle</strong>
+
+      <h2>M5-O 专项增强</h2>
+      <div class="inline">
+        <button type="button" data-testid="m5o-open-alpha-popup">打开 Alpha 窗口</button>
+        <button type="button" data-testid="m5o-open-beta-popup">打开 Beta 窗口</button>
+        <strong data-testid="m5o-window-status">Windows Idle</strong>
+      </div>
+      <div role="tree" data-tree="true" data-testid="m5o-tree">
+        <button type="button" data-testid="m5o-expand-tree">展开高级节点</button>
+        <div role="group" data-testid="m5o-tree-children" hidden>
+          <label class="inline" role="treeitem" data-tree-node="true" data-node-key="ops-alerts">
+            <input type="checkbox" data-testid="m5o-tree-checkbox"> Ops Alerts
+          </label>
+        </div>
+      </div>
+      <strong data-testid="m5o-tree-status">Tree Advanced Idle</strong>
+      <div id="m5oMonaco" class="monaco-editor" data-testid="m5o-monaco" data-control-kind="monaco">
+        <div class="view-line" contenteditable="true" role="textbox" aria-label="Advanced editor content">let mode = "idle";</div>
+      </div>
+      <strong data-testid="m5o-editor-status">Advanced Editor Idle</strong>
+      <input id="m5oHiddenUpload" class="hidden-upload-input" data-testid="m5o-hidden-upload-input" type="file">
+      <button type="button" data-testid="m5o-upload-proxy">代理上传文件</button>
+      <strong data-testid="m5o-upload-status">Proxy Upload Idle</strong>
+      <a href="/test-lab/downloads/m5o-binary.bin" download="m5o-binary.bin" data-testid="m5o-binary-download">下载二进制样例</a>
+    </section>
+  </main>
+
+  <div id="m2SelectDropdown" class="ant-select-dropdown" role="listbox" data-overlay="true">
+    <div class="ant-select-item-option" role="option">Starter</div>
+    <div class="ant-select-item-option" role="option">Growth</div>
+    <div class="ant-select-item-option" role="option">Enterprise</div>
+  </div>
+
+  <dialog id="scenarioDialog" data-testid="scenario-dialog">
+    <form method="dialog" class="panel">
+      <h2>确认操作</h2>
+      <p>这是用于验证弹窗定位、遮罩点击和确认按钮的稳定区域。</p>
+      <div class="inline">
+        <button value="cancel" type="submit">取消</button>
+        <button value="confirm" type="submit" class="primary">确定</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="m2Dialog" data-testid="m2-dialog">
+    <form method="dialog" class="panel">
+      <h2>M2 Dialog</h2>
+      <p>This dialog is used to verify overlay-scoped locator resolution.</p>
+      <div class="inline">
+        <button value="cancel" type="submit">Cancel</button>
+        <button value="confirm" type="submit" class="primary">Confirm</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script>
+    const dialog = document.getElementById('scenarioDialog');
+    const m2Dialog = document.getElementById('m2Dialog');
+    const customSelect = document.getElementById('m2CustomSelect');
+    const customDropdown = document.getElementById('m2SelectDropdown');
+    document.querySelector('[data-testid="open-dialog"]').addEventListener('click', () => dialog.showModal());
+    document.querySelector('[data-testid="open-m2-dialog"]').addEventListener('click', () => m2Dialog.showModal());
+    document.querySelector('[data-testid="outside-confirm"]').addEventListener('click', () => {
+      document.getElementById('statusText').textContent = 'Outside Confirmed';
+    });
+    customSelect.addEventListener('click', () => {
+      const rect = customSelect.getBoundingClientRect();
+      customDropdown.style.left = `${rect.left}px`;
+      customDropdown.style.top = `${rect.bottom + 4}px`;
+      customDropdown.classList.add('open');
+    });
+    customDropdown.querySelectorAll('[role="option"]').forEach((option) => {
+      option.addEventListener('click', () => {
+        customSelect.textContent = option.textContent;
+        customDropdown.classList.remove('open');
+        document.getElementById('jsonPayload').textContent = JSON.stringify({
+          caseId: 278,
+          customPlan: option.textContent,
+        }, null, 2);
+      });
+    });
+    document.addEventListener('click', (event) => {
+      if (!customSelect.contains(event.target) && !customDropdown.contains(event.target)) {
+        customDropdown.classList.remove('open');
+      }
+    });
+    document.querySelectorAll('table button').forEach((button) => {
+      button.addEventListener('click', () => {
+        const row = button.closest('tr');
+        document.getElementById('statusText').textContent = `Ran ${row.cells[0].textContent}`;
+      });
+    });
+    document.querySelector('[data-testid="show-toast"]').addEventListener('click', () => {
+      document.querySelectorAll('.toast').forEach((node) => node.remove());
+      const toast = document.createElement('div');
+      toast.className = 'toast';
+      toast.textContent = '保存成功：目标页面已响应操作。';
+      document.body.appendChild(toast);
+      document.getElementById('statusText').textContent = 'Saved';
+      setTimeout(() => toast.remove(), 3600);
+    });
+    document.querySelector('[data-testid="submit-login"]').addEventListener('click', () => {
+      document.getElementById('statusText').textContent = 'Submitted';
+      document.getElementById('jsonPayload').textContent = JSON.stringify({
+        caseId: 278,
+        status: 'submitted',
+        username: document.getElementById('username').value,
+        role: document.getElementById('role').value,
+      }, null, 2);
+    });
+    document.getElementById('tableFilter').addEventListener('input', (event) => {
+      const query = event.target.value.trim().toLowerCase();
+      document.querySelectorAll('tbody tr').forEach((row) => {
+        row.hidden = query && !row.textContent.toLowerCase().includes(query);
+      });
+    });
+    document.getElementById('m5FileInput').addEventListener('change', (event) => {
+      const files = Array.from(event.target.files || []);
+      document.querySelector('[data-testid="m5-upload-status"]').textContent = files.length
+        ? `Uploaded ${files.length} ${files.length === 1 ? 'file' : 'files'}: ${files.map((file) => file.name).join(', ')}`
+        : 'No file selected';
+    });
+    document.querySelector('[data-testid="m5b-monaco"] [contenteditable="true"]').addEventListener('input', (event) => {
+      document.querySelector('[data-testid="m5b-editor-status"]').textContent = event.target.textContent;
+    });
+    document.querySelectorAll('[data-tree-node="true"]').forEach((node) => {
+      node.addEventListener('click', () => {
+        document.getElementById('statusText').textContent = `Tree Selected ${node.textContent.trim()}`;
+      });
+    });
+    document.querySelector('[data-testid="m5b-open-popup"]').addEventListener('click', () => {
+      window.open('/test-lab/popup.html', 'cuecast-m5b-popup');
+    });
+    document.querySelector('[data-testid="m5o-open-alpha-popup"]').addEventListener('click', () => {
+      window.open('/test-lab/popup.html?name=Alpha', 'cuecast-m5o-alpha');
+      document.querySelector('[data-testid="m5o-window-status"]').textContent = 'Alpha Requested';
+    });
+    document.querySelector('[data-testid="m5o-open-beta-popup"]').addEventListener('click', () => {
+      window.open('/test-lab/popup.html?name=Beta', 'cuecast-m5o-beta');
+      document.querySelector('[data-testid="m5o-window-status"]').textContent = 'Beta Requested';
+    });
+    document.querySelector('[data-testid="m5o-expand-tree"]').addEventListener('click', () => {
+      document.querySelector('[data-testid="m5o-tree-children"]').hidden = false;
+      document.querySelector('[data-testid="m5o-tree-status"]').textContent = 'Tree Expanded';
+    });
+    document.querySelector('[data-testid="m5o-tree-checkbox"]').addEventListener('change', (event) => {
+      document.querySelector('[data-testid="m5o-tree-status"]').textContent = event.target.checked
+        ? 'Tree Checked Ops Alerts'
+        : 'Tree Unchecked Ops Alerts';
+    });
+    document.querySelector('[data-testid="m5o-monaco"] [contenteditable="true"]').addEventListener('input', (event) => {
+      document.querySelector('[data-testid="m5o-editor-status"]').textContent = event.target.textContent;
+    });
+    document.querySelector('[data-testid="m5o-monaco"] [contenteditable="true"]').addEventListener('keydown', (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+        event.preventDefault();
+        document.querySelector('[data-testid="m5o-editor-status"]').textContent = `Saved ${event.target.textContent.length}`;
+      }
+    });
+    document.getElementById('m5oHiddenUpload').addEventListener('change', (event) => {
+      const file = event.target.files && event.target.files[0];
+      document.querySelector('[data-testid="m5o-upload-status"]').textContent = file
+        ? `Proxy Uploaded ${file.name}`
+        : 'Proxy Upload Idle';
+    });
+    document.querySelector('[data-testid="m5c-fetch-profile"]').addEventListener('click', async () => {
+      const response = await fetch('/api/m5c/profile');
+      const payload = await response.json();
+      const data = payload.data || payload;
+      document.querySelector('[data-testid="m5c-network-status"]').textContent = `${data.name} ${data.tier}`;
+    });
+    document.querySelector('[data-testid="m5f-send-audit"]').addEventListener('click', async () => {
+      const response = await fetch('/api/m5f/audit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requestId: 'audit-m5f', enabled: true }),
+      });
+      const payload = await response.json();
+      document.querySelector('[data-testid="m5f-request-status"]').textContent = `Audit accepted ${payload.data.requestId}`;
+    });
+    document.querySelector('[data-testid="m5g-fetch-delayed"]').addEventListener('click', async () => {
+      const response = await fetch('/api/m5g/delayed');
+      const payload = await response.json();
+      const data = payload.data || payload;
+      document.querySelector('[data-testid="m5g-delay-status"]').textContent = data.message;
+    });
+    document.querySelector('[data-testid="m5g-send-pings"]').addEventListener('click', async () => {
+      await Promise.all([
+        fetch('/api/m5g/ping', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ requestId: 'ping-m5g', index: 1 }),
+        }),
+        fetch('/api/m5g/ping', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ requestId: 'ping-m5g', index: 2 }),
+        }),
+      ]);
+      document.querySelector('[data-testid="m5g-ping-status"]').textContent = 'Pings sent 2';
+    });
+    document.querySelector('[data-testid="m5h-fetch-health"]').addEventListener('click', async () => {
+      const response = await fetch('/api/m5h/health');
+      const payload = await response.json();
+      document.querySelector('[data-testid="m5h-health-status"]').textContent = payload.data.message;
+    });
+    document.querySelector('[data-testid="m5h-fetch-fail"]').addEventListener('click', async () => {
+      try {
+        await fetch('/api/m5h/fail');
+        document.querySelector('[data-testid="m5h-fail-status"]').textContent = 'Unexpected success';
+      } catch {
+        document.querySelector('[data-testid="m5h-fail-status"]').textContent = 'Abort handled';
+      }
+    });
+    document.querySelector('[data-testid="m5i-fetch-profile"]').addEventListener('click', async () => {
+      const response = await fetch('/api/m5i/profile');
+      const payload = await response.json();
+      document.querySelector('[data-testid="m5i-profile-status"]').textContent = `${payload.data.name} ${payload.data.stage}`;
+    });
+    document.querySelector('[data-testid="m5j-fetch-profile"]').addEventListener('click', async () => {
+      const response = await fetch('/api/m5j/profile');
+      const payload = await response.json();
+      document.querySelector('[data-testid="m5j-profile-status"]').textContent = `${payload.data.name} ${payload.data.stage}`;
+    });
+    document.querySelector('[data-testid="m5k-fetch-replay"]').addEventListener('click', async () => {
+      const [profileResponse, settingsResponse] = await Promise.all([
+        fetch('/api/m5k/profile'),
+        fetch('/api/m5k/settings'),
+      ]);
+      const profile = await profileResponse.json();
+      const settings = await settingsResponse.json();
+      document.querySelector('[data-testid="m5k-replay-status"]').textContent =
+        `${profile.data.name} ${settings.data.mode} ${settings.data.enabled ? 'Enabled' : 'Disabled'}`;
+    });
+    dialog.addEventListener('close', () => {
+      if (dialog.returnValue === 'confirm') {
+        document.getElementById('statusText').textContent = 'Confirmed';
+      }
+    });
+    m2Dialog.addEventListener('close', () => {
+      if (m2Dialog.returnValue === 'confirm') {
+        document.getElementById('statusText').textContent = 'M2 Dialog Confirmed';
+      }
+    });
+  </script>
+</body>
+</html>

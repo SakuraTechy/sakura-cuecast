@@ -38,9 +38,16 @@ export class ApiClient {
       } catch (_) {
         data = { message: text };
       }
-      const okByCode = data.code === 0 || data.code === '0';
-      const okBySuccess = data.success === true;
-      if (!res.ok || (!okByCode && !okBySuccess)) {
+      const hasCode = data && data.code !== undefined && data.code !== null;
+      const hasSuccessFlag = data && data.success !== undefined && data.success !== null;
+      const normalizedCode = hasCode ? Number(data.code) : null;
+      const okByCode = !hasCode || normalizedCode === 0 || normalizedCode === 200;
+      const explicitFailure = data?.success === false || !okByCode;
+      const hasErrorMessage = data && typeof data === 'object'
+        && ['message', 'msg', 'error'].some((key) => Boolean(data[key]));
+      const acceptedByHttp = res.ok && !hasCode && !hasSuccessFlag && !hasErrorMessage;
+      const acceptedByEnvelope = (hasCode && okByCode) || (hasSuccessFlag && data.success === true);
+      if (!res.ok || (!acceptedByEnvelope && !acceptedByHttp) || explicitFailure) {
         const message = data.message || data.msg || data.error || text || '请求失败';
         throw new Error(`HTTP ${res.status} ${method} ${url}: ${message}`);
       }
@@ -56,6 +63,13 @@ export class ApiClient {
   }
 
   getTestCase(id) { return this.request('GET', `/testcases/${id}?raw_values=1`); }
+  // 扩展 CDP 回放直接读取 admin 的统一 caseKey，避免在扩展侧重组 CaseDO/StepDO。
+  getAdminPlaywrightCase(caseKey, projectEnvironmentId) {
+    const query = projectEnvironmentId == null || String(projectEnvironmentId).trim() === ''
+      ? ''
+      : `?projectEnvironmentId=${encodeURIComponent(projectEnvironmentId)}`;
+    return this.request('GET', `/automation/playwright/testcases/${encodeAdminCasePath(caseKey)}${query}`);
+  }
   saveSteps(id, steps) { return this.request('POST', `/testcases/${id}/steps`, { steps }); }
   importRecording(payload) {
     return this.request('POST', '/automation/automationUiScene/recordings/import', payload, { timeoutMs: 60000 });
@@ -102,4 +116,21 @@ export class ApiClient {
     const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 120000;
     return this.request('POST', `/testcases/${caseId}/assert-json`, body, { timeoutMs });
   }
+
+  // admin 结果接口与旧 CueCast mock 结果接口分开，保留两条协议的兼容性。
+  saveAdminPlaywrightResult(caseKey, result) {
+    return this.request(
+      'POST',
+      `/automation/playwright/testcases/${encodeURIComponent(caseKey)}/results`,
+      result,
+      { timeoutMs: 30000 },
+    );
+  }
+}
+
+function encodeAdminCasePath(caseKey) {
+  const parts = String(caseKey ?? '').split(':');
+  if (parts.length < 2) return encodeURIComponent(caseKey);
+  const sceneKey = parts.shift();
+  return `${encodeURIComponent(sceneKey)}/${encodeURIComponent(parts.join(':'))}`;
 }

@@ -209,18 +209,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'AT_PLATFORM_RECORD':
       state.apiBase = message.apiBase || state.apiBase;
       state.authToken = message.authToken || state.authToken;
-      recorder
-        .start(message.testCaseId, message.startUrl, tabId, {
+      (async () => {
+        const windowPreference = await resolveWindowPreference(message, sender.tab?.windowId);
+        const response = await recorder.start(message.testCaseId, message.startUrl, tabId, {
           insertAfterStepIndex: message.insertAfterStepIndex,
           screenshotMode: message.screenshotMode,
           recordingImport: message.recordingImport,
-        })
-        .then((response) => {
-          if (response?.ok) {
-            armRecordingKeepalive();
-          }
-          sendResponse(response);
+          windowPreference,
         });
+        if (response?.ok) {
+          armRecordingKeepalive();
+        }
+        sendResponse(response);
+      })();
       return true;
 
     case 'AT_RECORDING_HEARTBEAT':
@@ -241,6 +242,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       state.apiBase = message.apiBase || state.apiBase;
       state.authToken = message.authToken || state.authToken;
       void player.start(message.testCaseId, message.startUrl, {
+        adminCaseKey: message.adminCaseKey || message.caseKey,
+        projectEnvironmentId: message.projectEnvironmentId,
+        dataSource: message.dataSource || message.executionSource,
         backgroundTab: message.backgroundTab === true,
         reuseTabId: message.reuseTabId ?? null,
         startStepIndex: message.startStepIndex,
@@ -248,6 +252,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         viewportMode: message.viewportMode,
         viewportWidth: message.viewportWidth,
         viewportHeight: message.viewportHeight,
+        pageErrorCheckEnabled: message.pageErrorCheckEnabled,
         sourceWindowId: sender.tab?.windowId,
       });
       sendResponse({ ok: true, accepted: true });
@@ -271,7 +276,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'AT_POPUP_PLAY':
       state.apiBase = message.apiBase || state.apiBase;
       state.authToken = message.authToken || state.authToken;
-      void player.start(message.testCaseId, null, { locale: message.locale || 'zh' });
+      void player.start(message.testCaseId, null, {
+        adminCaseKey: message.adminCaseKey || message.caseKey,
+        dataSource: message.dataSource || message.executionSource,
+        locale: message.locale || 'zh',
+      });
       sendResponse({ ok: true, accepted: true });
       return false;
 

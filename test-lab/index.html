@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CueCast Test Case 278</title>
+  <link rel="stylesheet" href="/test-lab/styles.css">
+</head>
+<body>
+  <svg class="icon-sprite" aria-hidden="true" focusable="false">
+    <symbol id="icon-grid" viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></symbol>
+    <symbol id="icon-case" viewBox="0 0 24 24"><path d="M5 7h14v12H5zM9 7V5h6v2M8 12h8M8 16h5"/></symbol>
+    <symbol id="icon-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></symbol>
+    <symbol id="icon-video" viewBox="0 0 24 24"><path d="M5 7h11v10H5zM16 11l4-3v8l-4-3z"/></symbol>
+    <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 0 0-14.9-4M4 4v4h4M4 12a8 8 0 0 0 14.9 4M20 20v-4h-4"/></symbol>
+    <symbol id="icon-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+    <symbol id="icon-copy" viewBox="0 0 24 24"><path d="M8 8h11v11H8zM5 16H4V5h11v1"/></symbol>
+    <symbol id="icon-export" viewBox="0 0 24 24"><path d="M12 16l-4-4h3V4h2v8h3l-4 4z"/></symbol>
+    <symbol id="icon-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V5h6v2m-7 0 .8 12.2h6.4L16 7"/></symbol>
+    <symbol id="icon-edit" viewBox="0 0 24 24"><path d="M5 19l4-.8L18.5 8.7a2.1 2.1 0 0 0-3-3L6 15.2zM14 7l3 3"/></symbol>
+    <symbol id="icon-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="icon-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="icon-window" viewBox="0 0 24 24"><path d="M4 5h16v14H4zM4 9h16"/></symbol>
+    <symbol id="icon-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/></symbol>
+  </svg>
+
+  <div class="app-frame">
+    <aside class="rail">
+      <div class="logo-mark" aria-label="CueCast">C</div>
+      <button class="rail-btn" type="button" title="Dashboard"><svg><use href="#icon-grid"></use></svg></button>
+      <button class="rail-btn is-active" type="button" title="Test Cases"><svg><use href="#icon-case"></use></svg></button>
+      <button class="rail-btn rail-bottom" type="button" title="Open target" data-command="open-target"><svg><use href="#icon-target"></use></svg></button>
+    </aside>
+
+    <section class="page">
+      <header class="global-bar">
+        <button class="project-switch" type="button">
+          <span class="stack-icon"></span>
+          <strong>AAS</strong>
+          <span class="chevron">v</span>
+        </button>
+        <div class="global-actions">
+          <span class="update-tip" id="bridgeStatus"><em class="dot"></em><strong class="status-text">检测中</strong><span class="version"></span></span>
+          <button class="square-btn" type="button" data-command="ping" title="检测插件"><svg><use href="#icon-check"></use></svg></button>
+          <button class="user-btn" type="button">系统管理员</button>
+        </div>
+      </header>
+
+      <main class="case-page">
+        <section class="case-header">
+          <button class="back-btn" type="button" title="返回"><span>&lt;</span></button>
+          <div class="case-heading">
+            <div class="breadcrumb">Test Cases / <span id="caseIdLabel">278</span></div>
+            <div class="title-line">
+              <h1 id="caseName">测试</h1>
+              <span class="status-tag" id="caseStatus">未执行</span>
+            </div>
+            <div class="case-meta">
+              <span>起始 URL: <code id="startUrlText">-</code></span>
+              <span>描述: <strong id="descriptionText">-</strong></span>
+              <span>截图: <strong id="screenshotModeText">标准</strong></span>
+              <span>执行窗口: <strong id="windowSizeText">默认最大化</strong></span>
+              <button type="button" class="text-icon" data-command="edit-case" title="编辑用例"><svg><use href="#icon-edit"></use></svg></button>
+            </div>
+          </div>
+          <div class="case-actions">
+            <button type="button" class="btn" data-command="refresh"><svg><use href="#icon-refresh"></use></svg><span>刷新</span></button>
+            <button type="button" class="btn ghost" data-command="record"><svg><use href="#icon-video"></use></svg><span>开始录制</span></button>
+            <!-- <button type="button" class="btn ghost" data-command="stop"><svg><use href="#icon-stop"></use></svg><span>停止录制</span></button> -->
+            <button type="button" class="btn volt" data-command="play"><svg><use href="#icon-play"></use></svg><span>执行用例</span></button>
+            <button type="button" class="btn ghost" data-command="runner-play"><svg><use href="#icon-play"></use></svg><span>Playwright 回放</span></button>
+            <!-- <button type="button" class="btn volt" data-command="stop"><svg><use href="#icon-stop"></use></svg><span>停止</span></button> -->
+          </div>
+        </section>
+
+        <section class="workbench">
+          <section class="steps-card">
+            <div class="steps-head">
+              <h2>操作步骤（<span id="stepCount">0</span> 步）</h2>
+              <div class="steps-tools">
+                <button type="button" data-command="add-step" title="新增步骤"><svg><use href="#icon-plus"></use></svg></button>
+                <button type="button" data-command="copy-steps" title="复制 JSON"><svg><use href="#icon-copy"></use></svg></button>
+                <button type="button" data-command="export-steps" title="导出 JSON"><svg><use href="#icon-export"></use></svg></button>
+                <button type="button" class="danger-icon" data-command="clear-steps" title="清空步骤"><svg><use href="#icon-trash"></use></svg></button>
+              </div>
+            </div>
+            <div class="step-canvas" id="stepCanvas" aria-live="polite"></div>
+          </section>
+
+          <button class="side-panel-toggle" type="button" data-command="toggle-side-panel" aria-expanded="true" aria-controls="sidePanel" title="收起侧栏">
+            <span aria-hidden="true">›</span>
+          </button>
+
+          <aside class="history-panel" id="sidePanel">
+            <details class="history-settings" open>
+              <summary class="history-head">
+                <h2>执行历史</h2>
+                <span id="runSummary">最近 5 条</span>
+              </summary>
+              <div class="history-list" id="historyList"></div>
+            </details>
+            <details class="debug-settings" open>
+              <summary>本地调试设置</summary>
+              <div class="settings-grid">
+                <label><span>API Base</span><input id="apiBase" type="url" value="http://127.0.0.1:4173/api"></label>
+                <label><span>Auth Token</span><input id="authToken" type="text" placeholder="Bearer token"></label>
+                <label><span>Test Case</span><input id="testCaseId" type="number" min="1" value="278"></label>
+                <label><span>Start URL</span><input id="startUrl" type="url"></label>
+                <label><span>Insert After Step</span><input id="insertAfterStepIndex" type="number" min="0" placeholder="覆盖录制"></label>
+                <label><span>Screenshot</span><select id="screenshotMode"><option value="standard">标准</option><option value="full_hd">全高清</option></select></label>
+                <label><span>Locale</span><select id="locale"><option value="zh">zh</option><option value="en">en</option></select></label>
+                <label><span>Start Step</span><input id="startStepIndex" type="number" min="0" value="0"></label>
+                <label class="checkbox-setting"><span>Runner Headed</span><input id="runnerHeaded" type="checkbox"></label>
+                <label><span>Runner Slow Mo (ms)</span><input id="runnerSlowMo" type="number" min="0" step="50" value="250"></label>
+                <label><span>Finish Delay (ms)</span><input id="runnerFinishDelay" type="number" min="0" step="500" value="5000"></label>
+              </div>
+              <div class="debug-actions">
+                <button type="button" class="btn ghost" data-command="open-play"><svg><use href="#icon-window"></use></svg><span>打开回放页</span></button>
+                <button type="button" class="btn ghost" data-command="focus-play"><svg><use href="#icon-target"></use></svg><span>定位回放页</span></button>
+                <button type="button" class="btn ghost" data-command="focus-runner"><svg><use href="#icon-target"></use></svg><span>尝试定位 Runner 窗口</span></button>
+                <button type="button" class="btn ghost danger" data-command="reset-local"><svg><use href="#icon-trash"></use></svg><span>重置本地数据</span></button>
+              </div>
+            </details>
+          </aside>
+        </section>
+
+        <section class="event-panel">
+          <div class="event-head">
+            <h2>扩展事件</h2>
+            <button type="button" class="btn ghost" data-command="reset-logs">清空</button>
+          </div>
+          <ul class="event-feed" id="eventFeed" aria-live="polite"></ul>
+        </section>
+
+        <div class="toast-zone" id="toastZone" aria-live="polite"></div>
+      </main>
+    </section>
+  </div>
+
+  <dialog class="modal" id="caseDialog">
+    <form method="dialog" class="modal-box" id="caseForm">
+      <header><strong>编辑用例信息</strong><button type="submit" value="cancel" title="关闭">x</button></header>
+      <label><span>用例标题</span><input id="editName" type="text"></label>
+      <label><span>起始 URL</span><input id="editStartUrl" type="url"></label>
+      <label><span>用例描述</span><textarea id="editDescription" rows="3"></textarea></label>
+      <fieldset class="choice-field inline-choice">
+        <legend>截图策略</legend>
+        <label class="radio-row"><input name="editScreenshotMode" type="radio" value="standard"> <span>标准（裁剪截图）</span></label>
+        <label class="radio-row"><input name="editScreenshotMode" type="radio" value="full_hd"> <span>全屏高清</span></label>
+        <p class="field-hint">标准模式更节省存储与加载时间。</p>
+      </fieldset>
+      <fieldset class="choice-field">
+        <legend>执行窗口尺寸</legend>
+        <label class="radio-row"><input name="editWindowSizeMode" type="radio" value="maximized"> <span>默认最大化</span></label>
+        <label class="radio-row"><input name="editWindowSizeMode" type="radio" value="current"> <span>使用当前窗口尺寸</span></label>
+        <label class="radio-row"><input name="editWindowSizeMode" type="radio" value="custom"> <span>自定义尺寸</span></label>
+        <div class="size-row" id="editWindowSizeCustom">
+          <label><span>宽度</span><input id="editViewportWidth" type="number" min="320" step="1" placeholder="1920"></label>
+          <label><span>高度</span><input id="editViewportHeight" type="number" min="320" step="1" placeholder="1080"></label>
+        </div>
+        <p class="field-hint">执行时默认打开最大化窗口；当前窗口尺寸会保存本页当前视口大小。</p>
+      </fieldset>
+      <label class="option-card">
+        <input id="editPageErrorCheckEnabled" type="checkbox">
+        <span>失败时启用 AI 分析</span>
+        <small>开启后会生成更完整的失败诊断，但失败结果需要等待大模型分析，保存与展示会变慢。</small>
+      </label>
+      <footer>
+        <button class="btn ghost" type="submit" value="cancel">取消</button>
+        <button class="btn volt" type="submit" value="save">保存</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="modal" id="stepDialog">
+    <form method="dialog" class="modal-box" id="stepForm">
+      <header><strong id="stepDialogTitle">编辑步骤</strong><button type="submit" value="cancel" title="关闭">x</button></header>
+      <input id="editStepId" type="hidden">
+      <label><span>动作</span><select id="editActionType">
+        <option value="click">click</option>
+        <option value="input">input</option>
+        <option value="key">key</option>
+        <option value="hover">hover</option>
+        <option value="scroll">scroll</option>
+        <option value="wait">wait</option>
+        <option value="assert_text">assert_text</option>
+        <option value="assert_json">assert_json</option>
+        <option value="ai_natural">ai_natural</option>
+      </select></label>
+      <label><span>步骤描述</span><input id="editStepDescription" type="text"></label>
+      <label><span>CSS Selector</span><input id="editSelector" type="text"></label>
+      <label><span>XPath</span><input id="editXPath" type="text"></label>
+      <label><span>Value</span><textarea id="editValue" rows="3"></textarea></label>
+      <footer>
+        <button class="btn ghost" type="submit" value="cancel">取消</button>
+        <button class="btn volt" type="submit" value="save">保存</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="image-preview" id="thumbDialog">
+    <button type="button" class="image-preview-close" id="thumbPreviewClose" aria-label="关闭">x</button>
+    <div class="image-preview-stage">
+      <img id="thumbPreview" alt="">
+    </div>
+    <div class="image-preview-hint">双击图片关闭 · Esc</div>
+  </dialog>
+
+  <template id="stepTemplate">
+    <article class="step-card">
+      <div class="step-thumb"></div>
+      <div class="step-body">
+        <div class="step-meta"><span class="step-number"></span><span class="action-chip"></span></div>
+        <strong class="step-title"></strong>
+        <details class="selector-line"><summary>选择器与 URL</summary><code></code></details>
+        <div class="step-actions">
+          <button type="button" data-step-action="edit">编辑</button>
+          <button type="button" data-step-action="duplicate">复制</button>
+          <button type="button" data-step-action="delete">删除</button>
+        </div>
+      </div>
+    </article>
+  </template>
+
+  <script src="/test-lab/app.js"></script>
+</body>
+</html>

@@ -7,12 +7,12 @@ Manifest V3 Chrome 扩展，实现录制与回放功能。
 1. 打开 Chrome 浏览器，地址栏输入 `chrome://extensions/`
 2. 右上角开启「开发者模式」
 3. 点击「加载已解压的扩展程序」
-4. 选择扩展目录（`D:\King\sakura-playwright\cuecast`）
+4. 选择扩展目录（`D:\King\sakura\sakura-cuecast`）
 
 ## 目录结构
 
 ```
-cuecast/
+./
 ├── manifest.json          - 插件配置（Manifest V3）
 ├── background.js          - Service Worker 核心调度器
 ├── modules/

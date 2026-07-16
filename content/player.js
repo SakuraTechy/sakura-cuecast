@@ -1330,7 +1330,7 @@
     return candidates[0]?.item || null;
   }
 
-  /** 与 cuecast/modules/player-manager.js 中 PAGE_LOADING_UI_CHECK 语义一致 */
+  /** 与 modules/player-manager.js 中 PAGE_LOADING_UI_CHECK 语义一致 */
   const LOADING_WAIT_WALL_MS = 180000;
 
   function isPageLoadingUi() {
@@ -1354,7 +1354,7 @@
     return false;
   }
 
-  /** 须与 cuecast/modules/player-manager.js 中 DEFAULT_PAGE_ERROR_KEYWORDS 保持一致 */
+  /** 须与 modules/player-manager.js 中 DEFAULT_PAGE_ERROR_KEYWORDS 保持一致 */
   const PAGE_ERROR_KEYWORDS = [
     '请求失败', '加载失败', '网络错误', '网络异常', '系统异常', '操作失败', '登录失败',
     '权限不足', '无权限', '访问被拒绝', '服务异常', '服务器错误', '请稍后重试', '接口异常',

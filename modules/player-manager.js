@@ -398,10 +398,11 @@ export class PlayerManager {
     const sourceCaseKey = adminCaseKey || String(testCaseId || '').trim();
     const runStartedAt = Date.now();
     const safeCaseKey = sourceCaseKey.replace(/[^A-Za-z0-9._-]/g, '_') || 'case';
-    const runId = `${safeCaseKey}-${runStartedAt}`;
+    const runId = String(opts.executionId || '').trim() || `${safeCaseKey}-${runStartedAt}`;
     let playbackOutcome = null;
     const executionSnapshot = {
       project_environment_id: opts.projectEnvironmentId ?? '',
+      batch_id: opts.batchId ?? '',
       window_size_mode: opts.viewportMode ?? '',
       viewport_width: opts.viewportWidth ?? null,
       viewport_height: opts.viewportHeight ?? null,
@@ -553,7 +554,7 @@ export class PlayerManager {
       const playbackScreenshots = new Array(steps.length).fill('');
       const aiSubtasksByStep = {};
       const stepResults = [];
-      const appendStepResult = (step, index, status, startedAt, error = '') => {
+      const appendStepResult = (step, index, status, startedAt, error = '', locator = null) => {
         stepResults.push({
           step_id: step?.id ?? '',
           step_index: index,
@@ -563,6 +564,12 @@ export class PlayerManager {
           target_xpath: step?.target_xpath || '',
           status,
           duration_ms: Math.max(0, Date.now() - startedAt),
+          ...(locator ? {
+            locator_source: locator.source || '',
+            locator_type: locator.type || '',
+            locator_value: locator.value || '',
+            matched_count: locator.matchedCount ?? null,
+          } : {}),
           ...(error ? { error } : {}),
         });
       };
@@ -588,6 +595,7 @@ export class PlayerManager {
         this._notifyPopup(stepLine);
 
         try {
+          let actualLocator = null;
           const waitBefore = Math.max(0, Number(runtimeStep.wait_before) || 0);
           if (waitBefore) await this._sleep(waitBefore);
           const executableStep = waitBefore ? { ...runtimeStep, wait_before: 0 } : runtimeStep;
@@ -631,7 +639,7 @@ export class PlayerManager {
             await this._executeAssertTextStepCDP(playTabId, executableStep);
           } else if (cdpAvailable && this._canUseCDP(executableStep)) {
             try {
-              await this._executeStepCDP(playTabId, executableStep, targetUrl, ctx.locale, runtimeNextStep, {
+              actualLocator = await this._executeStepCDP(playTabId, executableStep, targetUrl, ctx.locale, runtimeNextStep, {
                 beforeActionScreenshot: captureCurrentStep,
               });
             } catch (cdpErr) {
@@ -652,7 +660,7 @@ export class PlayerManager {
           if (['click', 'navigate', 'ai_natural'].includes(String(executableStep.action_type || '').trim().toLowerCase())) {
             await this._waitForTabLoad(playTabId);
           }
-          appendStepResult(runtimeStep, i, 'passed', stepStartedAt);
+          appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', actualLocator);
         } catch (err) {
           const rawErrMsg = err && err.message ? err.message : String(err);
           errorMsg = localizePlaybackError(ctx.locale, rawErrMsg);
@@ -740,6 +748,7 @@ export class PlayerManager {
           // 保留 extension-cdp 执行器和原始诊断，admin 只负责存储/展示结果。
           raw: {
             executor: 'extension-cdp',
+            batch_id: opts.batchId || '',
             run_id: runId,
             started_at: formatPlatformDateTime(runStartedAt),
             finished_at: formatPlatformDateTime(),
@@ -794,6 +803,7 @@ export class PlayerManager {
           error: msg,
           raw: {
             executor: 'extension-cdp',
+            batch_id: opts.batchId || '',
             run_id: runId,
             started_at: formatPlatformDateTime(runStartedAt),
             finished_at: formatPlatformDateTime(finishedAt),
@@ -819,7 +829,12 @@ export class PlayerManager {
       this._broadcastPlayback({
         type: 'AT_PLAYBACK_END',
         testCaseId,
-        ...(useAdminCase ? { adminCaseKey: sourceCaseKey, executor: 'extension-cdp', runId } : {}),
+        ...(useAdminCase ? {
+          adminCaseKey: sourceCaseKey,
+          batchId: opts.batchId || '',
+          executor: 'extension-cdp',
+          runId,
+        } : {}),
         ...(playbackOutcome || { ok: false, error: 'Playback ended without a result' }),
       });
       if (ctx != null) {
@@ -4781,8 +4796,40 @@ export class PlayerManager {
       && PlayerManager._sameRecordedTarget(step, nextStep);
   }
 
+  static _actualLocatorFromVia(step, via, matchedCount = 1) {
+    const source = String(via || '').trim();
+    if (!source) return null;
+    const candidates = PlayerManager._normalizeLocatorMetaCandidates(step?.locator_meta);
+    let type = '';
+    let value = '';
+    if (source.startsWith('meta-')) {
+      const sourceType = source.slice(5);
+      const candidate = sourceType === 'xpath'
+        ? candidates.find((item) => ['table_cell_xpath', 'xpath_fallback'].includes(String(item?.type || '')))
+        : sourceType === 'text'
+          ? candidates.find((item) => String(item?.type || '') === 'text_exact')
+          : candidates.find((item) => String(item?.type || '') === sourceType);
+      type = String(candidate?.type || sourceType);
+      value = String(candidate?.value || '');
+    } else if (source === 'css') {
+      type = 'css';
+      value = String(step?.target_selector || '');
+    } else if (source === 'xpath') {
+      type = 'xpath';
+      value = String(step?.target_xpath || '');
+    } else if (source === 'text' || source === 'overlay-text') {
+      type = 'text_exact';
+      value = String(step?.value || '');
+    } else {
+      type = source;
+      value = String(step?.target_selector || step?.target_xpath || step?.value || '');
+    }
+    return { source: `cdp:${source}`, type, value, matchedCount };
+  }
+
   async _executeStepCDP(tabId, step, baseUrl, locale = 'zh', nextStep = null, hooks = {}) {
     if (step.wait_before) await this._sleep(step.wait_before);
+    let actualLocator = null;
     switch (step.action_type) {
       case 'click':
       case 'double_click':
@@ -4804,6 +4851,7 @@ export class PlayerManager {
         let box;
         if (looksLikeOverlay) {
           box = await this._clickOverlayItem(tabId, step, locale, { hadReveal: !!revealTrigger });
+          actualLocator = PlayerManager._actualLocatorFromVia(step, 'overlay-text');
         } else {
           // 普通点击：检查 disabled 状态，等待组件就绪（级联 Select 场景）
           const boxResult = await this._getElementBoxResult(
@@ -4813,6 +4861,7 @@ export class PlayerManager {
           if (!box) {
             throw new Error(this._formatElementWaitFailure(boxResult, step.target_selector, step.target_xpath));
           }
+          actualLocator = PlayerManager._actualLocatorFromVia(step, box?.via);
         }
 
         // scrollIntoView 后等一帧让浏览器重排，再重取坐标（防止滚动偏差）
@@ -4849,6 +4898,12 @@ export class PlayerManager {
       }
 
       case 'input': {
+        if (step.target_selector || step.target_xpath || step.locator_meta) {
+          const probe = await this._getElementBoxResult(
+            tabId, step.target_selector, step.target_xpath, '', 1600, false, step.locator_meta
+          );
+          if (probe?.ok) actualLocator = PlayerManager._actualLocatorFromVia(step, probe.box?.via);
+        }
         const deadline = Date.now() + 8000;
         let lastErr = null;
         while (Date.now() < deadline) {
@@ -4888,6 +4943,12 @@ export class PlayerManager {
       }
 
       case 'key': {
+        if (step.target_selector || step.target_xpath || step.locator_meta) {
+          const probe = await this._getElementBoxResult(
+            tabId, step.target_selector, step.target_xpath, '', 1200, true, step.locator_meta
+          );
+          if (probe?.ok) actualLocator = PlayerManager._actualLocatorFromVia(step, probe.box?.via);
+        }
         const deadline = Date.now() + 6500;
         let lastErr = null;
         while (Date.now() < deadline) {
@@ -4915,8 +4976,12 @@ export class PlayerManager {
       }
 
       case 'hover': {
-        const box = await this._getElementBox(tabId, step.target_selector, step.target_xpath, '', 5000, false, step.locator_meta);
+        const boxResult = await this._getElementBoxResult(
+          tabId, step.target_selector, step.target_xpath, '', 5000, false, step.locator_meta
+        );
+        const box = boxResult?.ok ? boxResult.box : null;
         if (box) {
+          actualLocator = PlayerManager._actualLocatorFromVia(step, box.via);
           await this._sleep(120);
           const freshBox = await this._getElementBox(
             tabId, step.target_selector, step.target_xpath, '', 2000, false, step.locator_meta
@@ -4945,6 +5010,7 @@ export class PlayerManager {
       default:
         await this._executeStepDOM(tabId, step, locale);
     }
+    return actualLocator;
   }
 
   // =========================================================

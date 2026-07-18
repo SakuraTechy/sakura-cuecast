@@ -1,3 +1,117 @@
+# 2026-07-17 CueCast 批次标识与实际定位结果回传
+
+## 变更内容
+
+1. admin 发起 CDP 批量回放时透传服务端生成的 `batchId` 和稳定 `executionId`，成功、失败以及结束广播始终使用同一运行标识。
+2. CDP 点击、输入、键盘和悬停步骤回传实际命中的定位来源、类型、值与匹配数量；没有经过定位器确认的 DOM 降级路径不伪造实际定位。
+3. 纯键盘或无定位配置的输入步骤不会额外执行元素探测，保持原有执行语义和响应速度。
+
+## 涉及文件
+
+- `background.js`
+- `modules/player-manager.js`
+- `commit/git-commit-log.md`
+
+## 验证
+
+已执行：
+
+    node --check background.js
+    node --check modules/player-manager.js
+
+结果：扩展脚本语法检查通过；服务端批次标识、运行标识和实际定位字段已具备端到端回传契约，真实 Chrome CDP 操作仍需在扩展重新加载后做现场回放验证。
+
+## 具体代码改动
+
+### `background.js`
+
+`AT_PLATFORM_PLAY` 将批次与运行标识原样传入 `PlayerManager`：
+
+```diff
+       void player.start(message.testCaseId, message.startUrl, {
+         adminCaseKey: message.adminCaseKey || message.caseKey,
++        batchId: message.batchId,
++        executionId: message.executionId,
+         projectEnvironmentId: message.projectEnvironmentId,
+```
+
+### `modules/player-manager.js`
+
+优先采用服务端运行 ID，并把批次 ID 写入成功与失败结果；步骤只在 CDP 确认实际命中后附加定位诊断：
+
+```diff
+-    const runId = `${safeCaseKey}-${runStartedAt}`;
++    const runId = String(opts.executionId || '').trim() || `${safeCaseKey}-${runStartedAt}`;
+     const executionSnapshot = {
+       project_environment_id: opts.projectEnvironmentId ?? '',
++      batch_id: opts.batchId ?? '',
+@@
+-      const appendStepResult = (step, index, status, startedAt, error = '') => {
++      const appendStepResult = (step, index, status, startedAt, error = '', locator = null) => {
+         stepResults.push({
+@@
++          ...(locator ? {
++            locator_source: locator.source || '',
++            locator_type: locator.type || '',
++            locator_value: locator.value || '',
++            matched_count: locator.matchedCount ?? null,
++          } : {}),
+@@
+-              await this._executeStepCDP(playTabId, executableStep, targetUrl, ctx.locale, runtimeNextStep, {
++              actualLocator = await this._executeStepCDP(playTabId, executableStep, targetUrl, ctx.locale, runtimeNextStep, {
+@@
+-          appendStepResult(runtimeStep, i, 'passed', stepStartedAt);
++          appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', actualLocator);
+```
+
+定位来源由 `_buildFindCode` 的真实 `via` 结果转换，输入和键盘步骤仅在存在定位配置时探测：
+
+```diff
++  static _actualLocatorFromVia(step, via, matchedCount = 1) {
++    const source = String(via || '').trim();
++    if (!source) return null;
++    const candidates = PlayerManager._normalizeLocatorMetaCandidates(step?.locator_meta);
++    let type = '';
++    let value = '';
++    if (source.startsWith('meta-')) {
++      const sourceType = source.slice(5);
++      const candidate = sourceType === 'xpath'
++        ? candidates.find((item) => ['table_cell_xpath', 'xpath_fallback'].includes(String(item?.type || '')))
++        : sourceType === 'text'
++          ? candidates.find((item) => String(item?.type || '') === 'text_exact')
++          : candidates.find((item) => String(item?.type || '') === sourceType);
++      type = String(candidate?.type || sourceType);
++      value = String(candidate?.value || '');
++    } else if (source === 'css') {
++      type = 'css';
++      value = String(step?.target_selector || '');
++    } else if (source === 'xpath') {
++      type = 'xpath';
++      value = String(step?.target_xpath || '');
++    } else if (source === 'text' || source === 'overlay-text') {
++      type = 'text_exact';
++      value = String(step?.value || '');
++    } else {
++      type = source;
++      value = String(step?.target_selector || step?.target_xpath || step?.value || '');
++    }
++    return { source: `cdp:${source}`, type, value, matchedCount };
++  }
+@@
+       case 'input': {
++        if (step.target_selector || step.target_xpath || step.locator_meta) {
++          const probe = await this._getElementBoxResult(
++            tabId, step.target_selector, step.target_xpath, '', 1600, false, step.locator_meta
++          );
++          if (probe?.ok) actualLocator = PlayerManager._actualLocatorFromVia(step, probe.box?.via);
++        }
+@@
+-    }
++    }
++    return actualLocator;
+   }
+```
+
 # 2026-07-16 CueCast CDP 执行时间格式统一
 
 ## 变更内容
@@ -61,6 +175,44 @@ node --check modules/player-manager.js
 +            started_at: formatPlatformDateTime(runStartedAt),
 +            finished_at: formatPlatformDateTime(finishedAt),
 ```
+
+# 2026-07-15 CueCast CDP 执行记录标识与时间补全
+
+## 变更内容
+
+1. 扩展 CDP 回放在任务启动时生成稳定的 `run_id`，并在成功、步骤失败和启动失败结果中统一回传。
+2. 回传结果补齐 `started_at`、`finished_at`，启动失败时也按真实起止时间计算 `duration_ms`。
+3. `AT_PLAYBACK_END` 事件携带同一个 `runId`，便于 admin 页面把异步结束事件与执行记录关联。
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `commit/git-commit-log.md`
+
+## 验证
+
+执行：
+
+    node --check modules/player-manager.js
+
+结果：扩展回放脚本语法检查通过；真实 Chrome CDP 端到端结果将在本轮 admin-ui 联调中继续验证。
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+在 `start` 生命周期入口记录 `runStartedAt` 并生成文件系统与 URL 安全的 `runId`。admin 成功结果和启动失败结果均写入以下字段：
+
+```js
+{
+  executor: 'extension-cdp',
+  run_id: runId,
+  started_at: new Date(runStartedAt).toISOString(),
+  finished_at: new Date().toISOString(),
+}
+```
+
+结束广播增加 `runId`，保持页面状态、执行历史和后端记录使用同一执行标识。
 
 # 2026-07-15 CueCast CDP 产品环境回放配置
 
@@ -177,6 +329,151 @@ artifact 绝对路径统一转换为 mock server 可访问的 `/artifacts/...` U
 +const index = raw.lastIndexOf(marker);
 +if (index >= 0) return raw.slice(index);
 ```
+
+# 2026-07-14 CueCast admin 数据源 CDP 回放接入
+
+## 变更内容
+
+1. CueCast API 客户端新增 admin Playwright case 读取和结果回传接口，使用 `sceneDbId:caseId` 作为唯一 case key。
+2. `PlayerManager` 在收到 `adminCaseKey` 或 `dataSource=admin` 时，从 admin 读取完整 `playwright_step`，继续复用现有 CDP 优先、DOM 降级和复杂定位逻辑。
+3. 扩展回放结果按 `extension-cdp` executor 回写 admin，保留失败步骤、截图计数、定位和诊断信息；admin 结果 JSON 不直接写入截图 base64，未携带 admin 标记的旧 mock/legacy 回放路径不变。
+4. admin-ui 场景编辑页新增“扩展 CDP 回放”入口，选中用例后通过 `AT_PLATFORM_PLAY` 将 case key 和当前登录 token 传给 CueCast。
+
+## 涉及文件
+
+- modules/api-client.js
+- modules/player-manager.js
+- background.js
+- ../sakura-admin-ui/src/views/automation/automationUiScene/components/AddOrEditForm.vue
+- commit/git-commit-log.md
+
+## 验证
+
+已执行：
+
+    node --check modules/api-client.js
+    node --check modules/player-manager.js
+    node --check background.js
+
+结果：扩展脚本语法检查、admin-ui `typecheck`/生产构建、Runner `npm run check`、admin `continew-automation` `compile`/`test-compile` 均通过；登录浏览器端回放验证仍需在真实环境手动执行。
+
+## 具体代码改动
+
+### `modules/api-client.js`
+
+新增 admin case 读取与结果回传：
+
+```js
+getAdminPlaywrightCase(caseKey) {
+  return this.request('GET', `/automation/playwright/testcases/${encodeURIComponent(caseKey)}`);
+}
+
+saveAdminPlaywrightResult(caseKey, result) {
+  return this.request(
+    'POST',
+    `/automation/playwright/testcases/${encodeURIComponent(caseKey)}/results`,
+    result,
+    { timeoutMs: 30000 },
+  );
+}
+```
+
+### `modules/player-manager.js`
+
+扩展回放根据 admin case key 选择数据源，执行完成后将 `raw.executor` 标记为 `extension-cdp`。原始 `playwright_step` 由 admin 后端返回，扩展不重组 admin 内部 `caseList` 结构。
+
+### `background.js`
+
+`AT_PLATFORM_PLAY` 和 `AT_POPUP_PLAY` 透传 `adminCaseKey`、`caseKey`、`dataSource` 和 `executionSource` 到 `PlayerManager`。
+
+# 2026-07-14 CueCast CDP 回放失败诊断补强
+
+## 变更内容
+
+1. `PlayerManager` 保存回放结果，在 admin case 读取、起始页校验或 CDP attach 阶段异常时也回传 `failed`，避免中台只显示“已接受”而没有最终错误。
+2. `AT_PLAYBACK_END` 增加 `ok`、`error`、`adminCaseKey`、`executor` 和 `cdp_attach_error` 诊断信息，便于管理页与扩展后台定位失败点。
+3. admin-ui 监听扩展回放结束事件，失败时直接显示实际错误，不再把异步启动确认误认为执行成功。
+4. admin 来源要求 `chrome.debugger.attach` 成功；仅旧本地 mock/legacy 来源允许继续 DOM 降级。
+
+## 涉及文件
+
+- modules/player-manager.js
+- ../sakura-admin-ui/src/views/automation/automationUiScene/components/AddOrEditForm.vue
+- commit/git-commit-log.md
+
+## 验证
+
+已执行：
+
+    node --check modules/player-manager.js
+    node --check background.js
+    node --check modules/api-client.js
+    npm run typecheck（sakura-admin-ui）
+
+结果：扩展脚本语法检查和 admin-ui 类型检查通过；真实 Chrome CDP attach 与目标页面操作仍需根据新增错误信息进行现场复现。
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+回放异常时回传：
+
+```js
+{
+  type: 'AT_PLAYBACK_END',
+  ok: false,
+  error: msg,
+  adminCaseKey: sourceCaseKey,
+  executor: 'extension-cdp',
+}
+```
+
+并将 `chrome.debugger.attach` 的异常写入 `cdp_attach_error`；admin 读取失败也尝试保存启动失败结果，且 admin 来源不会在 CDP 失败后静默改走 DOM。
+
+### `AddOrEditForm.vue`
+
+监听匹配当前 `adminCaseKey` 的 `AT_PLAYBACK_END`，收到失败事件后显示扩展实际错误。
+同时在发送 `AT_PLATFORM_PLAY` 前通过当前 admin 会话预检 case，校验步骤并传递起始 URL、窗口和视口参数。
+
+# 2026-07-14 CueCast 回放用例与步骤结果回传
+
+## 变更内容
+
+1. `PlayerManager` 在扩展回放过程中逐步骤记录 `passed`、`failed`、`skipped`，并回传用例汇总、步骤明细、持续时间和错误信息。
+2. admin 结果接口解析 `case_result`，保存用例/步骤统计到 `debugRecord`，同时更新场景最近一次执行结果，保留旧 Runner 结果格式兼容。
+3. admin-ui 执行历史新增 Playwright 用例执行明细，展示用例结果以及每个步骤的通过、失败、跳过和错误信息。
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `../sakura-admin/continew-automation/src/main/java/top/continew/admin/automation/service/impl/AutomationPlaywrightCaseServiceImpl.java`
+- `../sakura-admin-ui/src/views/automation/automationUiScene/components/AutomationUiSceneDetailDrawer.vue`
+- `commit/git-commit-log.md`
+
+## 验证
+
+已执行：
+
+    node --check modules/player-manager.js
+    npm run typecheck（sakura-admin-ui）
+    mvn -pl continew-automation -am -DskipTests compile（sakura-admin）
+
+结果：扩展脚本语法检查、admin-ui 类型检查和 admin 后端编译通过；真实 Chrome CDP 回放仍需在扩展重新加载后执行一条 admin 用例确认端到端结果。
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+新增 `step_results` 和 `case_result` 回传。步骤执行成功、失败或被停止/前置失败跳过时均生成明细，未识别动作仍沿用原始步骤执行路径，不丢弃 `playwright_step` 和定位信息。
+
+### `AutomationPlaywrightCaseServiceImpl.java`
+
+解析扩展上报的用例/步骤结果，生成兼容现有 `debugRecord` 的统计字段和明细字段，并更新场景最近一次执行的通过率、用例统计和步骤统计。
+
+### `AutomationUiSceneDetailDrawer.vue`
+
+从最近一次回放记录读取 `caseResults` 和 `stepResults`，在执行历史中展示用例汇总与步骤级结果。
+
 
 # 2026-07-13 CueCast 用例内步骤追加与替换模式
 
@@ -809,183 +1106,3 @@ node --check modules/recorder-manager.js
 +      saveContext,
      });
 ```
-# 2026-07-14 CueCast admin 数据源 CDP 回放接入
-
-## 变更内容
-
-1. CueCast API 客户端新增 admin Playwright case 读取和结果回传接口，使用 `sceneDbId:caseId` 作为唯一 case key。
-2. `PlayerManager` 在收到 `adminCaseKey` 或 `dataSource=admin` 时，从 admin 读取完整 `playwright_step`，继续复用现有 CDP 优先、DOM 降级和复杂定位逻辑。
-3. 扩展回放结果按 `extension-cdp` executor 回写 admin，保留失败步骤、截图计数、定位和诊断信息；admin 结果 JSON 不直接写入截图 base64，未携带 admin 标记的旧 mock/legacy 回放路径不变。
-4. admin-ui 场景编辑页新增“扩展 CDP 回放”入口，选中用例后通过 `AT_PLATFORM_PLAY` 将 case key 和当前登录 token 传给 CueCast。
-
-## 涉及文件
-
-- modules/api-client.js
-- modules/player-manager.js
-- background.js
-- ../sakura-admin-ui/src/views/automation/automationUiScene/components/AddOrEditForm.vue
-- commit/git-commit-log.md
-
-## 验证
-
-已执行：
-
-    node --check modules/api-client.js
-    node --check modules/player-manager.js
-    node --check background.js
-
-结果：扩展脚本语法检查、admin-ui `typecheck`/生产构建、Runner `npm run check`、admin `continew-automation` `compile`/`test-compile` 均通过；登录浏览器端回放验证仍需在真实环境手动执行。
-
-## 具体代码改动
-
-### `modules/api-client.js`
-
-新增 admin case 读取与结果回传：
-
-```js
-getAdminPlaywrightCase(caseKey) {
-  return this.request('GET', `/automation/playwright/testcases/${encodeURIComponent(caseKey)}`);
-}
-
-saveAdminPlaywrightResult(caseKey, result) {
-  return this.request(
-    'POST',
-    `/automation/playwright/testcases/${encodeURIComponent(caseKey)}/results`,
-    result,
-    { timeoutMs: 30000 },
-  );
-}
-```
-
-### `modules/player-manager.js`
-
-扩展回放根据 admin case key 选择数据源，执行完成后将 `raw.executor` 标记为 `extension-cdp`。原始 `playwright_step` 由 admin 后端返回，扩展不重组 admin 内部 `caseList` 结构。
-
-### `background.js`
-
-`AT_PLATFORM_PLAY` 和 `AT_POPUP_PLAY` 透传 `adminCaseKey`、`caseKey`、`dataSource` 和 `executionSource` 到 `PlayerManager`。
-
-# 2026-07-14 CueCast CDP 回放失败诊断补强
-
-## 变更内容
-
-1. `PlayerManager` 保存回放结果，在 admin case 读取、起始页校验或 CDP attach 阶段异常时也回传 `failed`，避免中台只显示“已接受”而没有最终错误。
-2. `AT_PLAYBACK_END` 增加 `ok`、`error`、`adminCaseKey`、`executor` 和 `cdp_attach_error` 诊断信息，便于管理页与扩展后台定位失败点。
-3. admin-ui 监听扩展回放结束事件，失败时直接显示实际错误，不再把异步启动确认误认为执行成功。
-4. admin 来源要求 `chrome.debugger.attach` 成功；仅旧本地 mock/legacy 来源允许继续 DOM 降级。
-
-## 涉及文件
-
-- modules/player-manager.js
-- ../sakura-admin-ui/src/views/automation/automationUiScene/components/AddOrEditForm.vue
-- commit/git-commit-log.md
-
-## 验证
-
-已执行：
-
-    node --check modules/player-manager.js
-    node --check background.js
-    node --check modules/api-client.js
-    npm run typecheck（sakura-admin-ui）
-
-结果：扩展脚本语法检查和 admin-ui 类型检查通过；真实 Chrome CDP attach 与目标页面操作仍需根据新增错误信息进行现场复现。
-
-## 具体代码改动
-
-### `modules/player-manager.js`
-
-回放异常时回传：
-
-```js
-{
-  type: 'AT_PLAYBACK_END',
-  ok: false,
-  error: msg,
-  adminCaseKey: sourceCaseKey,
-  executor: 'extension-cdp',
-}
-```
-
-并将 `chrome.debugger.attach` 的异常写入 `cdp_attach_error`；admin 读取失败也尝试保存启动失败结果，且 admin 来源不会在 CDP 失败后静默改走 DOM。
-
-### `AddOrEditForm.vue`
-
-监听匹配当前 `adminCaseKey` 的 `AT_PLAYBACK_END`，收到失败事件后显示扩展实际错误。
-同时在发送 `AT_PLATFORM_PLAY` 前通过当前 admin 会话预检 case，校验步骤并传递起始 URL、窗口和视口参数。
-
-# 2026-07-14 CueCast 回放用例与步骤结果回传
-
-## 变更内容
-
-1. `PlayerManager` 在扩展回放过程中逐步骤记录 `passed`、`failed`、`skipped`，并回传用例汇总、步骤明细、持续时间和错误信息。
-2. admin 结果接口解析 `case_result`，保存用例/步骤统计到 `debugRecord`，同时更新场景最近一次执行结果，保留旧 Runner 结果格式兼容。
-3. admin-ui 执行历史新增 Playwright 用例执行明细，展示用例结果以及每个步骤的通过、失败、跳过和错误信息。
-
-## 涉及文件
-
-- `modules/player-manager.js`
-- `../sakura-admin/continew-automation/src/main/java/top/continew/admin/automation/service/impl/AutomationPlaywrightCaseServiceImpl.java`
-- `../sakura-admin-ui/src/views/automation/automationUiScene/components/AutomationUiSceneDetailDrawer.vue`
-- `commit/git-commit-log.md`
-
-## 验证
-
-已执行：
-
-    node --check modules/player-manager.js
-    npm run typecheck（sakura-admin-ui）
-    mvn -pl continew-automation -am -DskipTests compile（sakura-admin）
-
-结果：扩展脚本语法检查、admin-ui 类型检查和 admin 后端编译通过；真实 Chrome CDP 回放仍需在扩展重新加载后执行一条 admin 用例确认端到端结果。
-
-## 具体代码改动
-
-### `modules/player-manager.js`
-
-新增 `step_results` 和 `case_result` 回传。步骤执行成功、失败或被停止/前置失败跳过时均生成明细，未识别动作仍沿用原始步骤执行路径，不丢弃 `playwright_step` 和定位信息。
-
-### `AutomationPlaywrightCaseServiceImpl.java`
-
-解析扩展上报的用例/步骤结果，生成兼容现有 `debugRecord` 的统计字段和明细字段，并更新场景最近一次执行的通过率、用例统计和步骤统计。
-
-### `AutomationUiSceneDetailDrawer.vue`
-
-从最近一次回放记录读取 `caseResults` 和 `stepResults`，在执行历史中展示用例汇总与步骤级结果。
-# 2026-07-15 CueCast CDP 执行记录标识与时间补全
-
-## 变更内容
-
-1. 扩展 CDP 回放在任务启动时生成稳定的 `run_id`，并在成功、步骤失败和启动失败结果中统一回传。
-2. 回传结果补齐 `started_at`、`finished_at`，启动失败时也按真实起止时间计算 `duration_ms`。
-3. `AT_PLAYBACK_END` 事件携带同一个 `runId`，便于 admin 页面把异步结束事件与执行记录关联。
-
-## 涉及文件
-
-- `modules/player-manager.js`
-- `commit/git-commit-log.md`
-
-## 验证
-
-执行：
-
-    node --check modules/player-manager.js
-
-结果：扩展回放脚本语法检查通过；真实 Chrome CDP 端到端结果将在本轮 admin-ui 联调中继续验证。
-
-## 具体代码改动
-
-### `modules/player-manager.js`
-
-在 `start` 生命周期入口记录 `runStartedAt` 并生成文件系统与 URL 安全的 `runId`。admin 成功结果和启动失败结果均写入以下字段：
-
-```js
-{
-  executor: 'extension-cdp',
-  run_id: runId,
-  started_at: new Date(runStartedAt).toISOString(),
-  finished_at: new Date().toISOString(),
-}
-```
-
-结束广播增加 `runId`，保持页面状态、执行历史和后端记录使用同一执行标识。

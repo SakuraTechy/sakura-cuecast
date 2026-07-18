@@ -243,6 +243,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       state.authToken = message.authToken || state.authToken;
       void player.start(message.testCaseId, message.startUrl, {
         adminCaseKey: message.adminCaseKey || message.caseKey,
+        batchId: message.batchId,
+        executionId: message.executionId,
         projectEnvironmentId: message.projectEnvironmentId,
         dataSource: message.dataSource || message.executionSource,
         backgroundTab: message.backgroundTab === true,

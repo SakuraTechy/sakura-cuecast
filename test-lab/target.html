@@ -244,6 +244,25 @@
       opacity: 0;
       pointer-events: none;
     }
+    .semantic-checkbox {
+      position: relative;
+      display: inline-flex;
+      width: fit-content;
+      min-height: 34px;
+      align-items: center;
+      padding: 0 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--ink);
+      cursor: pointer;
+    }
+    .semantic-checkbox .el-checkbox__original {
+      position: absolute;
+      width: 0;
+      height: 0;
+      opacity: 0;
+      z-index: -1;
+    }
     [data-testid="m5o-tree-children"][hidden] {
       display: none;
     }
@@ -382,6 +401,15 @@
       <button type="button" data-testid="m5o-upload-proxy">代理上传文件</button>
       <strong data-testid="m5o-upload-status">Proxy Upload Idle</strong>
       <a href="/test-lab/downloads/m5o-binary.bin" download="m5o-binary.bin" data-testid="m5o-binary-download">下载二进制样例</a>
+
+      <h2>定位语义对齐</h2>
+      <label class="semantic-checkbox el-checkbox fs-checkbox" data-testid="semantic-hidden-checkbox-label">
+        <span class="el-checkbox__input">
+          <input class="el-checkbox__original" type="checkbox" data-testid="semantic-hidden-checkbox-input">
+        </span>
+        <span>语义复选框</span>
+      </label>
+      <strong data-testid="semantic-hidden-checkbox-status">Semantic Checkbox Idle</strong>
     </section>
   </main>
 
@@ -522,6 +550,11 @@
       document.querySelector('[data-testid="m5o-upload-status"]').textContent = file
         ? `Proxy Uploaded ${file.name}`
         : 'Proxy Upload Idle';
+    });
+    document.querySelector('[data-testid="semantic-hidden-checkbox-input"]').addEventListener('change', (event) => {
+      document.querySelector('[data-testid="semantic-hidden-checkbox-status"]').textContent = event.target.checked
+        ? 'Semantic Checkbox Checked'
+        : 'Semantic Checkbox Unchecked';
     });
     document.querySelector('[data-testid="m5c-fetch-profile"]').addEventListener('click', async () => {
       const response = await fetch('/api/m5c/profile');

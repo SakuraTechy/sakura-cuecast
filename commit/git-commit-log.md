@@ -1,3 +1,263 @@
+# 2026-07-23 CDP 日志契约与历史完整性统一
+
+## 变更内容
+
+1. CDP 回放按照与 Playwright Runner 对齐的生命周期生成结构化日志：任务入队、用例读取、配置、浏览器初始化、起始页、步骤开始/完成、定位详情和用例结束。
+2. 每条实时进度事件携带完整日志对象，同一事件同时进入 `progressLogs`；执行结束后通过 `execution_logs` 回传 admin，确保实时视图与历史视图使用同一份日志。
+3. 详细定位日志增加实际定位来源、定位类型、具体定位元素和命中数量，简洁日志继续隐藏该诊断信息。
+4. 修正启动失败分支引用步骤循环局部变量的问题，启动阶段异常也会生成并保存完整的 CDP 失败日志。
+5. 用例完成耗时统一从 CDP 任务开始时间计算，步骤耗时合计另存为 `step_duration_ms`，避免页面总耗时与完成日志不一致。
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+CDP 与 Playwright Runner 原先输出的阶段和信息粒度不同，且 CDP 历史记录没有保存实时事件，导致运行期间看到的日志在稍后读取历史记录时被不完整摘要替换。详细视图也只有定位来源，无法确认实际命中的元素。
+
+## 验证方式与结果
+
+```powershell
+node --check modules/player-manager.js
+node --check content/bridge.js
+```
+
+结果：两个扩展脚本语法检查通过；`sakura-admin-ui` 的 `pnpm typecheck` 通过；`sakura-playwright` 的 `pnpm check` 和 21 项单元测试全部通过；admin `continew-automation` reactor 编译通过。
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+实时事件与持久化日志共用序号、时间和消息，并补齐生命周期与实际定位详情：
+
+```diff
+-    let broadcastProgress = () => {};
++    let progressSequence = 0;
++    let progressStepTotal = 0;
++    const progressLogs = [];
++    const broadcastProgress = (phase, payload = {}) => {
++      if (!useAdminCase) return;
++      const timestamp = new Date().toISOString();
++      const sequence = ++progressSequence;
++      if (payload.log?.message) {
++        progressLogs.push({
++          sequence,
++          timestamp,
++          level: payload.log.level || 'info',
++          phase: payload.log.phase || phase,
++          message: payload.log.message,
++          detail: Boolean(payload.log.detail),
++        });
++      }
++      this._broadcastPlayback({
++        type: 'AT_PLAYBACK_PROGRESS',
++        sequence,
++        phase,
++        timestamp,
++        stepTotal: progressStepTotal,
++        ...payload,
++      });
++    };
++    broadcastProgress('log', {
++      log: { level: 'info', phase: 'admin', message: 'CDP 任务已加入执行队列' },
++    });
+@@
++        if (result.locator_source) {
++          broadcastProgress('log', {
++            log: {
++              level: 'info',
++              phase: 'locator',
++              message: [
++                `步骤 ${index + 1}: ${result.description || result.action_type}`,
++                `定位来源=${result.locator_source}`,
++                result.locator_type ? `定位类型=${result.locator_type}` : '',
++                result.locator_value ? `定位元素=${result.locator_value}` : '',
++                result.matched_count != null ? `命中=${result.matched_count}` : '',
++              ].filter(Boolean).join('，'),
++              detail: true,
++            },
++          });
++        }
+@@
++            execution_logs: progressLogs,
++      const stepDuration = stepResults.reduce(
++        (total, item) => total + Math.max(0, Number(item.duration_ms) || 0),
++        0,
++      );
+-      const duration = Date.now() - startTime;
++      const duration = Date.now() - runStartedAt;
+```
+
+# 2026-07-23 CDP 回放运行日志实时进度修复
+
+## 变更内容
+
+1. 扩展 CDP 回放新增 `AT_PLAYBACK_PROGRESS` 事件，按用例开始、用例加载、步骤开始、步骤完成和用例结束顺序发送真实进度。
+2. bridge 放行步骤进度事件，admin-ui 可以在执行期间持续显示步骤日志和状态，不再等待 `AT_PLAYBACK_END` 后生成一次性摘要。
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `content/bridge.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+运行过程中日志必须随真实步骤稳定追加和更新；原链路只广播 `AT_PLAYBACK_END`，导致中台只能使用不完整结果生成“0 个步骤、执行完成 0ms”等错误日志。
+
+## 验证方式与结果
+
+```powershell
+node --check modules/player-manager.js
+node --check content/bridge.js
+```
+
+结果：两个扩展脚本语法检查通过；admin-ui 类型检查在 `sakura-admin-ui` 目录执行通过。
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+新增带序号的实时进度事件，并在每个步骤开始和完成时发送真实状态：
+
+```diff
++      let progressSequence = 0;
++      broadcastProgress = (phase, payload = {}) => {
++        if (!useAdminCase) return;
++        this._broadcastPlayback({
++          type: 'AT_PLAYBACK_PROGRESS',
++          adminCaseKey: sourceCaseKey,
++          batchId: opts.batchId || '',
++          executionId: opts.executionId || runId,
++          sequence: ++progressSequence,
++          phase,
++          timestamp: new Date().toISOString(),
++          stepTotal: steps.length,
++          ...payload,
++        });
++      };
++      broadcastProgress('case-started');
++      broadcastProgress('case-loaded');
+@@
++        broadcastProgress('step-finished', {
++          stepIndex: index,
++          status,
++          durationMs: result.duration_ms,
++        });
+```
+
+### `content/bridge.js`
+
+允许步骤进度事件从扩展后台转发到 admin 页面：
+
+```diff
+         || message.type === 'AT_PLAYBACK_LIVE'
++        || message.type === 'AT_PLAYBACK_PROGRESS'
+         || message.type === 'AT_PLAYBACK_END'
+```
+
+# 2026-07-19 Playwright Runner 录制定位语义回归样本
+
+## 变更内容
+
+1. test-lab 新增 Element 风格语义复选框：原生 `input` 不可见，用户可交互目标为外层 `label`，用于复现 CDP 能通过组件代理点击而旧 Runner 直接点击原生节点失败的场景。
+2. 新增 mock case `297`，保留录制格式的 CSS/XPath 候选与 `control_kind`、标签、容器、状态类上下文，验证 Runner `semantic-v1` 能把隐藏原生节点规范化为可见组件代理。
+3. 本轮只扩充 test-lab 回归样本，不修改 CueCast 扩展生产代码，也不改变现有 CDP 回放能力。
+
+## 涉及文件
+
+- `test-lab/target.html`
+- `test-lab/mock-data/cases.json`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+同一条录制步骤在扩展 CDP 回放中可通过组件语义找到可交互包装器，但旧 Playwright Runner 只按原始 selector 点击隐藏 `input`，会出现定位存在却无法操作的差异。该样本为 Runner 语义对齐提供稳定、可重复的端到端验收入口。
+
+## 验证方式与结果
+
+```powershell
+node --check test-lab/mock-server.js
+Get-Content -Raw -Encoding utf8 test-lab/mock-data/cases.json | ConvertFrom-Json | Out-Null
+node src/index.js --case-id 297 --api-base http://127.0.0.1:4173/api --headed false --locator-mode semantic-v1 --trace off --video off
+```
+
+结果：mock server 语法检查和 JSON 解析通过；case `297` 端到端执行通过。第一步实际命中 `locator_meta.candidates[0]`，原始目标为隐藏 `input.el-checkbox__original`，有效目标转换为可见 `label.semantic-checkbox`，结果记录 `normalization_rule: checkbox-visible-wrapper`、最高分 `255`。
+
+## 具体代码改动
+
+### `test-lab/target.html`
+
+新增隐藏原生 checkbox、可见组件包装器及状态反馈：
+
+```diff
++    .semantic-checkbox {
++      position: relative;
++      display: inline-flex;
++    }
++    .semantic-checkbox .el-checkbox__original {
++      position: absolute;
++      width: 0;
++      height: 0;
++      opacity: 0;
++      z-index: -1;
++    }
+-      <strong data-testid="m5o-upload-status">Proxy Upload Idle</strong>
++      <strong data-testid="m5o-upload-status">Proxy Upload Idle</strong>
++      <label class="semantic-checkbox el-checkbox fs-checkbox" data-testid="semantic-hidden-checkbox-label">
++        <span class="el-checkbox__input">
++          <input class="el-checkbox__original" type="checkbox" data-testid="semantic-hidden-checkbox-input">
++        </span>
++        <span>语义复选框</span>
++      </label>
++      <strong data-testid="semantic-hidden-checkbox-status">Semantic Checkbox Idle</strong>
++    document.querySelector('[data-testid="semantic-hidden-checkbox-input"]').addEventListener('change', (event) => {
++      document.querySelector('[data-testid="semantic-hidden-checkbox-status"]').textContent = event.target.checked
++        ? 'Semantic Checkbox Checked'
++        : 'Semantic Checkbox Unchecked';
++    });
+```
+
+### `test-lab/mock-data/cases.json`
+
+新增保留 CSS/XPath 候选和录制上下文的语义回归用例，并初始化结果列表：
+
+```diff
++    "297": {
++      "id": 297,
++      "name": "Locator semantic hidden checkbox mock",
++      "page_error_check_enabled": 0,
++      "steps": [
++        {
++          "action_type": "click",
++          "target_selector": "[data-testid=\"semantic-hidden-checkbox-input\"]",
++          "locator_meta": {
++            "version": 1,
++            "candidates": [
++              {
++                "type": "css_fallback",
++                "value": "[data-testid=\"semantic-hidden-checkbox-input\"]",
++                "score": 0.72
++              }
++            ],
++            "context": {
++              "tag": "input",
++              "control_kind": "input:checkbox",
++              "label_text": "语义复选框",
++              "container_text": "语义复选框",
++              "state_classes": ["el-checkbox__original"]
++            }
++          }
++        }
++      ]
++    }
+-    "296": []
++    "296": [],
++    "297": []
+```
+
 # 2026-07-17 CueCast 批次标识与实际定位结果回传
 
 ## 变更内容

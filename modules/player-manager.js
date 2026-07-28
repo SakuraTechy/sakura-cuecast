@@ -400,6 +400,38 @@ export class PlayerManager {
     const safeCaseKey = sourceCaseKey.replace(/[^A-Za-z0-9._-]/g, '_') || 'case';
     const runId = String(opts.executionId || '').trim() || `${safeCaseKey}-${runStartedAt}`;
     let playbackOutcome = null;
+    let progressFinished = false;
+    let progressSequence = 0;
+    let progressStepTotal = 0;
+    const progressLogs = [];
+    const broadcastProgress = (phase, payload = {}) => {
+      if (!useAdminCase) return;
+      const timestamp = new Date().toISOString();
+      const sequence = ++progressSequence;
+      if (payload.log?.message) {
+        progressLogs.push({
+          sequence,
+          timestamp,
+          level: payload.log.level || 'info',
+          phase: payload.log.phase || phase,
+          message: payload.log.message,
+          detail: Boolean(payload.log.detail),
+        });
+      }
+      this._broadcastPlayback({
+        type: 'AT_PLAYBACK_PROGRESS',
+        adminCaseKey: sourceCaseKey,
+        batchId: opts.batchId || '',
+        executionId: opts.executionId || runId,
+        executor: 'extension-cdp',
+        runId,
+        sequence,
+        phase,
+        timestamp,
+        stepTotal: progressStepTotal,
+        ...payload,
+      });
+    };
     const executionSnapshot = {
       project_environment_id: opts.projectEnvironmentId ?? '',
       batch_id: opts.batchId ?? '',
@@ -408,6 +440,15 @@ export class PlayerManager {
       viewport_height: opts.viewportHeight ?? null,
       page_error_check_enabled: opts.pageErrorCheckEnabled ?? null,
     };
+    broadcastProgress('log', {
+      log: { level: 'info', phase: 'admin', message: 'CDP 任务已加入执行队列' },
+    });
+    broadcastProgress('case-started', {
+      log: { level: 'info', phase: 'runner', message: `CDP 任务开始，case=${sourceCaseKey}` },
+    });
+    broadcastProgress('log', {
+      log: { level: 'info', phase: 'case', message: '正在读取 admin 用例快照' },
+    });
 
     try {
       const res = useAdminCase
@@ -415,6 +456,10 @@ export class PlayerManager {
         : await this.api.getTestCase(testCaseId);
       const testCase = res.data;
       const steps = testCase.steps || [];
+      progressStepTotal = steps.length;
+      broadcastProgress('case-loaded', {
+        log: { level: 'success', phase: 'case', message: `用例加载完成，共 ${steps.length} 个步骤` },
+      });
       const windowPreference = await resolveWindowPreference({
         viewportMode: opts.viewportMode ?? testCase.window_size_mode ?? testCase.viewport_mode,
         viewportWidth: opts.viewportWidth ?? testCase.viewport_width,
@@ -434,6 +479,14 @@ export class PlayerManager {
         viewport_width: windowPreference.width ?? null,
         viewport_height: windowPreference.height ?? null,
         page_error_check_enabled: pageErrorCheckEnabled ? 1 : 0,
+      });
+      broadcastProgress('log', {
+        log: {
+          level: 'info',
+          phase: 'config',
+          message: `窗口模式=${windowPreference.mode}，页面错误检测=${pageErrorCheckEnabled}`,
+          detail: true,
+        },
       });
 
       if (!steps.length) {
@@ -477,6 +530,9 @@ export class PlayerManager {
 
       const reuseTabId = opts.reuseTabId ?? null;
 
+      broadcastProgress('browser-started', {
+        log: { level: 'info', phase: 'browser', message: '正在初始化 CDP 浏览器' },
+      });
       if (reuseTabId != null) {
         playTabId = reuseTabId;
         ctx.tabId = playTabId;
@@ -491,13 +547,28 @@ export class PlayerManager {
         playTabId = tab.id;
         ctx.tabId = playTabId;
       }
+      const viewportLabel = windowPreference.width && windowPreference.height
+        ? `${windowPreference.width}x${windowPreference.height}`
+        : windowPreference.mode;
+      broadcastProgress('browser-ready', {
+        log: { level: 'success', phase: 'browser', message: `浏览器初始化成功，viewport=${viewportLabel}` },
+      });
       this._playTabByCaseId.set(testCaseId, playTabId);
       this._pageErrorCheckEnabledByTab = this._pageErrorCheckEnabledByTab || new Map();
       this._pageErrorCheckEnabledByTab.set(playTabId, pageErrorCheckEnabled);
       ctx.liveBroadcast = true;
       this._broadcastPlayback({ type: 'AT_PLAYBACK_LIVE', testCaseId, tabId: playTabId });
+      broadcastProgress('live-ready', {
+        log: { level: 'success', phase: 'live', message: '实时画面已启用，来源=CDP' },
+      });
+      broadcastProgress('navigation-started', {
+        log: { level: 'info', phase: 'navigation', message: '正在打开用例起始页面' },
+      });
       await this._bringTabToForeground(playTabId);
       await this._waitForTabLoad(playTabId);
+      broadcastProgress('navigation-finished', {
+        log: { level: 'success', phase: 'navigation', message: '起始页面加载完成' },
+      });
 
       const tabAfterLoad = await chrome.tabs.get(playTabId).catch(() => null);
       const urlAfterLoad = tabAfterLoad?.url || '';
@@ -547,7 +618,6 @@ export class PlayerManager {
           : trByLocale(ctx.locale, `开始回放 #${testCaseId}，共 ${steps.length} 步`, `Start playback #${testCaseId}, total ${steps.length} steps`),
       );
 
-      const startTime = Date.now();
       let errorStep = null;
       let errorMsg = null;
       let failureContext = null;
@@ -555,7 +625,7 @@ export class PlayerManager {
       const aiSubtasksByStep = {};
       const stepResults = [];
       const appendStepResult = (step, index, status, startedAt, error = '', locator = null) => {
-        stepResults.push({
+        const result = {
           step_id: step?.id ?? '',
           step_index: index,
           action_type: String(step?.action_type || '').trim().toLowerCase(),
@@ -571,7 +641,45 @@ export class PlayerManager {
             matched_count: locator.matchedCount ?? null,
           } : {}),
           ...(error ? { error } : {}),
+        };
+        stepResults.push(result);
+        broadcastProgress('step-finished', {
+          stepIndex: index,
+          status,
+          description: result.description,
+          actionType: result.action_type,
+          durationMs: result.duration_ms,
+          locatorSource: result.locator_source || '',
+          locatorType: result.locator_type || '',
+          locatorValue: result.locator_value || '',
+          matchedCount: result.matched_count ?? null,
+          ...(error ? { error } : {}),
+          log: {
+            level: status === 'passed' ? 'success' : status === 'skipped' ? 'warning' : 'error',
+            phase: 'step',
+            message: status === 'passed'
+              ? `步骤 ${index + 1}: ${result.description || result.action_type}，执行成功，耗时 ${result.duration_ms}ms`
+              : status === 'skipped'
+                ? `步骤 ${index + 1}: ${result.description || result.action_type}，已跳过`
+                : `步骤 ${index + 1}: ${result.description || result.action_type}，执行失败${error ? `：${error}` : ''}`,
+          },
         });
+        if (result.locator_source) {
+          broadcastProgress('log', {
+            log: {
+              level: 'info',
+              phase: 'locator',
+              message: [
+                `步骤 ${index + 1}: ${result.description || result.action_type}`,
+                `定位来源=${result.locator_source}`,
+                result.locator_type ? `定位类型=${result.locator_type}` : '',
+                result.locator_value ? `定位元素=${result.locator_value}` : '',
+                result.matched_count != null ? `命中=${result.matched_count}` : '',
+              ].filter(Boolean).join('，'),
+              detail: true,
+            },
+          });
+        }
       };
 
       for (let i = startStepIndex; i < steps.length; i++) {
@@ -593,6 +701,25 @@ export class PlayerManager {
             ? trByLocale(ctx.locale, `#${testCaseId} 第 ${i + 1}/${steps.length} 步 · JSON 断言`, `#${testCaseId} Step ${i + 1}/${steps.length} · JSON Assert`)
             : trByLocale(ctx.locale, `#${testCaseId} 第 ${i + 1}/${steps.length} 步: ${runtimeStep.description || runtimeStep.action_type}`, `#${testCaseId} Step ${i + 1}/${steps.length}: ${runtimeStep.description || runtimeStep.action_type}`);
         this._notifyPopup(stepLine);
+        broadcastProgress('step-started', {
+          stepIndex: i,
+          status: 'running',
+          description: runtimeStep.description || runtimeStep.action_type || '',
+          actionType: at,
+          log: {
+            level: 'info',
+            phase: 'step',
+            message: `步骤 ${i + 1}: ${runtimeStep.description || runtimeStep.action_type || ''}，开始执行`,
+          },
+        });
+        broadcastProgress('log', {
+          log: {
+            level: 'info',
+            phase: 'step',
+            message: `步骤 ${i + 1}: ${runtimeStep.description || runtimeStep.action_type || ''}，动作类型=${at || 'custom'}`,
+            detail: true,
+          },
+        });
 
         try {
           let actualLocator = null;
@@ -703,7 +830,11 @@ export class PlayerManager {
       }
       stepResults.sort((a, b) => a.step_index - b.step_index);
 
-      const duration = Date.now() - startTime;
+      const stepDuration = stepResults.reduce(
+        (total, item) => total + Math.max(0, Number(item.duration_ms) || 0),
+        0,
+      );
+      const duration = Date.now() - runStartedAt;
       const success = !errorMsg;
       playbackOutcome = { ok: success, duration, error: errorMsg || '' };
       const executedStepIndexes = stepResults
@@ -722,6 +853,7 @@ export class PlayerManager {
         step_pass: stepPass,
         step_fail: stepFail,
         step_skip: stepSkip,
+        step_duration_ms: stepDuration,
         steps: stepResults,
       };
 
@@ -729,6 +861,7 @@ export class PlayerManager {
         steps: steps.length,
         start_step_index: startStepIndex,
         executed_step_indexes: executedStepIndexes,
+        step_duration_ms: stepDuration,
         cdp_mode: cdpAvailable,
         ...(ctx.cdpAttachError ? { cdp_attach_error: ctx.cdpAttachError } : {}),
         // admin debugRecord 不直接写入截图 base64，避免结果 JSON 膨胀；截图数量仍用于诊断。
@@ -739,6 +872,18 @@ export class PlayerManager {
         ai_subtasks_by_step: aiSubtasksByStep,
         ...(failureContext ? { failure_context: failureContext } : {}),
       };
+      broadcastProgress('case-finished', {
+        status: success ? 'passed' : 'failed',
+        durationMs: duration,
+        stepDurationMs: stepDuration,
+        ...(errorMsg ? { error: errorMsg } : {}),
+        log: {
+          level: success ? 'success' : 'error',
+          phase: 'runner',
+          message: `CDP 执行${success ? '完成' : '失败'}，耗时 ${duration}ms${errorMsg ? `：${errorMsg}` : ''}`,
+        },
+      });
+      progressFinished = true;
       if (useAdminCase) {
         await this.api.saveAdminPlaywrightResult(sourceCaseKey, {
           status: success ? 'passed' : 'failed',
@@ -757,11 +902,13 @@ export class PlayerManager {
             status: success ? 'passed' : 'failed',
             success,
             duration_ms: duration,
+            step_duration_ms: stepDuration,
             failed_step_index: errorStep,
             error: errorMsg || '',
             case_result: caseResult,
             detail: resultDetail,
             execution_config: executionSnapshot,
+            execution_logs: progressLogs,
           },
         });
       } else {
@@ -793,9 +940,20 @@ export class PlayerManager {
       const rawMsg = err && err.message ? err.message : String(err);
       const msg = localizePlaybackError(ctx?.locale ?? runLocale, rawMsg);
       playbackOutcome = { ok: false, error: msg };
+      const finishedAt = Date.now();
+      broadcastProgress('case-finished', {
+        status: 'failed',
+        durationMs: finishedAt - runStartedAt,
+        error: msg,
+        log: {
+          level: 'error',
+          phase: 'runner',
+          message: `CDP 执行失败，耗时 ${finishedAt - runStartedAt}ms：${msg}`,
+        },
+      });
+      progressFinished = true;
       // admin 读取、起始页或 CDP attach 在执行循环前失败时，也必须回传失败结果，避免中台一直显示旧状态。
       if (useAdminCase && sourceCaseKey) {
-        const finishedAt = Date.now();
         await this.api.saveAdminPlaywrightResult(sourceCaseKey, {
           status: 'failed',
           success: false,
@@ -814,6 +972,7 @@ export class PlayerManager {
             startup_failure: true,
             error: msg,
             execution_config: executionSnapshot,
+            execution_logs: progressLogs,
           },
         }).catch(() => {});
       }
@@ -825,6 +984,17 @@ export class PlayerManager {
       }
       return playbackOutcome;
     } finally {
+      if (!progressFinished && useAdminCase) {
+        broadcastProgress('case-finished', {
+          status: playbackOutcome?.ok ? 'passed' : 'failed',
+          ...(playbackOutcome?.error ? { error: playbackOutcome.error } : {}),
+          log: {
+            level: playbackOutcome?.ok ? 'success' : 'error',
+            phase: 'runner',
+            message: playbackOutcome?.ok ? 'CDP 执行完成' : `CDP 执行失败：${playbackOutcome?.error || '未知错误'}`,
+          },
+        });
+      }
       // 须始终广播 END（含拉取用例失败、无步骤等），否则中台顺序回放会一直等不到结束事件
       this._broadcastPlayback({
         type: 'AT_PLAYBACK_END',

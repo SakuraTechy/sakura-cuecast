@@ -103,6 +103,7 @@
         || message.type === 'AT_RECORDING_LIVE'
         || message.type === 'AT_RECORDING_END'
         || message.type === 'AT_PLAYBACK_LIVE'
+        || message.type === 'AT_PLAYBACK_PROGRESS'
         || message.type === 'AT_PLAYBACK_END'
       ) {
         window.postMessage(message, '*');

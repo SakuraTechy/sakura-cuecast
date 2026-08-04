@@ -126,6 +126,39 @@ export class ApiClient {
       { timeoutMs: 30000 },
     );
   }
+
+  /**
+   * 基础设施步骤只提交已冻结用例中的步骤身份；命令、SQL 和凭据始终由 admin/执行节点解析。
+   */
+  createInfrastructureTask(payload) {
+    return this.request('POST', '/automation/infrastructure/tasks', payload, { timeoutMs: 30000 });
+  }
+
+  getInfrastructureTask(taskId, afterSequence = 0) {
+    const query = afterSequence > 0 ? `?afterSequence=${encodeURIComponent(afterSequence)}` : '';
+    return this.request('GET', `/automation/infrastructure/tasks/${encodeURIComponent(taskId)}${query}`, null, { timeoutMs: 30000 });
+  }
+
+  cancelInfrastructureTask(taskId) {
+    return this.request('DELETE', `/automation/infrastructure/tasks/${encodeURIComponent(taskId)}`, null, { timeoutMs: 30000 });
+  }
+
+  /**
+   * 上报 CueCast 当前真实可执行的 canonical action。
+   * 旧 Admin 没有该接口时由 PlayerManager 捕获异常并继续回放。
+   */
+  registerOperationCapabilities(capabilities) {
+    const payload = {
+      executor_instance_id: capabilities?.executorInstanceId,
+      executor_version: capabilities?.executorVersion,
+      catalog_version: capabilities?.catalogVersion,
+      project_environment_id: capabilities?.projectEnvironmentId,
+      session_id: capabilities?.sessionId,
+      actions: capabilities?.actions,
+      features: capabilities?.features || [],
+    };
+    return this.request('POST', '/automation/operation-catalog/capabilities/cuecast', payload, { timeoutMs: 5000 });
+  }
 }
 
 function encodeAdminCasePath(caseKey) {

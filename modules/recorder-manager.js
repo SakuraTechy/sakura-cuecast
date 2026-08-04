@@ -48,6 +48,7 @@ export class RecorderManager {
     return JSON.stringify({
       mode: recordingImport.mode || '',
       targetSceneDbId: recordingImport.targetSceneDbId ?? '',
+      expectedDefinitionVersion: recordingImport.expectedDefinitionVersion ?? '',
       targetCaseId: recordingImport.targetCaseId ?? '',
       targetStepId: recordingImport.targetStepId ?? '',
       appendPosition: recordingImport.appendPosition ?? '',
@@ -230,6 +231,8 @@ export class RecorderManager {
     return {
       mode: options.mode || 'createScene',
       targetSceneDbId: options.targetSceneDbId,
+      // 替换和追加必须透传启动录制时读取的定义版本，避免绕过并发修改校验。
+      expectedDefinitionVersion: options.expectedDefinitionVersion,
       targetCaseId: options.targetCaseId,
       targetStepId: options.targetStepId,
       appendPosition: options.appendPosition,

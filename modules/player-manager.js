@@ -3,6 +3,19 @@
  * 支持双模式：CDP（chrome.debugger）+ DOM 降级
  */
 
+import {
+  getCuecastCapabilities,
+  isCuecastCdpAction,
+} from './canonical-action-registry.js';
+import {
+  CuecastVariableContext,
+  evaluateArithmeticExpression,
+  formatFormulaValue,
+  formatVariableDate,
+  isCuecastLocalVariableAction,
+  toBoolean,
+} from './variable-context.js';
+
 /** 改为 true 后：打开扩展 Service Worker 控制台可看到 AI 步骤的节点数与操作计划 */
 const DEBUG_AI_NATURAL = false;
 
@@ -12,6 +25,34 @@ function isAiNaturalStep(step) {
     .trim()
     .toLowerCase();
   return t === 'ai_natural';
+}
+
+/** 基础设施步骤由扩展后台委托受控执行器，绝不能发送到内容脚本或 CDP 页面上下文。 */
+function isInfrastructureStep(step) {
+  return [
+    'server_command',
+    'database_sql',
+    'database_native',
+    'host_command',
+    'host_file_lookup',
+    'host_file_delete',
+    'host_pointer_move',
+    'server_file_upload',
+    'global_variable_system_info',
+    'global_variable_available_ip',
+    'global_variable_property',
+  ].includes(
+    String(step?.action_type ?? '').trim().toLowerCase(),
+  );
+}
+
+function isInfrastructureTerminalStatus(status) {
+  return ['passed', 'failed', 'cancelled', 'canceled', 'timeout'].includes(String(status || '').trim().toLowerCase());
+}
+
+function unwrapInfrastructureTask(response) {
+  const task = response?.data && typeof response.data === 'object' ? response.data : response;
+  return task && typeof task === 'object' ? task : {};
 }
 
 function normalizeLocale(locale) {
@@ -229,6 +270,24 @@ export class PlayerManager {
     this._playContexts = new Set();
     /** @type {Map<number, number>} */
     this._playTabByCaseId = new Map();
+    // MV3 Service Worker 生命周期较短；同一 Admin 会话内限频上报，唤醒或换会话后会重新握手。
+    this._capabilityHandshake = null;
+    // 以下状态按受控 tab 隔离，避免并发回放之间的 iframe、隐式等待和鼠标坐标互相污染。
+    this._frameStackByTab = new Map();
+    this._frameContextByTab = new Map();
+    this._implicitWaitMsByTab = new Map();
+    this._pointerPositionByTab = new Map();
+    // CDP 的 dialog 只能通过 Page.handleJavaScriptDialog 结束；缓存 opening 事件用于处理
+    // “点击触发弹窗 → 下一条 dialog_* 步骤”的正常时序，而不是在页面上下文伪造 alert。
+    this._dialogOpeningByTab = new Map();
+    this._pendingDialogPromptByTab = new Map();
+    if (chrome.debugger?.onEvent?.addListener) {
+      chrome.debugger.onEvent.addListener((source, method, params) => {
+        if (method === 'Page.javascriptDialogOpening' && source?.tabId != null) {
+          this._dialogOpeningByTab.set(source.tabId, { ...params, openedAt: Date.now() });
+        }
+      });
+    }
   }
 
   /** 是否为「非本扩展」的 chrome-extension:// 页面（CDP / scripting 均受限） */
@@ -376,8 +435,14 @@ export class PlayerManager {
   }
 
   handlePlayTabClosed(tabId) {
+    this._clearTabExecutionState(tabId);
     for (const ctx of this._playContexts) {
-      if (ctx.tabId === tabId) ctx.stopped = true;
+      ctx.managedTabIds?.delete(tabId);
+      if (ctx.tabId === tabId || ctx.activeTabId === tabId) {
+        ctx.stopped = true;
+        ctx.tabId = null;
+        ctx.activeTabId = null;
+      }
     }
   }
 
@@ -395,6 +460,10 @@ export class PlayerManager {
 
     const adminCaseKey = String(opts.adminCaseKey || '').trim();
     const useAdminCase = Boolean(adminCaseKey) || String(opts.dataSource || '').trim().toLowerCase() === 'admin';
+    if (useAdminCase) {
+      // 能力目录仅影响 Admin 的可用性显示；旧 Admin 或网络异常绝不能阻断既有 CDP 回放。
+      void this._reportOperationCapabilities(opts);
+    }
     const sourceCaseKey = adminCaseKey || String(testCaseId || '').trim();
     const runStartedAt = Date.now();
     const safeCaseKey = sourceCaseKey.replace(/[^A-Za-z0-9._-]/g, '_') || 'case';
@@ -456,6 +525,11 @@ export class PlayerManager {
         : await this.api.getTestCase(testCaseId);
       const testCase = res.data;
       const steps = testCase.steps || [];
+      // 每次回放独立创建变量上下文，不能复用扩展进程状态或将值写入 chrome.storage。
+      const variableContext = new CuecastVariableContext(
+        opts.initialVariables ?? testCase.initial_variables ?? testCase.initialVariables ?? {},
+      );
+      const variableResultsByStep = {};
       progressStepTotal = steps.length;
       broadcastProgress('case-loaded', {
         log: { level: 'success', phase: 'case', message: `用例加载完成，共 ${steps.length} 个步骤` },
@@ -523,6 +597,13 @@ export class PlayerManager {
         locale: runLocale,
         pageErrorCheckEnabled,
         startStepIndex,
+        activeTabId: null,
+        managedWindowId: null,
+        managedTabIds: new Set(),
+        // 初始复用页属于用户已有页面：本次只能管理其派生页，收尾时绝不能关闭它。
+        initialManagedTabId: null,
+        // 只保存任务 ID，用于用户停止回放时向 admin 请求取消；扩展不持有命令、SQL 或凭据。
+        infrastructureTaskIds: new Set(),
       };
       this._playContexts.add(ctx);
       this.state.activePlayCount = (this.state.activePlayCount || 0) + 1;
@@ -538,6 +619,13 @@ export class PlayerManager {
         ctx.tabId = playTabId;
         ctx.reusedTab = true;
         const reuseTab = await chrome.tabs.get(playTabId).catch(() => null);
+        if (!reuseTab) {
+          throw new Error(`复用回放标签页不存在：${playTabId}`);
+        }
+        ctx.managedWindowId = reuseTab.windowId ?? null;
+        ctx.managedTabIds.add(playTabId);
+        ctx.initialManagedTabId = playTabId;
+        ctx.activeTabId = playTabId;
         if (reuseTab?.windowId != null) await applyWindowPreference(reuseTab.windowId, windowPreference);
         await chrome.tabs.update(playTabId, { url: targetUrl, active: true });
       } else {
@@ -546,6 +634,10 @@ export class PlayerManager {
         const tab = win.tabs[0];
         playTabId = tab.id;
         ctx.tabId = playTabId;
+        ctx.managedWindowId = win.id ?? tab.windowId ?? null;
+        ctx.managedTabIds.add(playTabId);
+        ctx.initialManagedTabId = playTabId;
+        ctx.activeTabId = playTabId;
       }
       const viewportLabel = windowPreference.width && windowPreference.height
         ? `${windowPreference.width}x${windowPreference.height}`
@@ -624,7 +716,7 @@ export class PlayerManager {
       const playbackScreenshots = new Array(steps.length).fill('');
       const aiSubtasksByStep = {};
       const stepResults = [];
-      const appendStepResult = (step, index, status, startedAt, error = '', locator = null) => {
+      const appendStepResult = (step, index, status, startedAt, error = '', locator = null, executorResult = null) => {
         const result = {
           step_id: step?.id ?? '',
           step_index: index,
@@ -640,6 +732,12 @@ export class PlayerManager {
             locator_value: locator.value || '',
             matched_count: locator.matchedCount ?? null,
           } : {}),
+          ...(executorResult ? {
+            executor: executorResult.executor || 'infrastructure-service',
+            infrastructure_task_id: executorResult.taskId || '',
+            exit_code: executorResult.exitCode ?? null,
+            affected_rows: executorResult.affectedRows ?? null,
+          } : {}),
           ...(error ? { error } : {}),
         };
         stepResults.push(result);
@@ -653,6 +751,12 @@ export class PlayerManager {
           locatorType: result.locator_type || '',
           locatorValue: result.locator_value || '',
           matchedCount: result.matched_count ?? null,
+          ...(executorResult ? {
+            executor: result.executor,
+            taskId: result.infrastructure_task_id,
+            exitCode: result.exit_code,
+            affectedRows: result.affected_rows,
+          } : {}),
           ...(error ? { error } : {}),
           log: {
             level: status === 'passed' ? 'success' : status === 'skipped' ? 'warning' : 'error',
@@ -692,8 +796,10 @@ export class PlayerManager {
         }
 
         const step = steps[i];
-        const runtimeStep = PlayerManager._resolveDynamicStepValue(step);
-        const runtimeNextStep = steps[i + 1] ? PlayerManager._resolveDynamicStepValue(steps[i + 1]) : null;
+        const runtimeStep = variableContext.resolveStep(PlayerManager._resolveDynamicStepValue(step));
+        const runtimeNextStep = steps[i + 1]
+          ? variableContext.resolveStep(PlayerManager._resolveDynamicStepValue(steps[i + 1]))
+          : null;
         const at = String(runtimeStep.action_type || '').trim().toLowerCase();
         const stepLine = isAiNaturalStep(step)
           ? trByLocale(ctx.locale, `#${testCaseId} 第 ${i + 1}/${steps.length} 步 · 智能步骤`, `#${testCaseId} Step ${i + 1}/${steps.length} · AI Step`)
@@ -727,11 +833,63 @@ export class PlayerManager {
           if (waitBefore) await this._sleep(waitBefore);
           const executableStep = waitBefore ? { ...runtimeStep, wait_before: 0 } : runtimeStep;
 
-          if (String(executableStep.action_type || '').trim().toLowerCase() !== 'assert_text') {
-            await this._throwIfPageError(playTabId);
+          if (isInfrastructureStep(executableStep)) {
+            const infrastructureResult = await this._executeInfrastructureStep(sourceCaseKey, executableStep, {
+              ctx,
+              executionId: opts.executionId || runId,
+              projectEnvironmentId: executionSnapshot.project_environment_id,
+              runtimeBindings: variableContext.bindingsForStep(step),
+              onProgress: (phase, payload) => broadcastProgress(phase, payload),
+            });
+            const variable = this._applyInfrastructureVariableResult(
+              executableStep,
+              infrastructureResult,
+              variableContext,
+            );
+            if (variable) variableResultsByStep[String(i)] = variable;
+            appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', null, infrastructureResult);
+            continue;
           }
 
           const actionType = String(executableStep.action_type || '').trim().toLowerCase();
+          if (actionType === 'captcha_ocr') {
+            if (!cdpAvailable) throw new Error('验证码 OCR 需要 Chrome CDP 截图能力');
+            const imageBase64 = await this._captureCaptchaTargetBase64(playTabId, executableStep);
+            const infrastructureResult = await this._executeInfrastructureStep(sourceCaseKey, executableStep, {
+              ctx,
+              executionId: opts.executionId || runId,
+              projectEnvironmentId: executionSnapshot.project_environment_id,
+              runtimeBindings: variableContext.bindingsForStep(step),
+              runtimeInput: { captcha_image_base64: imageBase64 },
+              onProgress: (phase, payload) => broadcastProgress(phase, payload),
+            });
+            const variable = this._applyInfrastructureVariableResult(executableStep, infrastructureResult, variableContext);
+            if (variable) variableResultsByStep[String(i)] = variable;
+            appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', null, infrastructureResult);
+            continue;
+          }
+          if (isCuecastLocalVariableAction(actionType)) {
+            const localResult = await this._executeLocalVariableAction(
+              playTabId,
+              executableStep,
+              variableContext,
+            );
+            if (localResult?.variable) variableResultsByStep[String(i)] = localResult.variable;
+            appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', null);
+            continue;
+          }
+          if (playTabId == null && actionType !== 'switch_page') {
+            throw new Error('当前没有可执行的受控标签页；请先切换到本次回放创建的标签页');
+          }
+          if (!PlayerManager._skipPageErrorCheckForAction(actionType)) {
+            await this._throwIfPageError(playTabId);
+          }
+          if (actionType === 'navigate' && playTabId != null) {
+            // content/player.js 始终在顶层页面执行导航，导航后旧 iframe executionContext 已失效。
+            this._clearFrameSelection(playTabId);
+            this._pointerPositionByTab.delete(playTabId);
+          }
+
           const captureInsideCdpStep = cdpAvailable
             && this._canUseCDP(executableStep)
             && ['click', 'double_click', 'right_click', 'hover'].includes(actionType);
@@ -745,7 +903,17 @@ export class PlayerManager {
             await captureCurrentStep();
           }
 
-          if (isAiNaturalStep(executableStep)) {
+          const managedTabAction = await this._executeManagedTabAction(playTabId, executableStep, ctx, {
+            cdpAvailable,
+            useAdminCase,
+          });
+          if (managedTabAction) {
+            actualLocator = managedTabAction.locator || null;
+            if (Object.prototype.hasOwnProperty.call(managedTabAction, 'tabId')) {
+              playTabId = managedTabAction.tabId;
+              cdpAvailable = managedTabAction.cdpAvailable === true;
+            }
+          } else if (isAiNaturalStep(executableStep)) {
             if (!cdpAvailable) {
               throw new Error('AI 自然语言步骤需要 CDP（debugger）模式，请确认扩展具备调试权限且页面允许附加调试器');
             }
@@ -784,7 +952,7 @@ export class PlayerManager {
 
           await this._sleep(300);
 
-          if (['click', 'navigate', 'ai_natural'].includes(String(executableStep.action_type || '').trim().toLowerCase())) {
+          if (playTabId != null && ['click', 'navigate', 'ai_natural', 'reload', 'switch_page'].includes(actionType)) {
             await this._waitForTabLoad(playTabId);
           }
           appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', actualLocator);
@@ -870,6 +1038,8 @@ export class PlayerManager {
           : { playback_screenshots: playbackScreenshots }),
         step_results: stepResults,
         ai_subtasks_by_step: aiSubtasksByStep,
+        // 只回传脱敏描述，不回传变量原值；变量上下文在本次回放结束后即释放。
+        variable_results_by_step: variableResultsByStep,
         ...(failureContext ? { failure_context: failureContext } : {}),
       };
       broadcastProgress('case-finished', {
@@ -1011,15 +1181,11 @@ export class PlayerManager {
         if (ctx.liveBroadcast) {
           this._playTabByCaseId.delete(ctx.testCaseId);
         }
-        if (playTabId != null) {
-          if (ctx.debuggerAttached) await this._detachDebugger(playTabId, ctx).catch(() => {});
-          await chrome.tabs.sendMessage(playTabId, { type: 'AT_PLAYER_CLEANUP' }).catch(() => {});
-          if (this._pageErrorCheckEnabledByTab) this._pageErrorCheckEnabledByTab.delete(playTabId);
-          if (!ctx.reusedTab) {
-            await chrome.tabs.remove(playTabId).catch(() => {});
-          }
-        }
+        await this._cleanupPlaybackTabs(ctx, playTabId).catch((cleanupError) => {
+          console.warn('[Player] 回放标签页清理失败:', cleanupError?.message || cleanupError);
+        });
         ctx.tabId = null;
+        ctx.activeTabId = null;
         this._playContexts.delete(ctx);
         this.state.activePlayCount = Math.max(0, (this.state.activePlayCount || 0) - 1);
       }
@@ -1029,29 +1195,587 @@ export class PlayerManager {
   async stop() {
     for (const ctx of this._playContexts) {
       ctx.stopped = true;
+      const taskIds = Array.from(ctx.infrastructureTaskIds || []);
+      // 取消由 admin 转发给实际执行节点；此处不保存也不重放任何基础设施步骤内容。
+      await Promise.all(taskIds.map(taskId => this.api.cancelInfrastructureTask(taskId).catch(() => {})));
     }
     return { ok: true };
+  }
+
+  /**
+   * 在建立 Admin 回放会话时上报扩展版本、目录版本和真实 action 集合。
+   * 不等待网络结果，避免旧版 Admin 缺接口或短暂网络失败影响已有回放链路。
+   */
+  _reportOperationCapabilities(options = {}) {
+    if (typeof this.api?.registerOperationCapabilities !== 'function') {
+      return Promise.resolve({ ok: false, skipped: true });
+    }
+    const extensionVersion = this._getExtensionVersion();
+    // token 本身不进入限频状态；认证状态变化后仍会在下一轮握手使用 ApiClient 的最新 token。
+    const capabilitySessionId = this._getCapabilitySessionId();
+    const projectEnvironmentId = String(options.projectEnvironmentId || '').trim();
+    const sessionKey = `${String(this.state?.apiBase || '').trim()}\n${this.state?.authToken ? 'authenticated' : 'anonymous'}\n${extensionVersion}\n${projectEnvironmentId}\n${capabilitySessionId}`;
+    const now = Date.now();
+    if (
+      this._capabilityHandshake
+      && this._capabilityHandshake.sessionKey === sessionKey
+      && now - this._capabilityHandshake.attemptedAt < 60000
+    ) {
+      return this._capabilityHandshake.promise;
+    }
+
+    const capabilities = getCuecastCapabilities({
+      executorVersion: extensionVersion,
+      executorInstanceId: String(chrome.runtime?.id || 'cuecast-extension'),
+      projectEnvironmentId,
+      sessionId: capabilitySessionId,
+      features: ['browser', 'cdp'],
+    });
+    const promise = Promise.resolve()
+      .then(() => this.api.registerOperationCapabilities(capabilities))
+      .then(() => {
+        console.info(
+          '[Player] 已上报 CueCast 能力，版本=%s，action=%d',
+          capabilities.executorVersion,
+          capabilities.actions.length,
+        );
+        return { ok: true };
+      })
+      .catch((error) => {
+        // 404、目录版本不一致和临时网络异常均只影响能力快照，不能中断回放。
+        console.warn('[Player] CueCast 能力上报未完成，继续回放：', error?.message || String(error));
+        return { ok: false, error };
+      });
+    this._capabilityHandshake = { sessionKey, attemptedAt: now, promise };
+    return promise;
+  }
+
+  _getCapabilitySessionId() {
+    if (!this._capabilitySessionId) {
+      this._capabilitySessionId = globalThis.crypto?.randomUUID?.()
+        || `cuecast-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+    return this._capabilitySessionId;
+  }
+
+  _getExtensionVersion() {
+    try {
+      return String(chrome.runtime?.getManifest?.().version || 'unknown');
+    } catch (_) {
+      return 'unknown';
+    }
+  }
+
+  static _skipPageErrorCheckForAction(actionType) {
+    return new Set([
+      'assert_text',
+      'assert_text_not',
+      'assert_attribute',
+      'assert_script',
+      'assert_text_regex',
+      'dialog_accept',
+      'dialog_dismiss',
+      'dialog_prompt',
+      'close_page',
+      'close_all_pages',
+      'reload',
+      'switch_page',
+      'frame_switch',
+      'frame_parent',
+      'frame_main',
+      'implicit_wait',
+    ]).has(actionType);
+  }
+
+  /**
+   * 仅处理需要 Chrome tabs/window 状态的 canonical action。
+   * 关闭和切换只使用本次回放新建窗口中的标签页，或从显式复用标签页派生出来的子标签页。
+   */
+  async _executeManagedTabAction(tabId, step, ctx, options = {}) {
+    const actionType = String(step?.action_type || '').trim().toLowerCase();
+    if (actionType === 'close_page') {
+      return this._closeManagedTab(tabId, ctx, options);
+    }
+    if (actionType === 'close_all_pages') {
+      return this._closeAllManagedTabs(tabId, ctx, options);
+    }
+    if (actionType === 'reload') {
+      return this._reloadManagedTab(tabId, ctx, options, step);
+    }
+    if (actionType === 'switch_page') {
+      return this._switchManagedTab(tabId, step, ctx, options);
+    }
+    return null;
+  }
+
+  async _refreshManagedTabs(ctx) {
+    const allTabs = await chrome.tabs.query({}).catch(() => []);
+    const byId = new Map(allTabs.filter((tab) => tab?.id != null).map((tab) => [tab.id, tab]));
+    const managed = new Set(Array.from(ctx?.managedTabIds || []).filter((tabId) => byId.has(tabId)));
+    if (ctx?.initialManagedTabId != null && byId.has(ctx.initialManagedTabId)) {
+      managed.add(ctx.initialManagedTabId);
+    }
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const tab of allTabs) {
+        if (tab?.id == null || managed.has(tab.id)) continue;
+        const openedByManagedTab = tab.openerTabId != null && managed.has(tab.openerTabId);
+        if (openedByManagedTab) {
+          managed.add(tab.id);
+          changed = true;
+        }
+      }
+    }
+    ctx.managedTabIds = managed;
+    return Array.from(managed)
+      .map((tabId) => byId.get(tabId))
+      .filter(Boolean)
+      .sort((left, right) => Number(left.id) - Number(right.id));
+  }
+
+  _requireManagedTab(tabId, ctx) {
+    if (tabId == null || !ctx?.managedTabIds?.has(tabId)) {
+      throw new Error('当前标签页不属于本次 CueCast 回放，拒绝执行标签页控制操作');
+    }
+  }
+
+  _clearTabExecutionState(tabId) {
+    if (tabId == null) return;
+    this._frameStackByTab.delete(tabId);
+    this._frameContextByTab.delete(tabId);
+    this._implicitWaitMsByTab.delete(tabId);
+    this._pointerPositionByTab.delete(tabId);
+    this._dialogOpeningByTab.delete(tabId);
+    this._pendingDialogPromptByTab.delete(tabId);
+    if (this._pageErrorCheckEnabledByTab) this._pageErrorCheckEnabledByTab.delete(tabId);
+  }
+
+  async _ensurePlayerScript(tabId) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    const url = String(tab?.url || '');
+    if (!tab || PlayerManager._isForeignExtensionPageUrl(url) || /^(chrome|edge|devtools):\/\//i.test(url)) {
+      throw new Error(`无法向受控标签页注入回放脚本：${url || tabId}`);
+    }
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ['content/player.js'],
+      });
+    } catch (error) {
+      throw new Error(`无法向受控标签页注入回放脚本：${error?.message || String(error)}`);
+    }
+  }
+
+  async _activateManagedTab(tabId, ctx, options = {}) {
+    this._requireManagedTab(tabId, ctx);
+    const previousTabId = ctx.activeTabId;
+    if (options.cdpAvailable && previousTabId != null && previousTabId !== tabId && ctx.debuggerAttached) {
+      await this._detachDebugger(previousTabId, ctx).catch(() => {});
+    }
+    await chrome.tabs.update(tabId, { active: true });
+    ctx.activeTabId = tabId;
+    ctx.tabId = tabId;
+    this._playTabByCaseId.set(ctx.testCaseId, tabId);
+    this._pageErrorCheckEnabledByTab = this._pageErrorCheckEnabledByTab || new Map();
+    this._pageErrorCheckEnabledByTab.set(tabId, ctx.pageErrorCheckEnabled !== false);
+    await this._waitForTabLoad(tabId);
+
+    let cdpAvailable = Boolean(options.cdpAvailable);
+    if (previousTabId !== tabId || !ctx.debuggerAttached) {
+      cdpAvailable = await this._attachDebugger(tabId, ctx);
+    }
+    if (options.useAdminCase && !cdpAvailable) {
+      throw new Error(`admin 扩展 CDP 无法附加到切换后的标签页：${ctx.cdpAttachError || '未知错误'}`);
+    }
+    await this._ensurePlayerScript(tabId);
+    return { tabId, cdpAvailable };
+  }
+
+  async _switchManagedTab(tabId, step, ctx, options = {}) {
+    const tabs = await this._refreshManagedTabs(ctx);
+    if (!tabs.length) {
+      throw new Error('本次 CueCast 回放没有可切换的受控标签页');
+    }
+    const rawMode = String(step?.page_mode || step?.mode || '').trim().toLowerCase();
+    const rawIndex = step?.index ?? step?.page_index ?? step?.value;
+    const useLatest = rawMode === 'latest' || rawIndex == null || String(rawIndex).trim() === '';
+    let target;
+    if (useLatest) {
+      target = tabs[tabs.length - 1];
+    } else {
+      const index = Number(rawIndex);
+      if (!Number.isInteger(index) || index < 0 || index >= tabs.length) {
+        throw new Error(`切换标签页序号无效：${rawIndex}，当前受控标签页数量=${tabs.length}`);
+      }
+      target = tabs[index];
+    }
+    return this._activateManagedTab(target.id, ctx, options);
+  }
+
+  async _closeManagedTab(tabId, ctx, options = {}) {
+    this._requireManagedTab(tabId, ctx);
+    if (ctx.reusedTab && tabId === ctx.initialManagedTabId) {
+      throw new Error('复用的初始标签页不属于本次创建页面，拒绝关闭；请先切换到本次回放派生的标签页');
+    }
+    // 先发现当前步骤触发的派生页；即使当前页马上关闭，也不会把新页遗漏在受控集合外。
+    await this._refreshManagedTabs(ctx);
+    if (options.cdpAvailable && ctx.debuggerAttached) {
+      await this._detachDebugger(tabId, ctx).catch(() => {});
+    }
+    await chrome.tabs.remove(tabId);
+    ctx.managedTabIds.delete(tabId);
+    this._clearTabExecutionState(tabId);
+    const tabs = await this._refreshManagedTabs(ctx);
+    if (!tabs.length) {
+      ctx.activeTabId = null;
+      ctx.tabId = null;
+      return { tabId: null, cdpAvailable: false };
+    }
+    return this._activateManagedTab(tabs[tabs.length - 1].id, ctx, {
+      ...options,
+      cdpAvailable: false,
+    });
+  }
+
+  async _closeAllManagedTabs(tabId, ctx, options = {}) {
+    if (tabId != null) this._requireManagedTab(tabId, ctx);
+    const tabs = await this._refreshManagedTabs(ctx);
+    if (options.cdpAvailable && ctx.debuggerAttached && tabId != null) {
+      await this._detachDebugger(tabId, ctx).catch(() => {});
+    }
+    const retainedTabId = ctx.reusedTab && tabs.some((tab) => tab.id === ctx.initialManagedTabId)
+      ? ctx.initialManagedTabId
+      : null;
+    const ids = tabs
+      .map((tab) => tab.id)
+      .filter((id) => id !== retainedTabId);
+    await Promise.all(ids.map((id) => chrome.tabs.remove(id).catch(() => {})));
+    for (const id of ids) this._clearTabExecutionState(id);
+    if (retainedTabId != null) {
+      ctx.managedTabIds = new Set([retainedTabId]);
+      return this._activateManagedTab(retainedTabId, ctx, {
+        ...options,
+        cdpAvailable: false,
+      });
+    }
+    ctx.managedTabIds.clear();
+    ctx.activeTabId = null;
+    ctx.tabId = null;
+    return { tabId: null, cdpAvailable: false };
+  }
+
+  async _reloadManagedTab(tabId, ctx, options = {}, step = {}) {
+    this._requireManagedTab(tabId, ctx);
+    this._clearFrameSelection(tabId);
+    this._pointerPositionByTab.delete(tabId);
+    const bypassCache = step?.bypass_cache === true || String(step?.bypass_cache || '').trim().toLowerCase() === 'true';
+    await chrome.tabs.reload(tabId, { bypassCache }).catch((error) => {
+      throw new Error(`刷新受控标签页失败：${error?.message || String(error)}`);
+    });
+    await this._waitForTabLoad(tabId);
+    await this._ensurePlayerScript(tabId);
+    return { tabId, cdpAvailable: Boolean(options.cdpAvailable) };
+  }
+
+  /**
+   * 回放结束时仅删除本轮创建的页面。复用页只清理注入状态，避免影响用户原有标签页。
+   */
+  async _cleanupPlaybackTabs(ctx, activeTabId) {
+    const tabs = await this._refreshManagedTabs(ctx);
+    const retainedTabId = ctx.reusedTab && tabs.some((tab) => tab.id === ctx.initialManagedTabId)
+      ? ctx.initialManagedTabId
+      : null;
+    const removableIds = tabs
+      .map((tab) => tab.id)
+      .filter((tabId) => tabId !== retainedTabId);
+
+    if (ctx.debuggerAttached && activeTabId != null) {
+      await this._detachDebugger(activeTabId, ctx).catch(() => {});
+    }
+
+    await Promise.all(tabs.map((tab) => (
+      chrome.tabs.sendMessage(tab.id, { type: 'AT_PLAYER_CLEANUP' }).catch(() => {})
+    )));
+    await Promise.all(removableIds.map((tabId) => chrome.tabs.remove(tabId).catch(() => {})));
+
+    for (const tabId of removableIds) this._clearTabExecutionState(tabId);
+    if (retainedTabId != null) {
+      this._clearTabExecutionState(retainedTabId);
+      ctx.managedTabIds = new Set([retainedTabId]);
+    } else {
+      ctx.managedTabIds.clear();
+    }
+  }
+
+  async _executeInfrastructureStep(caseKey, step, options) {
+    const stepId = String(step?.id ?? '').trim();
+    if (!caseKey || !stepId) {
+      throw new Error('基础设施步骤缺少用例或步骤标识，无法委托执行');
+    }
+    const actionType = String(step.action_type || '').trim().toLowerCase();
+    const onProgress = typeof options?.onProgress === 'function' ? options.onProgress : () => {};
+    const createResponse = await this.api.createInfrastructureTask({
+      caseKey,
+      stepId,
+      executionId: String(options.executionId || ''),
+      projectEnvironmentId: options.projectEnvironmentId ?? '',
+      attempt: 0,
+      ...(options.runtimeBindings && Object.keys(options.runtimeBindings).length > 0
+        ? { runtimeBindings: options.runtimeBindings }
+        : {}),
+      // 验证码截图仅随本次任务请求传递，不能写入场景或回放结果。
+      ...(options.runtimeInput && Object.keys(options.runtimeInput).length > 0
+        ? { runtimeInput: options.runtimeInput }
+        : {}),
+    });
+    let task = unwrapInfrastructureTask(createResponse);
+    const taskId = String(task.taskId || task.id || '').trim();
+    if (!taskId) {
+      throw new Error('基础设施任务创建成功但未返回 taskId');
+    }
+    options.ctx?.infrastructureTaskIds?.add(taskId);
+    onProgress('infrastructure-task-started', {
+      executor: 'infrastructure-service',
+      taskId,
+      actionType,
+      status: 'running',
+      log: { level: 'info', phase: 'infrastructure', message: `基础设施任务已提交：${taskId}` },
+    });
+
+    const timeoutMs = Math.max(10000, Math.min(600000, Number(step.timeout_ms || step.timeoutMs) || 30000)) + 10000;
+    const deadline = Date.now() + timeoutMs;
+    let afterSequence = 0;
+    let lastProgressKey = '';
+    try {
+      while (!isInfrastructureTerminalStatus(task.status)) {
+        if (options.ctx?.stopped) {
+          await this.api.cancelInfrastructureTask(taskId).catch(() => {});
+          throw new Error('用户手动停止');
+        }
+        if (Date.now() >= deadline) {
+          await this.api.cancelInfrastructureTask(taskId).catch(() => {});
+          throw new Error(`基础设施任务超时（${timeoutMs}ms）`);
+        }
+        await this._sleep(500);
+        task = unwrapInfrastructureTask(await this.api.getInfrastructureTask(taskId, afterSequence));
+        const sequence = Number(task.nextSequence ?? afterSequence) || afterSequence;
+        afterSequence = Math.max(afterSequence, sequence);
+        const taskLogs = Array.isArray(task.logs) ? task.logs : [];
+        for (const log of taskLogs) {
+          onProgress('infrastructure-task-progress', {
+            executor: 'infrastructure-service',
+            taskId,
+            actionType,
+            status: String(task.status || 'running').toLowerCase(),
+            log: {
+              level: ['success', 'warning', 'error', 'info'].includes(String(log?.level || '').toLowerCase())
+                ? String(log.level).toLowerCase()
+                : 'info',
+              phase: 'infrastructure',
+              // 服务端按任务日志契约完成脱敏；扩展不拼接步骤原文、SQL 或 target_ref。
+              message: String(log?.message || `基础设施任务状态：${task.status || 'running'}`),
+              detail: true,
+            },
+          });
+        }
+        const progressKey = `${task.status || ''}:${afterSequence}:${task.errorMessage || task.resultSummary || ''}`;
+        if (progressKey !== lastProgressKey) {
+          lastProgressKey = progressKey;
+          onProgress('infrastructure-task-progress', {
+            executor: 'infrastructure-service',
+            taskId,
+            actionType,
+            status: String(task.status || 'running').toLowerCase(),
+            log: {
+              level: String(task.status || '').toLowerCase() === 'failed' ? 'error' : 'info',
+              phase: 'infrastructure',
+              message: task.errorMessage || task.resultSummary || `基础设施任务状态：${task.status || 'running'}`,
+              detail: true,
+            },
+          });
+        }
+      }
+      const status = String(task.status || '').trim().toLowerCase();
+      if (status !== 'passed') {
+        throw new Error(task.errorMessage || task.error || `基础设施任务执行失败：${status}`);
+      }
+      return {
+        executor: task.executor || 'infrastructure-service',
+        taskId,
+        exitCode: task.exitCode ?? task.exit_code,
+        affectedRows: task.affectedRows ?? task.affected_rows,
+        // Admin 只对白名单基础设施动作返回受限变量快照；扩展不会读取命令输出或凭据。
+        variables: task.result?.variables && typeof task.result.variables === 'object'
+          ? task.result.variables
+          : {},
+      };
+    } finally {
+      options.ctx?.infrastructureTaskIds?.delete(taskId);
+    }
+  }
+
+  static _normalizeVariableSourceType(value) {
+    const source = String(value || '').trim().toLowerCase();
+    if (['literal', 'value', 'text', 'constant', '常量', '固定值'].includes(source)) return 'literal';
+    if (['locator', 'element', '页面元素', '元素'].includes(source)) return 'locator';
+    if (['script', 'javascript', 'js', '脚本'].includes(source)) return 'script';
+    return source;
+  }
+
+  static _transformVariableValue(value, step) {
+    let transformed = value == null ? '' : String(value);
+    const pattern = String(step?.regex || '');
+    if (pattern) {
+      if (pattern.length > 512) throw new Error('变量提取正则长度不能超过 512');
+      let match;
+      try {
+        match = new RegExp(pattern).exec(transformed);
+      } catch {
+        throw new Error('变量提取正则不合法');
+      }
+      if (!match) throw new Error('变量提取正则未匹配到内容');
+      const group = String(step?.regex_group || '1');
+      transformed = match.groups?.[group] ?? match[Number(group)] ?? match[0];
+    }
+    if (step?.replace_from != null && String(step.replace_from) !== '') {
+      transformed = transformed.split(String(step.replace_from)).join(String(step.replace_to ?? ''));
+    }
+    return transformed;
+  }
+
+  async _readVariableFromLocatorCDP(tabId, step) {
+    if (tabId == null) throw new Error('从页面元素读取变量需要受控浏览器标签页');
+    const mode = String(step?.read_mode || 'text').trim().toLowerCase();
+    if (mode.startsWith('attribute:')) {
+      return this._waitForTargetAttributeCDP(tabId, step, mode.slice('attribute:'.length));
+    }
+    const raw = await this._waitForDomTextRawCDP(
+      tabId,
+      step.target_selector,
+      step.target_xpath,
+      10000,
+      true,
+    );
+    if (raw == null) throw new Error('从页面元素读取变量失败：找不到目标元素');
+    return raw;
+  }
+
+  static _remoteResultValue(remoteResult) {
+    if (remoteResult && Object.prototype.hasOwnProperty.call(remoteResult, 'value')) {
+      return remoteResult.value;
+    }
+    return remoteResult?.unserializableValue ?? remoteResult?.description ?? '';
+  }
+
+  async _executeLocalVariableAction(tabId, step, variableContext) {
+    const actionType = String(step?.action_type || '').trim().toLowerCase();
+    if (actionType === 'global_variable_set') {
+      const name = String(step?.variable_name || '').trim();
+      const source = PlayerManager._normalizeVariableSourceType(step?.source_type ?? step?.source ?? 'literal');
+      let value;
+      if (source === 'literal') {
+        value = step?.value ?? '';
+      } else if (source === 'locator') {
+        value = await this._readVariableFromLocatorCDP(tabId, step);
+      } else if (source === 'script') {
+        if (tabId == null) throw new Error('从页面脚本读取变量需要受控浏览器标签页');
+        const result = await this._evaluatePageScriptCDP(tabId, step?.script ?? step?.value);
+        value = PlayerManager._remoteResultValue(result);
+      } else {
+        throw new Error(`不支持的变量来源：${source || '(空)'}`);
+      }
+      const variable = variableContext.set(
+        name,
+        PlayerManager._transformVariableValue(value, step),
+        {
+          masked: toBoolean(step?.value_masked),
+          overwrite: step?.overwrite !== false && step?.overwrite !== 'false',
+          source,
+        },
+      );
+      return { variable };
+    }
+
+    if (actionType === 'global_variable_date') {
+      const name = String(step?.variable_name || '').trim();
+      const mode = String(step?.date_mode || 'current_datetime').trim().toLowerCase();
+      const offsetSeconds = Number(step?.offset_seconds ?? 0);
+      if (!Number.isFinite(offsetSeconds)) throw new Error('offset_seconds 必须是有效数字');
+      const date = mode === 'custom_datetime'
+        ? new Date(String(step?.datetime ?? step?.date_value ?? step?.value ?? ''))
+        : new Date();
+      if (Number.isNaN(date.getTime())) throw new Error('自定义日期不是合法时间');
+      date.setTime(date.getTime() + offsetSeconds * 1000);
+      const unit = String(step?.timestamp_unit || 'milliseconds').trim().toLowerCase();
+      const value = mode === 'timestamp'
+        ? (unit === 'seconds' ? Math.floor(date.getTime() / 1000) : date.getTime())
+        : formatVariableDate(date, step?.format || 'yyyy-MM-dd HH:mm:ss');
+      return {
+        variable: variableContext.set(name, value, {
+          masked: toBoolean(step?.value_masked),
+          overwrite: step?.overwrite !== false && step?.overwrite !== 'false',
+          source: 'date',
+        }),
+      };
+    }
+
+    if (actionType === 'global_variable_formula') {
+      const value = evaluateArithmeticExpression(step?.expression ?? step?.value, variableContext);
+      return {
+        variable: variableContext.set(String(step?.variable_name || '').trim(), formatFormulaValue(value, step), {
+          masked: toBoolean(step?.value_masked),
+          overwrite: step?.overwrite !== false && step?.overwrite !== 'false',
+          source: 'formula',
+        }),
+      };
+    }
+
+    const reference = String(step?.variable_name || step?.value || '').trim();
+    const expected = String(step?.expect ?? step?.expected ?? '');
+    const raw = variableContext.get(reference);
+    const actual = typeof raw === 'string' ? raw : JSON.stringify(raw);
+    const matched = actual.includes(expected);
+    const negate = actionType === 'assert_variable_list_not';
+    if (negate ? matched : !matched) {
+      throw new Error(negate
+        ? `变量 ${reference} 不应包含 ${expected}`
+        : `变量 ${reference} 未包含 ${expected}`);
+    }
+    return { variable: variableContext.describe(reference) };
+  }
+
+  _applyInfrastructureVariableResult(step, infrastructureResult, variableContext) {
+    const actionType = String(step?.action_type || '').trim().toLowerCase();
+    const name = String(step?.variable_name || step?.result_binding || '').trim();
+    const variables = infrastructureResult?.variables;
+    if (!name) return null;
+    if (!name || !variables || !Object.prototype.hasOwnProperty.call(variables, name)) {
+      if (['global_variable_system_info', 'global_variable_available_ip', 'global_variable_property', 'captcha_ocr'].includes(actionType)) {
+        throw new Error(`基础设施变量动作未返回变量：${name || '(空)'}`);
+      }
+      return null;
+    }
+    return variableContext.set(name, variables[name], {
+      masked: toBoolean(step?.value_masked),
+      overwrite: step?.overwrite !== false && step?.overwrite !== 'false',
+      source: 'infrastructure',
+    });
   }
 
   // =========================================================
   // CDP 相关
   // =========================================================
   _canUseCDP(step) {
-    return [
-      'click',
-      'double_click',
-      'right_click',
-      'input',
-      'key',
-      'scroll',
-      'hover',
-    ].includes(step.action_type);
+    return isCuecastCdpAction(step?.action_type);
   }
 
   async _attachDebugger(tabId, ctx) {
     try {
       await chrome.debugger.attach({ tabId }, '1.3');
       ctx.debuggerAttached = true;
+      // 开启 Page 域以接收 javascriptDialogOpening；即使该订阅失败，后续仍会直接尝试 handleJavaScriptDialog。
+      await this._cdpSend(tabId, 'Page.enable').catch(() => {});
       return true;
     } catch (e) {
       ctx.cdpAttachError = e?.message || String(e);
@@ -1070,12 +1794,799 @@ export class PlayerManager {
   }
 
   async _cdpSend(tabId, method, params = {}) {
+    const effectiveParams = await this._prepareCdpCommandParams(tabId, method, params);
     return new Promise((resolve, reject) => {
-      chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
+      chrome.debugger.sendCommand({ tabId }, method, effectiveParams, (result) => {
         if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
         else resolve(result);
       });
     });
+  }
+
+  /** 将 Runtime.evaluate 定向到当前 iframe，并把 iframe 内局部鼠标坐标转换到页面视口。 */
+  async _prepareCdpCommandParams(tabId, method, params = {}) {
+    let effective = params;
+    if (method === 'Runtime.evaluate' && !Object.prototype.hasOwnProperty.call(params, 'contextId')) {
+      const frame = this._frameContextByTab.get(tabId);
+      if (frame?.contextId != null) {
+        effective = { ...effective, contextId: frame.contextId };
+      }
+    }
+    if (
+      method === 'Input.dispatchMouseEvent'
+      && Number.isFinite(Number(effective.x))
+      && Number.isFinite(Number(effective.y))
+      && this._frameContextByTab.has(tabId)
+    ) {
+      const point = await this._translateFramePointToViewport(tabId, Number(effective.x), Number(effective.y));
+      effective = { ...effective, x: point.x, y: point.y };
+    }
+    return effective;
+  }
+
+  _clearFrameSelection(tabId) {
+    this._frameStackByTab.delete(tabId);
+    this._frameContextByTab.delete(tabId);
+  }
+
+  async _getFrameIndex(tabId) {
+    const response = await this._cdpSend(tabId, 'Page.getFrameTree');
+    const byId = new Map();
+    let rootFrameId = '';
+    const visit = (node, parentFrameId = '') => {
+      if (!node?.frame?.id) return;
+      const frameId = node.frame.id;
+      if (!rootFrameId) rootFrameId = frameId;
+      byId.set(frameId, {
+        frameId,
+        parentFrameId,
+        name: node.frame.name || '',
+        url: node.frame.url || '',
+      });
+      for (const child of node.childFrames || []) visit(child, frameId);
+    };
+    visit(response?.frameTree);
+    return { rootFrameId, byId };
+  }
+
+  async _translateFramePointToViewport(tabId, x, y) {
+    const active = this._frameContextByTab.get(tabId);
+    if (!active?.frameId) return { x, y };
+    try {
+      const { rootFrameId, byId } = await this._getFrameIndex(tabId);
+      let cursor = active.frameId;
+      let viewportX = x;
+      let viewportY = y;
+      while (cursor && cursor !== rootFrameId) {
+        const owner = await this._cdpSend(tabId, 'DOM.getFrameOwner', { frameId: cursor });
+        const backendNodeId = owner?.backendNodeId;
+        if (!backendNodeId) break;
+        const model = await this._cdpSend(tabId, 'DOM.getBoxModel', { backendNodeId });
+        const quad = model?.model?.content || model?.model?.border;
+        if (!Array.isArray(quad) || quad.length < 8) break;
+        const horizontal = [quad[0], quad[2], quad[4], quad[6]];
+        const vertical = [quad[1], quad[3], quad[5], quad[7]];
+        viewportX += Math.min(...horizontal);
+        viewportY += Math.min(...vertical);
+        cursor = byId.get(cursor)?.parentFrameId || '';
+      }
+      return { x: viewportX, y: viewportY };
+    } catch {
+      // 坐标转换失败时仍交给 CDP；后续 actionability 检查会给出具体定位失败原因。
+      return { x, y };
+    }
+  }
+
+  static _buildSimpleTargetElementExpr(selector, xpath) {
+    let safeSelector = String(selector || '').trim();
+    let safeXpath = String(xpath || '').trim();
+    if (PlayerManager._isVolatileRcCss(safeSelector) || /:\w+-of-type\(0\)/.test(safeSelector)) safeSelector = '';
+    if (PlayerManager._isVolatileRcXPath(safeXpath)) safeXpath = '';
+    if (safeXpath && !safeXpath.startsWith('//') && !safeXpath.startsWith('/html') && !safeXpath.startsWith('/*')) {
+      safeXpath = `/${safeXpath}`;
+    }
+    const expressions = [];
+    if (safeXpath) {
+      expressions.push(`document.evaluate(${JSON.stringify(safeXpath)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue`);
+    }
+    if (safeSelector) {
+      expressions.push(`document.querySelector(${JSON.stringify(safeSelector)})`);
+    }
+    return expressions.length ? `(${expressions.join(' || ')})` : 'null';
+  }
+
+  async _resolveFrameId(tabId, step) {
+    const selector = String(step?.target_selector || step?.selector || '').trim();
+    const xpath = String(step?.target_xpath || step?.xpath || '').trim();
+    if (selector || xpath) {
+      const expression = PlayerManager._buildSimpleTargetElementExpr(selector, xpath);
+      const deadline = Date.now() + this._getEffectiveWaitTimeout(tabId, 5000);
+      let objectId = '';
+      do {
+        const result = await this._cdpSend(tabId, 'Runtime.evaluate', {
+          expression,
+          returnByValue: false,
+        });
+        if (result?.exceptionDetails) {
+          throw new Error(`定位 iframe 失败：${result.exceptionDetails.text || 'Runtime.evaluate error'}`);
+        }
+        objectId = result?.result?.objectId || '';
+        if (objectId || Date.now() >= deadline) break;
+        await this._sleep(250);
+      } while (Date.now() < deadline);
+      if (!objectId) {
+        throw new Error(`找不到 iframe 元素\n  CSS: ${selector || '—'}\n  XPath: ${xpath || '—'}`);
+      }
+      const node = await this._cdpSend(tabId, 'DOM.describeNode', { objectId });
+      const frameId = node?.node?.frameId;
+      if (!frameId) {
+        throw new Error('目标元素不是可切换的 iframe');
+      }
+      return frameId;
+    }
+
+    const { rootFrameId, byId } = await this._getFrameIndex(tabId);
+    const currentFrameId = this._frameContextByTab.get(tabId)?.frameId || rootFrameId;
+    const candidates = Array.from(byId.values()).filter((item) => item.parentFrameId === currentFrameId);
+    const rawIndex = step?.index ?? step?.frame_index ?? step?.value;
+    const requested = Number(rawIndex);
+    if (!Number.isInteger(requested)) {
+      throw new Error('切换 iframe 需要 target_ref 或 1 起始的 iframe 序号');
+    }
+    const index = requested > 0 ? requested - 1 : 0;
+    if (!candidates[index]) {
+      throw new Error(`iframe 序号无效：${rawIndex}，当前层级 iframe 数量=${candidates.length}`);
+    }
+    return candidates[index].frameId;
+  }
+
+  async _selectFrame(tabId, frameId) {
+    const { rootFrameId, byId } = await this._getFrameIndex(tabId);
+    if (!byId.has(frameId) || frameId === rootFrameId) {
+      this._clearFrameSelection(tabId);
+      return;
+    }
+    const path = [];
+    let cursor = frameId;
+    while (cursor && cursor !== rootFrameId) {
+      const item = byId.get(cursor);
+      if (!item) throw new Error('iframe 层级已变化，无法恢复执行上下文');
+      path.unshift(item);
+      cursor = item.parentFrameId;
+    }
+    const stack = [];
+    for (const item of path) {
+      const world = await this._cdpSend(tabId, 'Page.createIsolatedWorld', {
+        frameId: item.frameId,
+        worldName: 'cuecast-playback',
+        grantUniveralAccess: true,
+      });
+      if (world?.executionContextId == null) {
+        throw new Error('创建 iframe CDP 执行上下文失败');
+      }
+      stack.push({ ...item, contextId: world.executionContextId });
+    }
+    this._frameStackByTab.set(tabId, stack);
+    this._frameContextByTab.set(tabId, stack[stack.length - 1]);
+  }
+
+  async _executeFrameAction(tabId, step) {
+    const actionType = String(step?.action_type || '').trim().toLowerCase();
+    // 鼠标相对坐标以当前 frame 的视口为参照，切换 frame 后不能沿用上一层的局部坐标。
+    this._pointerPositionByTab.delete(tabId);
+    if (actionType === 'frame_main') {
+      this._clearFrameSelection(tabId);
+      return;
+    }
+    if (actionType === 'frame_parent') {
+      const stack = [...(this._frameStackByTab.get(tabId) || [])];
+      stack.pop();
+      if (!stack.length) {
+        this._clearFrameSelection(tabId);
+      } else {
+        this._frameStackByTab.set(tabId, stack);
+        this._frameContextByTab.set(tabId, stack[stack.length - 1]);
+      }
+      return;
+    }
+    const frameId = await this._resolveFrameId(tabId, step);
+    await this._selectFrame(tabId, frameId);
+  }
+
+  /** 当前 tab 设置过隐式等待时，它是后续定位动作的默认超时；否则沿用动作已有默认值。 */
+  _getEffectiveWaitTimeout(tabId, fallbackMs) {
+    const fallback = Math.max(0, Math.round(Number(fallbackMs) || 0));
+    if (!this._implicitWaitMsByTab.has(tabId)) return fallback;
+    return this._implicitWaitMsByTab.get(tabId);
+  }
+
+  _setImplicitWaitTimeout(tabId, step) {
+    const raw = step?.duration_ms ?? step?.timeout_ms ?? step?.value;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value < 0) {
+      throw new Error('隐式等待的 duration_ms 必须是大于或等于 0 的毫秒数');
+    }
+    // 所有 CDP 定位循环仍受统一的 wall-clock 上限约束，避免错误配置让 Service Worker 长时间悬挂。
+    this._implicitWaitMsByTab.set(
+      tabId,
+      Math.min(Math.round(value), PlayerManager.LOADING_WAIT_WALL_MS),
+    );
+  }
+
+  static _firstStepString(step, fields) {
+    for (const field of fields) {
+      if (step?.[field] != null) return String(step[field]);
+    }
+    return '';
+  }
+
+  static _parseLegacyLocator(raw) {
+    const value = String(raw || '').trim();
+    if (!value) return { selector: '', xpath: '' };
+    const xpath = value.match(/^xpath\s*=\s*(.+)$/i);
+    if (xpath) return { selector: '', xpath: xpath[1].trim() };
+    const css = value.match(/^css\s*=\s*(.+)$/i);
+    if (css) return { selector: css[1].trim(), xpath: '' };
+    if (/^(?:\/|\(|\.\/|\.\.\/)/.test(value)) return { selector: '', xpath: value };
+    return { selector: value, xpath: '' };
+  }
+
+  static _optionLocatorFromStep(step) {
+    const selector = PlayerManager._firstStepString(step, [
+      'option_selector',
+      'option_target_selector',
+      'element_selector',
+    ]).trim();
+    const xpath = PlayerManager._firstStepString(step, [
+      'option_xpath',
+      'option_target_xpath',
+      'element_xpath',
+    ]).trim();
+    if (selector || xpath) return { selector, xpath };
+    return PlayerManager._parseLegacyLocator(step?.element);
+  }
+
+  static _formatInputDate(format, date = new Date()) {
+    const year = String(date.getFullYear());
+    const values = {
+      yyyy: year,
+      YYYY: year,
+      yy: year.slice(-2),
+      YY: year.slice(-2),
+      MM: PlayerManager._pad2(date.getMonth() + 1),
+      M: String(date.getMonth() + 1),
+      dd: PlayerManager._pad2(date.getDate()),
+      DD: PlayerManager._pad2(date.getDate()),
+      d: String(date.getDate()),
+      HH: PlayerManager._pad2(date.getHours()),
+      H: String(date.getHours()),
+      mm: PlayerManager._pad2(date.getMinutes()),
+      m: String(date.getMinutes()),
+      ss: PlayerManager._pad2(date.getSeconds()),
+      s: String(date.getSeconds()),
+      SSS: String(date.getMilliseconds()).padStart(3, '0'),
+    };
+    return String(format || 'yyyy-MM-dd HH:mm:ss')
+      .replace(/yyyy|YYYY|SSS|yy|YY|MM|dd|DD|HH|mm|ss|M|d|H|m|s/g, (token) => values[token]);
+  }
+
+  static _parseDateOffsetSeconds(step) {
+    const direct = step?.offset_seconds;
+    if (direct != null && String(direct).trim() !== '') {
+      const value = Number(direct);
+      if (!Number.isFinite(value)) throw new Error('offset_seconds 必须是有效数字');
+      return value;
+    }
+    // 兼容旧 XML 的 keys，例如 -60*4；只接收数值乘法，绝不执行任意表达式。
+    const legacy = String(step?.keys ?? '').replace(/\s+/g, '');
+    if (!legacy) return 0;
+    if (!/^[+-]?\d+(?:\*[+-]?\d+)*$/.test(legacy)) {
+      throw new Error('旧时间偏移 keys 仅支持数字和 *，例如 -60*4');
+    }
+    return legacy.split('*').reduce((total, part) => total * Number(part), 1);
+  }
+
+  _buildInputDateValue(step) {
+    const rawDate = PlayerManager._firstStepString(step, ['datetime', 'date_value', 'date']).trim();
+    const date = rawDate ? new Date(rawDate) : new Date();
+    if (Number.isNaN(date.getTime())) {
+      throw new Error(`无法解析 input_date 的日期值：${rawDate}`);
+    }
+    const offsetSeconds = PlayerManager._parseDateOffsetSeconds(step);
+    date.setTime(date.getTime() + offsetSeconds * 1000);
+    return PlayerManager._formatInputDate(step?.format || step?.key || 'yyyy-MM-dd HH:mm:ss', date);
+  }
+
+  async _setTextLikeInputWithRetry(tabId, step, value, autoConfirmAntSelect = false) {
+    let actualLocator = null;
+    if (step.target_selector || step.target_xpath || step.locator_meta) {
+      const probe = await this._getElementBoxResult(
+        tabId,
+        step.target_selector,
+        step.target_xpath,
+        '',
+        1600,
+        false,
+        step.locator_meta,
+      );
+      if (probe?.ok) actualLocator = PlayerManager._actualLocatorFromVia(step, probe.box?.via);
+    }
+    const deadline = Date.now() + this._getEffectiveWaitTimeout(tabId, 8000);
+    let lastErr = null;
+    do {
+      await this._throwIfPageError(tabId);
+      try {
+        await this._setInputValueCDP(
+          tabId,
+          step.target_selector,
+          step.target_xpath,
+          value,
+          step.locator_meta,
+          autoConfirmAntSelect,
+        );
+        return actualLocator;
+      } catch (error) {
+        lastErr = error;
+        if (Date.now() >= deadline) break;
+        await this._sleep(400);
+      }
+    } while (Date.now() < deadline);
+    throw new Error(
+      `输入失败（等待超时）\n  CSS: ${step.target_selector || '—'}\n  XPath: ${step.target_xpath || '—'}\n  ${lastErr?.message || ''}`,
+    );
+  }
+
+  async _executeInputDateCDP(tabId, step) {
+    const value = this._buildInputDateValue(step);
+    const locator = await this._setTextLikeInputWithRetry(tabId, step, value, false);
+    await this._sleep(120);
+    return locator;
+  }
+
+  async _executeClearCDP(tabId, step) {
+    const locator = await this._setTextLikeInputWithRetry(tabId, step, '', false);
+    await this._sleep(80);
+    return locator;
+  }
+
+  /**
+   * Chrome Debugger 协议支持 DOM.setFileInputFiles。文件路径只能来自显式 file_ref/certificate_ref，
+   * 拒绝变量、相对路径和目录回退，避免扩展把任意页面文本误解释为宿主机文件路径。
+   */
+  async _executeFileUploadCDP(tabId, step) {
+    const files = PlayerManager._filePathsFromStep(step);
+    const expression = PlayerManager._buildSimpleTargetElementExpr(step?.target_selector, step?.target_xpath);
+    if (expression === 'null') throw new Error('file_upload 需要文件控件定位');
+    const deadline = Date.now() + this._getEffectiveWaitTimeout(tabId, 8000);
+    let lastError = '';
+    do {
+      const evaluated = await this._cdpSend(tabId, 'Runtime.evaluate', {
+        expression,
+        returnByValue: false,
+      });
+      const objectId = evaluated?.result?.objectId || '';
+      if (objectId) {
+        const described = await this._cdpSend(tabId, 'DOM.describeNode', { objectId });
+        const node = described?.node;
+        const attributes = Array.isArray(node?.attributes) ? node.attributes : [];
+        const typeIndex = attributes.findIndex((value) => String(value).toLowerCase() === 'type');
+        const inputType = typeIndex >= 0 ? String(attributes[typeIndex + 1] || '').toLowerCase() : '';
+        if (String(node?.nodeName || '').toLowerCase() !== 'input' || inputType !== 'file') {
+          throw new Error('目标元素不是 input[type=file]');
+        }
+        if (node?.nodeId == null) throw new Error('文件控件未返回 DOM nodeId');
+        await this._cdpSend(tabId, 'DOM.setFileInputFiles', { nodeId: node.nodeId, files });
+        return PlayerManager._actualLocatorFromVia(step, step?.target_xpath ? 'xpath' : 'css');
+      }
+      lastError = '未找到文件控件';
+      if (Date.now() >= deadline) break;
+      await this._sleep(250);
+    } while (Date.now() < deadline);
+    throw new Error(`设置上传文件失败：${lastError || '未找到文件控件'}`);
+  }
+
+  static _filePathsFromStep(step) {
+    const actionType = String(step?.action_type || '').trim().toLowerCase();
+    const source = actionType === 'certificate_upload'
+      ? (step?.certificate_ref ?? step?.certificateRef ?? step?.file_ref ?? step?.fileRef)
+      : (step?.file_ref ?? step?.fileRef ?? step?.files ?? step?.file);
+    const candidates = Array.isArray(source) ? source : [source];
+    const files = candidates.flatMap((item) => {
+      if (typeof item === 'string') return [item];
+      if (item && typeof item === 'object') {
+        const value = item.path ?? item.local_path ?? item.localPath ?? item.file_path ?? item.filePath;
+        return Array.isArray(value) ? value : [value];
+      }
+      return [];
+    }).map((item) => String(item || '').trim()).filter(Boolean);
+    if (!files.length) throw new Error(`${actionType || 'file_upload'} 缺少 file_ref 本机绝对路径`);
+    for (const file of files) {
+      if (file.includes('${') || file.includes('\u0000') || /(^|[\\/])\.\.([\\/]|$)/.test(file)
+        || !(/^[A-Za-z]:[\\/]/.test(file) || file.startsWith('/'))) {
+        throw new Error('file_ref 必须是无变量、无上级目录片段的本机绝对路径');
+      }
+    }
+    return files;
+  }
+
+  async _clickConfiguredOptionCDP(tabId, step, option, locale) {
+    let optionLocator = PlayerManager._optionLocatorFromStep(step);
+    // 兼容旧 select-click 的 value 直接填写 XPath；新 canonical option 仍优先按可见文本处理。
+    if (!optionLocator.selector && !optionLocator.xpath && /^(?:xpath\s*=|css\s*=|\/|\()/i.test(String(option || '').trim())) {
+      optionLocator = PlayerManager._parseLegacyLocator(option);
+    }
+    if (optionLocator.selector || optionLocator.xpath) {
+      const boxResult = await this._getElementBoxResult(
+        tabId,
+        optionLocator.selector,
+        optionLocator.xpath,
+        '',
+        5000,
+        true,
+      );
+      const box = boxResult?.ok ? boxResult.box : null;
+      if (!box) {
+        throw new Error(this._formatElementWaitFailure(boxResult, optionLocator.selector, optionLocator.xpath));
+      }
+      await this._cdpClick(tabId, box.x, box.y);
+      return PlayerManager._actualLocatorFromVia({
+        ...step,
+        target_selector: optionLocator.selector,
+        target_xpath: optionLocator.xpath,
+      }, box.via);
+    }
+
+    const box = await this._clickOverlayItem(tabId, { value: option }, locale);
+    await this._cdpClick(tabId, box.x, box.y);
+    return PlayerManager._actualLocatorFromVia({ ...step, value: option }, 'overlay-text');
+  }
+
+  async _executeSelectOptionCDP(tabId, step, locale) {
+    const option = PlayerManager._firstStepString(step, ['option', 'value', 'expect']);
+    if (option.trim() === '') throw new Error('select_option 缺少 option');
+
+    let targetLocator = null;
+    if (step.target_selector || step.target_xpath || step.locator_meta) {
+      const probe = await this._getElementBoxResult(
+        tabId,
+        step.target_selector,
+        step.target_xpath,
+        '',
+        5000,
+        false,
+        step.locator_meta,
+      );
+      if (probe?.ok) targetLocator = PlayerManager._actualLocatorFromVia(step, probe.box?.via);
+    }
+
+    const targetExpr = PlayerManager._buildSimpleTargetElementExpr(
+      step.target_selector,
+      step.target_xpath,
+    );
+    if (targetExpr !== 'null') {
+      const nativeResult = await this._cdpSend(tabId, 'Runtime.evaluate', {
+        expression: `(function(){
+          var root = ${targetExpr};
+          if (!root) return { ok: false, reason: 'target_not_found' };
+          var select = String(root.tagName || '').toLowerCase() === 'select'
+            ? root
+            : (root.querySelector ? root.querySelector('select') : null);
+          if (!select) return { ok: false, native: false };
+          var wanted = ${JSON.stringify(option)};
+          var items = Array.prototype.slice.call(select.options || []);
+          var matched = items.find(function(item){ return item.value === wanted; })
+            || items.find(function(item){ return String(item.textContent || '').trim() === wanted; });
+          if (!matched) {
+            return {
+              ok: false,
+              native: true,
+              reason: 'option_not_found',
+              options: items.slice(0, 30).map(function(item){ return String(item.textContent || '').trim(); })
+            };
+          }
+          select.value = matched.value;
+          matched.selected = true;
+          select.dispatchEvent(new Event('input', { bubbles: true }));
+          select.dispatchEvent(new Event('change', { bubbles: true }));
+          return { ok: true, native: true, text: String(matched.textContent || '').trim() };
+        })()`,
+        returnByValue: true,
+      });
+      const result = nativeResult?.result?.value;
+      if (result?.native === true && result.ok !== true) {
+        const available = Array.isArray(result.options) && result.options.length
+          ? `，可选项：${result.options.join('、')}`
+          : '';
+        throw new Error(`原生 select 中找不到选项「${option}」${available}`);
+      }
+      if (result?.ok === true && result.native === true) return targetLocator;
+    }
+
+    const trigger = await this._getElementBoxResult(
+      tabId,
+      step.target_selector,
+      step.target_xpath,
+      '',
+      5000,
+      false,
+      step.locator_meta,
+    );
+    const triggerBox = trigger?.ok ? trigger.box : null;
+    if (!triggerBox) {
+      throw new Error(this._formatElementWaitFailure(trigger, step.target_selector, step.target_xpath));
+    }
+    await this._cdpClick(tabId, triggerBox.x, triggerBox.y);
+    await this._sleep(150);
+    await this._clickConfiguredOptionCDP(tabId, step, option, locale);
+    return targetLocator || PlayerManager._actualLocatorFromVia(step, triggerBox.via);
+  }
+
+  async _executeComboSelectCDP(tabId, step, locale) {
+    const option = PlayerManager._firstStepString(step, ['option', 'value', 'expect']);
+    if (option.trim() === '') throw new Error('combo_select 缺少 option');
+    const targetLocator = await this._setTextLikeInputWithRetry(tabId, step, option, false);
+    await this._sleep(160);
+    await this._clickConfiguredOptionCDP(tabId, step, option, locale);
+    return targetLocator;
+  }
+
+  static _scriptExpression(script) {
+    const source = String(script || '').trim();
+    if (!source) throw new Error('页面脚本不能为空');
+    // Selenium executeScript 常见写法含顶层 return；Runtime.evaluate 需要函数包装才可执行。
+    return /\breturn\b/.test(source) ? `(function(){\n${source}\n})()` : source;
+  }
+
+  async _evaluatePageScriptCDP(tabId, script) {
+    const result = await this._cdpSend(tabId, 'Runtime.evaluate', {
+      expression: PlayerManager._scriptExpression(script),
+      awaitPromise: true,
+      returnByValue: true,
+      userGesture: true,
+    });
+    if (result?.exceptionDetails) {
+      throw new Error(`执行页面脚本失败：${result.exceptionDetails.text || 'Runtime.evaluate error'}`);
+    }
+    return result?.result || {};
+  }
+
+  static _scriptResultToString(remoteResult) {
+    if (!remoteResult) return 'undefined';
+    if (Object.prototype.hasOwnProperty.call(remoteResult, 'value')) {
+      const value = remoteResult.value;
+      if (value === undefined) return 'undefined';
+      if (value === null) return 'null';
+      if (typeof value === 'string') return value;
+      if (typeof value === 'object') {
+        try { return JSON.stringify(value); } catch { return String(value); }
+      }
+      return String(value);
+    }
+    return String(remoteResult.unserializableValue ?? remoteResult.description ?? 'undefined');
+  }
+
+  async _executeEvaluateCDP(tabId, step) {
+    await this._evaluatePageScriptCDP(tabId, step?.script ?? step?.value);
+  }
+
+  async _waitForTargetAttributeCDP(tabId, step, attribute) {
+    const targetExpr = PlayerManager._buildSimpleTargetElementExpr(step.target_selector, step.target_xpath);
+    if (targetExpr === 'null') throw new Error('assert_attribute 需要 target_ref');
+    const deadline = Date.now() + this._getEffectiveWaitTimeout(tabId, 8000);
+    let lastError = '';
+    do {
+      const result = await this._cdpSend(tabId, 'Runtime.evaluate', {
+        expression: `(function(){
+          try {
+            var el = ${targetExpr};
+            if (!el) return { ok: false, reason: 'not_found' };
+            return { ok: true, value: el.getAttribute(${JSON.stringify(attribute)}) };
+          } catch (e) {
+            return { ok: false, reason: String(e && e.message ? e.message : e) };
+          }
+        })()`,
+        returnByValue: true,
+      });
+      const value = result?.result?.value;
+      if (value?.ok) return value.value == null ? '' : String(value.value);
+      lastError = value?.reason || 'not_found';
+      if (Date.now() >= deadline) break;
+      await this._sleep(300);
+    } while (Date.now() < deadline);
+    throw new Error(`断言失败：找不到属性目标元素（${lastError}）`);
+  }
+
+  async _executeAssertAttributeCDP(tabId, step) {
+    const attribute = PlayerManager._firstStepString(step, ['attribute', 'value']).trim();
+    const expected = PlayerManager._firstStepString(step, ['expect', 'expected']);
+    if (!attribute) throw new Error('assert_attribute 缺少 attribute');
+    const actual = await this._waitForTargetAttributeCDP(tabId, step, attribute);
+    if (actual !== expected) {
+      throw new Error(`断言失败：属性 ${attribute} 的实际值与期望值不一致`);
+    }
+  }
+
+  async _executeAssertScriptCDP(tabId, step) {
+    const expected = PlayerManager._firstStepString(step, ['expect', 'expected']);
+    const remoteResult = await this._evaluatePageScriptCDP(tabId, step?.script ?? step?.value);
+    const actual = PlayerManager._scriptResultToString(remoteResult);
+    if (actual !== expected) {
+      throw new Error('断言失败：页面脚本返回值与期望值不一致');
+    }
+  }
+
+  async _executeAssertTextNotCDP(tabId, step) {
+    const expected = PlayerManager._firstStepString(step, ['expect', 'value']);
+    if (expected.trim() === '') throw new Error('assert_text_not 缺少 expect');
+    const actual = await this._waitForDomTextRawCDP(
+      tabId,
+      step.target_selector,
+      step.target_xpath,
+      10000,
+      true,
+    );
+    if (actual == null) throw new Error('断言失败：找不到目标元素');
+    const operator = String(step?.operator || step?.match || 'not_contains').trim().toLowerCase();
+    const hit = operator === 'not_equals' ? actual !== expected : !actual.includes(expected);
+    if (!hit) throw new Error('断言失败：元素内容包含不应出现的文本');
+  }
+
+  async _executeAssertTextRegexCDP(tabId, step) {
+    const pattern = PlayerManager._firstStepString(step, ['regex', 'value']);
+    if (!pattern.trim()) throw new Error('assert_text_regex 缺少 regex');
+    let regex;
+    try {
+      regex = new RegExp(pattern, String(step?.regex_flags || ''));
+    } catch (error) {
+      throw new Error(`assert_text_regex 的正则无效：${error?.message || error}`);
+    }
+    const actual = await this._waitForDomTextRawCDP(
+      tabId,
+      step.target_selector,
+      step.target_xpath,
+      10000,
+      true,
+    );
+    if (actual == null) throw new Error('断言失败：找不到目标元素');
+    if (!regex.test(actual)) throw new Error('断言失败：元素内容不匹配正则表达式');
+  }
+
+  async _scrollToElementCDP(tabId, step) {
+    const result = await this._getElementBoxResult(
+      tabId,
+      step.target_selector,
+      step.target_xpath,
+      '',
+      5000,
+      true,
+      step.locator_meta,
+    );
+    if (!result?.ok) {
+      throw new Error(this._formatElementWaitFailure(result, step.target_selector, step.target_xpath));
+    }
+    // _getElementBoxResult 的定位表达式会 scrollIntoView(center)，这里不触发 click，避免旧 scroll-element 的误点击副作用。
+    return PlayerManager._actualLocatorFromVia(step, result.box?.via);
+  }
+
+  async _getCurrentPointerViewport(tabId) {
+    const response = await this._cdpSend(tabId, 'Runtime.evaluate', {
+      expression: `({ width: Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1), height: Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1) })`,
+      returnByValue: true,
+    });
+    const value = response?.result?.value || {};
+    return {
+      width: Math.max(1, Number(value.width) || 1),
+      height: Math.max(1, Number(value.height) || 1),
+    };
+  }
+
+  _rememberPointerPosition(tabId, x, y) {
+    this._pointerPositionByTab.set(tabId, {
+      x: Number(x),
+      y: Number(y),
+      frameId: this._frameContextByTab.get(tabId)?.frameId || '',
+    });
+  }
+
+  async _executePointerMoveCDP(tabId, step) {
+    const coordinate = String(step?.coordinate || 'relative').trim().toLowerCase();
+    if (coordinate && coordinate !== 'relative') {
+      throw new Error('CueCast/CDP 的 pointer_move 只支持浏览器视口相对坐标；绝对屏幕坐标应使用 host_pointer_move Agent');
+    }
+    const offsetX = Number(step?.x ?? step?.offset_x);
+    const offsetY = Number(step?.y ?? step?.offset_y);
+    if (!Number.isFinite(offsetX) || !Number.isFinite(offsetY)) {
+      throw new Error('pointer_move 需要有效的 x 和 y 相对偏移');
+    }
+    const frameId = this._frameContextByTab.get(tabId)?.frameId || '';
+    const viewport = await this._getCurrentPointerViewport(tabId);
+    const previous = this._pointerPositionByTab.get(tabId);
+    const start = previous && previous.frameId === frameId
+      ? previous
+      : { x: viewport.width / 2, y: viewport.height / 2 };
+    const x = Math.min(Math.max(0, start.x + offsetX), viewport.width - 1);
+    const y = Math.min(Math.max(0, start.y + offsetY), viewport.height - 1);
+    await this._cdpSend(tabId, 'Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x,
+      y,
+      button: 'none',
+    });
+    this._rememberPointerPosition(tabId, x, y);
+  }
+
+  async _waitForDialogOpening(tabId, timeout = 1200) {
+    if (this._dialogOpeningByTab.has(tabId)) return true;
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      await this._sleep(80);
+      if (this._dialogOpeningByTab.has(tabId)) return true;
+    }
+    return false;
+  }
+
+  async _handleJavaScriptDialogCDP(tabId, accept, promptText) {
+    const params = { accept: Boolean(accept) };
+    if (accept && promptText != null) params.promptText = String(promptText);
+    try {
+      await this._cdpSend(tabId, 'Page.handleJavaScriptDialog', params);
+    } catch (firstError) {
+      // 点击触发 dialog 的 CDP 事件偶尔在下一条步骤开始后才到达；短暂等待后只重试一次。
+      await this._waitForDialogOpening(tabId);
+      try {
+        await this._cdpSend(tabId, 'Page.handleJavaScriptDialog', params);
+      } catch (secondError) {
+        throw new Error(`处理浏览器弹窗失败：${secondError?.message || firstError?.message || secondError || firstError}`);
+      }
+    } finally {
+      this._dialogOpeningByTab.delete(tabId);
+    }
+  }
+
+  async _executeDialogActionCDP(tabId, step, nextStep) {
+    const actionType = String(step?.action_type || '').trim().toLowerCase();
+    if (actionType === 'dialog_prompt') {
+      const promptText = PlayerManager._firstStepString(step, ['value', 'prompt_text']);
+      const nextAction = String(nextStep?.action_type || '').trim().toLowerCase();
+      // Selenium 的旧 click-text 只写入文本而不关闭弹窗。CDP 无法单独写入 prompt，
+      // 因而将文本暂存到紧随其后的 accept/dismiss，保持旧链路 click-text → click-ok 的语义。
+      if (nextAction === 'dialog_accept' || nextAction === 'dialog_dismiss') {
+        this._pendingDialogPromptByTab.set(tabId, promptText);
+        return;
+      }
+      await this._handleJavaScriptDialogCDP(tabId, true, promptText);
+      return;
+    }
+    const promptText = this._pendingDialogPromptByTab.get(tabId);
+    this._pendingDialogPromptByTab.delete(tabId);
+    await this._handleJavaScriptDialogCDP(tabId, actionType === 'dialog_accept', promptText);
+  }
+
+  /** 截取验证码元素本身，避免把整页截图或验证码内容写入场景数据。 */
+  async _captureCaptchaTargetBase64(tabId, step) {
+    const boxResult = await this._getElementBoxResult(
+      tabId,
+      step?.target_selector,
+      step?.target_xpath,
+      '',
+      8000,
+      false,
+      step?.locator_meta,
+    );
+    const box = boxResult?.box;
+    if (!box || box.width <= 0 || box.height <= 0) {
+      throw new Error('验证码元素不可见，无法截取图片');
+    }
+    const screenshot = await this._cdpSend(tabId, 'Page.captureScreenshot', {
+      format: 'png',
+      clip: { x: box.x, y: box.y, width: box.width, height: box.height, scale: 1 },
+      captureBeyondViewport: false,
+    });
+    const data = String(screenshot?.data || '');
+    if (!data || data.length > 3 * 1024 * 1024) {
+      throw new Error('验证码截图为空或超过 2MB 限制');
+    }
+    return data;
   }
 
   /** 视口截图（需已附加 debugger），用于回放步骤截图落库 */
@@ -2785,7 +4296,7 @@ export class PlayerManager {
   }
 
   async _waitForDomTextRawCDP(tabId, selector, xpath, timeout = 8000, skipPageErrorCheck = false) {
-    let remaining = timeout;
+    let remaining = this._getEffectiveWaitTimeout(tabId, timeout);
     const wallEnd = Date.now() + PlayerManager.LOADING_WAIT_WALL_MS;
     const expr = PlayerManager._buildDomTextRawExpr(selector, xpath);
     while (Date.now() < wallEnd && remaining > 0) {
@@ -2918,7 +4429,8 @@ export class PlayerManager {
 
   async _executeAssertTextStepCDP(tabId, step) {
     if (step.wait_before) await this._sleep(step.wait_before);
-    const expected = step.value != null ? String(step.value) : '';
+    // canonical 表单使用 expect；保留 value 读取以兼容 CueCast 既有录制步骤。
+    const expected = step.expect != null ? String(step.expect) : (step.value != null ? String(step.value) : '');
     if (expected.trim() === '') {
       throw new Error('断言失败：未配置断言文本（「输入值」不能为空或仅空白）');
     }
@@ -3045,7 +4557,7 @@ export class PlayerManager {
         return r.width > 0 && r.height > 0;
       });
     })()`;
-    let remaining = timeout;
+    let remaining = this._getEffectiveWaitTimeout(tabId, timeout);
     const wallEnd = Date.now() + PlayerManager.LOADING_WAIT_WALL_MS;
     while (Date.now() < wallEnd && remaining > 0) {
       await this._throwIfPageError(tabId);
@@ -3061,7 +4573,7 @@ export class PlayerManager {
   // 通过 CSS/XPath/文本内容 查找元素坐标，带超时重试（页面处于 loading 时不扣减剩余时间）
   // skipDisabledCheck=true 用于浮层选项（选项本身不会 disabled）
   async _getElementBoxResult(tabId, selector, xpath, textFallback = '', timeout = 5000, skipDisabledCheck = false, locatorMeta = null) {
-    let remaining = timeout;
+    let remaining = this._getEffectiveWaitTimeout(tabId, timeout);
     const wallEnd = Date.now() + PlayerManager.LOADING_WAIT_WALL_MS;
     let lastStatus = null;
     while (Date.now() < wallEnd && remaining > 0) {
@@ -3225,7 +4737,7 @@ export class PlayerManager {
     }
 
     // 在浮层容器内按文本搜索；全页 loading 时不扣减 6s 预算
-    let remaining = 6000;
+    let remaining = this._getEffectiveWaitTimeout(tabId, 6000);
     const wallEnd = Date.now() + PlayerManager.LOADING_WAIT_WALL_MS;
     let box = null;
     while (!box && Date.now() < wallEnd && remaining > 0) {
@@ -3286,6 +4798,7 @@ export class PlayerManager {
     const clickCount = Number(options.clickCount || 1);
     const buttons = button === 'right' ? 2 : 1;
     await this._cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
+    this._rememberPointerPosition(tabId, x, y);
     if (clickCount <= 1 || button === 'right') {
       await this._cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, clickCount, buttons });
       await this._sleep(60);
@@ -5000,7 +6513,93 @@ export class PlayerManager {
   async _executeStepCDP(tabId, step, baseUrl, locale = 'zh', nextStep = null, hooks = {}) {
     if (step.wait_before) await this._sleep(step.wait_before);
     let actualLocator = null;
-    switch (step.action_type) {
+    const actionType = String(step.action_type || '').trim().toLowerCase();
+    switch (actionType) {
+      case 'frame_switch':
+      case 'frame_parent':
+      case 'frame_main': {
+        await this._executeFrameAction(tabId, { ...step, action_type: actionType });
+        break;
+      }
+
+      case 'evaluate': {
+        await this._executeEvaluateCDP(tabId, step);
+        break;
+      }
+
+      case 'select_option': {
+        actualLocator = await this._executeSelectOptionCDP(tabId, step, locale);
+        break;
+      }
+
+      case 'combo_select': {
+        actualLocator = await this._executeComboSelectCDP(tabId, step, locale);
+        break;
+      }
+
+      case 'dialog_accept':
+      case 'dialog_dismiss':
+      case 'dialog_prompt': {
+        await this._executeDialogActionCDP(tabId, { ...step, action_type: actionType }, nextStep);
+        break;
+      }
+
+      case 'input_date': {
+        actualLocator = await this._executeInputDateCDP(tabId, step);
+        break;
+      }
+
+      case 'clear': {
+        actualLocator = await this._executeClearCDP(tabId, step);
+        break;
+      }
+
+      case 'file_upload':
+      case 'certificate_upload': {
+        actualLocator = await this._executeFileUploadCDP(tabId, step);
+        break;
+      }
+
+      case 'assert_text': {
+        await this._executeAssertTextStepCDP(tabId, step);
+        break;
+      }
+
+      case 'assert_text_not': {
+        await this._executeAssertTextNotCDP(tabId, step);
+        break;
+      }
+
+      case 'assert_attribute': {
+        await this._executeAssertAttributeCDP(tabId, step);
+        break;
+      }
+
+      case 'assert_script': {
+        await this._executeAssertScriptCDP(tabId, step);
+        break;
+      }
+
+      case 'assert_text_regex': {
+        await this._executeAssertTextRegexCDP(tabId, step);
+        break;
+      }
+
+      case 'implicit_wait': {
+        this._setImplicitWaitTimeout(tabId, step);
+        break;
+      }
+
+      case 'pointer_move': {
+        await this._executePointerMoveCDP(tabId, step);
+        break;
+      }
+
+      case 'scroll_to_element': {
+        actualLocator = await this._scrollToElementCDP(tabId, step);
+        break;
+      }
+
       case 'click':
       case 'double_click':
       case 'right_click': {
@@ -5059,8 +6658,8 @@ export class PlayerManager {
         }
 
         await this._cdpClick(tabId, x, y, {
-          button: step.action_type === 'right_click' ? 'right' : 'left',
-          clickCount: step.action_type === 'double_click' ? 2 : 1,
+          button: actionType === 'right_click' ? 'right' : 'left',
+          clickCount: actionType === 'double_click' ? 2 : 1,
         });
 
         if (looksLikeOverlay) await this._sleep(400);
@@ -5074,7 +6673,7 @@ export class PlayerManager {
           );
           if (probe?.ok) actualLocator = PlayerManager._actualLocatorFromVia(step, probe.box?.via);
         }
-        const deadline = Date.now() + 8000;
+        const deadline = Date.now() + this._getEffectiveWaitTimeout(tabId, 8000);
         let lastErr = null;
         while (Date.now() < deadline) {
           await this._throwIfPageError(tabId);
@@ -5119,7 +6718,7 @@ export class PlayerManager {
           );
           if (probe?.ok) actualLocator = PlayerManager._actualLocatorFromVia(step, probe.box?.via);
         }
-        const deadline = Date.now() + 6500;
+        const deadline = Date.now() + this._getEffectiveWaitTimeout(tabId, 6500);
         let lastErr = null;
         while (Date.now() < deadline) {
           await this._throwIfPageError(tabId);
@@ -5140,8 +6739,20 @@ export class PlayerManager {
       }
 
       case 'scroll': {
-        const scrollY = step.value ? parseInt(step.value) : 300;
-        await this._cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseWheel', x: 400, y: 300, deltaX: 0, deltaY: scrollY });
+        if (step.target_selector || step.target_xpath || step.locator_meta) {
+          actualLocator = await this._scrollToElementCDP(tabId, step);
+          break;
+        }
+        const scrollY = Number(step.delta_y ?? step.value ?? 300);
+        if (!Number.isFinite(scrollY)) throw new Error('scroll 的 delta_y 必须是有效数字');
+        const viewport = await this._getCurrentPointerViewport(tabId);
+        await this._cdpSend(tabId, 'Input.dispatchMouseEvent', {
+          type: 'mouseWheel',
+          x: Math.round(viewport.width / 2),
+          y: Math.round(viewport.height / 2),
+          deltaX: Number(step.delta_x) || 0,
+          deltaY: scrollY,
+        });
         break;
       }
 
@@ -5172,6 +6783,7 @@ export class PlayerManager {
             y: merged.y,
             button: 'none',
           });
+          this._rememberPointerPosition(tabId, merged.x, merged.y);
         }
         await this._sleep(300);
         break;

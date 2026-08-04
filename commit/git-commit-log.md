@@ -1,3 +1,453 @@
+# 2026-08-03 修复 replaceCase 录制导入缺少定义版本
+
+## 涉及文件
+
+- modules/recorder-manager.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. CueCast 组装录制导入请求时透传 Admin UI 提供的 `expectedDefinitionVersion`，修复 `replaceCase`、追加及步骤修改模式被后端拒绝的问题。
+2. 将定义版本加入录制意图标识；同一目标在版本变化后不再错误复用旧录制会话。
+
+## 验证
+
+已执行模块语法检查和 payload 契约验证，确认 `replaceCase` 请求保留版本号，且不同版本的录制意图标识不同。
+
+```powershell
+node --check modules/recorder-manager.js
+node --experimental-default-type=module --input-type=module -e "import { RecorderManager } from './modules/recorder-manager.js'; /* payload/identity assertions */"
+```
+
+## 具体代码改动
+
+### `modules/recorder-manager.js`
+
+```diff
+ return JSON.stringify({
+   mode: recordingImport.mode || '',
+   targetSceneDbId: recordingImport.targetSceneDbId ?? '',
++  expectedDefinitionVersion: recordingImport.expectedDefinitionVersion ?? '',
+   targetCaseId: recordingImport.targetCaseId ?? '',
+ });
+
+ return {
+   mode: options.mode || 'createScene',
+   targetSceneDbId: options.targetSceneDbId,
++  // 替换和追加必须透传启动录制时读取的定义版本，避免绕过并发修改校验。
++  expectedDefinitionVersion: options.expectedDefinitionVersion,
+   targetCaseId: options.targetCaseId,
+ };
+```
+
+# 2026-08-01 CueCast 能力快照按环境与扩展会话隔离
+
+## 涉及文件
+
+- modules/api-client.js
+- modules/canonical-action-registry.js
+- modules/player-manager.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. 能力上报改用受控 `capabilities/cuecast` 路径，不再由请求体决定执行器类型。
+2. 上报稳定扩展实例 ID、项目环境、当前回放会话和真实 feature，使 Admin 能按环境与用户会话隔离短租约快照。
+3. 会话 ID 仅保存在当前扩展后台内存中，不持久化认证信息；环境切换会形成新的握手限频键。
+
+## 验证
+
+待与 Admin 批次 A 契约一起执行：
+
+```powershell
+node --check modules/api-client.js
+node --check modules/canonical-action-registry.js
+node --check modules/player-manager.js
+```
+
+## 具体代码改动
+
+### `modules/api-client.js`
+
+```diff
+- return this.request('POST', '/automation/operation-catalog/capabilities', capabilities, { timeoutMs: 5000 });
++ return this.request('POST', '/automation/operation-catalog/capabilities/cuecast', {
++   executor_instance_id: capabilities?.executorInstanceId,
++   project_environment_id: capabilities?.projectEnvironmentId,
++   session_id: capabilities?.sessionId,
++   actions: capabilities?.actions,
++   features: capabilities?.features || [],
++ }, { timeoutMs: 5000 });
+```
+
+### `modules/canonical-action-registry.js`
+
+```diff
+ export function getCuecastCapabilities({
++  executorInstanceId = '',
++  projectEnvironmentId = '',
++  sessionId = '',
++  features = ['browser', 'cdp'],
+ } = {}) {
+```
+
+### `modules/player-manager.js`
+
+```diff
+- void this._reportOperationCapabilities();
++ void this._reportOperationCapabilities(opts);
+
++ const capabilities = getCuecastCapabilities({
++   executorInstanceId: String(chrome.runtime?.id || 'cuecast-extension'),
++   projectEnvironmentId,
++   sessionId: this._getCapabilitySessionId(),
++   features: ['browser', 'cdp'],
++ });
+```
+
+# 2026-07-31 CueCast 文件上传与验证码 OCR 受控链路
+
+## 涉及文件
+
+- modules/canonical-action-registry.js
+- modules/player-manager.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. 将普通文件上传、证书上传登记为 Chrome CDP 动作：只允许执行端可读的绝对文件路径，使用 `DOM.setFileInputFiles` 写入真实 `input[type=file]`，不向页面脚本文本注入路径。
+2. 将验证码 OCR 登记为 CDP 动作：CueCast 仅截取目标验证码元素，图片 base64 只随本次基础设施任务短时传递；不会写入场景、截图工件或回放结果。
+3. 对运行时属性与验证码变量增加任务结果强校验，Agent 没有返回声明变量时直接失败，避免后续步骤使用空变量继续执行。
+
+## 验证
+
+已执行：
+
+```powershell
+node --check modules/canonical-action-registry.js
+node --check modules/player-manager.js
+node --experimental-default-type=module --input-type=module -e "import { PlayerManager } from './modules/player-manager.js'; const cases=[['file_upload',{file_ref:{path:'C:\\work\\upload.txt'}}],['certificate_upload',{certificate_ref:{path:'/tmp/client.pem'}}]]; for(const [type, step] of cases){ const files=PlayerManager._filePathsFromStep({action_type:type,...step}); if(!files[0]) throw new Error(type); } console.log('cuecast file reference contract passed');"
+```
+
+结果：两个模块语法检查通过；普通文件和证书引用均可被受控解析。验证码截图和 OCR 任务转发由同一受限基础设施通道处理。
+
+## 具体代码改动
+
+### `modules/canonical-action-registry.js`
+
+```diff
+  { actionType: 'assert_variable_list_not', route: 'runner_local' },
++ { actionType: 'file_upload', route: 'cdp' },
++ { actionType: 'certificate_upload', route: 'cdp' },
++ { actionType: 'captcha_ocr', route: 'cdp' },
+  { actionType: 'assert_database_value', route: 'runner_local' },
+```
+
+### `modules/player-manager.js`
+
+```diff
++ async _executeFileUploadCDP(tabId, step) {
++   const files = PlayerManager._filePathsFromStep(step);
++   await this._cdpSend(tabId, 'DOM.setFileInputFiles', { files, backendNodeId });
++ }
+
++ if (actionType === 'captcha_ocr') {
++   const imageBase64 = await this._captureCaptchaTargetBase64(playTabId, executableStep);
++   await this._executeInfrastructureStep(sourceCaseKey, executableStep, {
++     runtimeInput: { captcha_image_base64: imageBase64 },
++   });
++ }
+```
+
+# 2026-07-31 CueCast 数据库变量断言与基础设施绑定收口
+
+## 涉及文件
+
+- modules/canonical-action-registry.js
+- modules/variable-context.js
+- modules/player-manager.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. 将 `assert_database_value` 登记为 `runner_local`：断言只读取本次 CDP 回放的变量上下文，不访问浏览器、扩展存储或历史报告。
+2. 基础设施步骤继续只提交冻结步骤中实际出现的 `${变量}` 根变量；数据库、文件查询等返回值仅在当前回放上下文回写。
+3. 能力目录只有在 CueCast 上报该 action 后才会启用相应人工步骤，避免将 CDP 不具备的动作误报为可执行。
+
+## 验证
+
+已执行：
+
+```powershell
+node --check modules/canonical-action-registry.js
+node --check modules/variable-context.js
+node --check modules/player-manager.js
+node --experimental-default-type=module --input-type=module -e "import { CuecastVariableContext } from './modules/variable-context.js'; import { CUECAST_ACTION_TYPES } from './modules/canonical-action-registry.js'; const variables = new CuecastVariableContext({ rows: [{ id: '7', status: 'READY' }] }); const reference = String.fromCharCode(36) + '{rows[0].id}'; const bindings = variables.bindingsForStep({ sql: reference }); if (bindings.rows[0].id !== '7' || !CUECAST_ACTION_TYPES.has('assert_database_value') || !CUECAST_ACTION_TYPES.has('host_file_lookup')) process.exit(1);"
+```
+
+结果：三个模块语法检查通过；嵌套数据库结果只生成根变量绑定，数据库断言和文件查询动作均在实际注册表中。
+
+## 具体代码改动
+
+### `modules/canonical-action-registry.js`
+
+```diff
+  { actionType: 'assert_variable_list', route: 'runner_local' },
+  { actionType: 'assert_variable_list_not', route: 'runner_local' },
++ { actionType: 'assert_database_value', route: 'runner_local' },
+  { actionType: 'assert_json', route: 'cdp_admin' },
+```
+
+### `modules/variable-context.js`
+
+```diff
+  'global_variable_formula',
+  'assert_variable_list',
+  'assert_variable_list_not',
++ 'assert_database_value',
+]);
+```
+
+### `modules/player-manager.js`
+
+```diff
+  if (isInfrastructureStep(executableStep)) {
+    const infrastructureResult = await this._executeInfrastructureStep(sourceCaseKey, executableStep, {
++     runtimeBindings: variableContext.bindingsForStep(step),
+    });
+  }
+
++ if (isCuecastLocalVariableAction(actionType)) {
++   await this._executeLocalVariableAction(playTabId, executableStep, variableContext);
++ }
+```
+
+# 2026-07-30 CueCast canonical action 注册表与 Admin 能力握手
+
+## 涉及文件
+
+- modules/canonical-action-registry.js
+- modules/api-client.js
+- modules/player-manager.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. 新增 CueCast 独立的 canonical action 注册表，逐项标明真实路由：`chrome.debugger/CDP`、`content/player.js`、CDP 采集后 Admin 比对/规划，以及只按冻结步骤身份委托 Admin/Agent 的基础设施动作。
+2. API 客户端新增 `POST /automation/operation-catalog/capabilities` 调用，超时限制为 5 秒。
+3. Admin 用例回放开始时异步上报 `executor=cuecast`、manifest 版本、目录版本和实际 action 集合；同一 Admin 会话内 60 秒限频。旧 Admin 的 404、目录版本不一致和网络异常只记录告警，不会中断既有 CDP 回放。
+4. `PlayerManager._canUseCDP()` 改为复用注册表，防止能力上报和真实 CDP 路由漂移。
+
+## 修改原因
+
+Admin 新增步骤页需要按照三执行器真实能力交集开放方法。CueCast 不能被当作 Playwright Runner，也不能把由内容脚本或 Admin/Agent 执行的动作误报为纯 CDP；因此将实际路由集中登记，并在建立 Admin 回放会话时以 `cuecast` 身份完成兼容握手。
+
+## 验证
+
+已执行：
+
+```powershell
+node --check modules/canonical-action-registry.js
+node --check modules/api-client.js
+node --check modules/player-manager.js
+node --experimental-default-type=module --input-type=module -e "import { CUECAST_ACTION_TYPES, CUECAST_CDP_ACTION_TYPES, getCuecastCapabilities, getCuecastActionRoute } from './modules/canonical-action-registry.js'; const payload = getCuecastCapabilities({ executorVersion: '1.1.0' }); if (payload.executor !== 'cuecast' || payload.catalogVersion !== '2026-07-30.1' || !payload.actions.includes('navigate') || !payload.actions.includes('server_command') || CUECAST_CDP_ACTION_TYPES.has('navigate') || getCuecastActionRoute('server_command') !== 'admin_infrastructure' || !CUECAST_ACTION_TYPES.has('assert_text')) process.exit(1); console.log(JSON.stringify(payload));"
+node --experimental-default-type=module --input-type=module -e "import { PlayerManager } from './modules/player-manager.js'; globalThis.chrome = { runtime: { getManifest: () => ({ version: '1.1.0' }) } }; let payload; const manager = new PlayerManager({ apiBase: 'http://admin/api', authToken: 'token' }, { registerOperationCapabilities: async (body) => { payload = body; } }); const report = await manager._reportOperationCapabilities(); if (!report.ok || payload.executor !== 'cuecast' || payload.executorVersion !== '1.1.0' || !payload.actions.includes('click') || !payload.actions.includes('navigate')) process.exit(1); const fallback = new PlayerManager({ apiBase: 'http://old-admin/api', authToken: 'token' }, { registerOperationCapabilities: async () => { throw new Error('HTTP 404'); } }); const failed = await fallback._reportOperationCapabilities(); if (failed.ok || !failed.error) process.exit(1); console.log('capability handshake contract passed');"
+```
+
+结果：三个扩展模块语法检查通过；注册表契约验证通过；正常上报与旧 Admin 失败降级均通过，不会阻断回放。
+
+## 具体代码改动
+
+### `modules/canonical-action-registry.js`
+
+```diff
++export const OPERATION_CATALOG_VERSION = '2026-07-30.1';
++
++export const CUECAST_ACTION_REGISTRY = Object.freeze([
++  { actionType: 'navigate', route: 'content_player' },
++  { actionType: 'click', route: 'cdp' },
++  { actionType: 'double_click', route: 'cdp' },
++  { actionType: 'right_click', route: 'cdp' },
++  { actionType: 'input', route: 'cdp' },
++  { actionType: 'key', route: 'cdp' },
++  { actionType: 'scroll', route: 'cdp' },
++  { actionType: 'hover', route: 'cdp' },
++  { actionType: 'assert_text', route: 'cdp' },
++  { actionType: 'wait', route: 'content_player' },
++  { actionType: 'assert_json', route: 'cdp_admin' },
++  { actionType: 'ai_natural', route: 'cdp_admin' },
++  { actionType: 'server_command', route: 'admin_infrastructure' },
++  { actionType: 'database_sql', route: 'admin_infrastructure' },
++  { actionType: 'database_native', route: 'admin_infrastructure' },
++].map((entry) => Object.freeze(entry)));
++
++export const CUECAST_ACTION_TYPES = new Set(
++  CUECAST_ACTION_REGISTRY.map((entry) => entry.actionType),
++);
++
++export const CUECAST_CDP_ACTION_TYPES = new Set(
++  CUECAST_ACTION_REGISTRY
++    .filter((entry) => entry.route === 'cdp')
++    .map((entry) => entry.actionType),
++);
++
++export function isCuecastCdpAction(actionType) {
++  return CUECAST_CDP_ACTION_TYPES.has(normalizeActionType(actionType));
++}
++
++export function getCuecastCapabilities({ executorVersion = 'unknown', catalogVersion = OPERATION_CATALOG_VERSION } = {}) {
++  return {
++    executor: 'cuecast',
++    executorVersion: String(executorVersion || 'unknown').trim() || 'unknown',
++    catalogVersion: String(catalogVersion || OPERATION_CATALOG_VERSION).trim(),
++    actions: [...CUECAST_ACTION_TYPES],
++  };
++}
+```
+
+### `modules/api-client.js`
+
+```diff
+   cancelInfrastructureTask(taskId) {
+     return this.request('DELETE', `/automation/infrastructure/tasks/${encodeURIComponent(taskId)}`, null, { timeoutMs: 30000 });
+   }
++
++  registerOperationCapabilities(capabilities) {
++    return this.request('POST', '/automation/operation-catalog/capabilities', capabilities, { timeoutMs: 5000 });
++  }
+ }
+```
+
+### `modules/player-manager.js`
+
+```diff
++import {
++  getCuecastCapabilities,
++  isCuecastCdpAction,
++} from './canonical-action-registry.js';
++
+ export class PlayerManager {
+   constructor(state, api) {
+     this.state = state;
+     this.api = api;
++    this._capabilityHandshake = null;
+   }
+@@
+   async start(testCaseId, startUrl, opts = {}) {
+     const adminCaseKey = String(opts.adminCaseKey || '').trim();
+     const useAdminCase = Boolean(adminCaseKey) || String(opts.dataSource || '').trim().toLowerCase() === 'admin';
++    if (useAdminCase) {
++      void this._reportOperationCapabilities();
++    }
+@@
++  _reportOperationCapabilities() {
++    if (typeof this.api?.registerOperationCapabilities !== 'function') {
++      return Promise.resolve({ ok: false, skipped: true });
++    }
++    const extensionVersion = this._getExtensionVersion();
++    const sessionKey = `${String(this.state?.apiBase || '').trim()}\n${this.state?.authToken ? 'authenticated' : 'anonymous'}\n${extensionVersion}`;
++    const capabilities = getCuecastCapabilities({ executorVersion: extensionVersion });
++    const promise = Promise.resolve()
++      .then(() => this.api.registerOperationCapabilities(capabilities))
++      .catch((error) => {
++        console.warn('[Player] CueCast 能力上报未完成，继续回放：', error?.message || String(error));
++        return { ok: false, error };
++      });
++    this._capabilityHandshake = { sessionKey, attemptedAt: Date.now(), promise };
++    return promise;
++  }
+@@
+   _canUseCDP(step) {
+-    return ['click', 'double_click', 'right_click', 'input', 'key', 'scroll', 'hover'].includes(step.action_type);
++    return isCuecastCdpAction(step?.action_type);
+   }
+ }
+```
+
+# 2026-07-28 CueCast 基础设施步骤后台委托与统一回放进度
+
+## 涉及文件
+
+- modules/api-client.js
+- modules/player-manager.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. API 客户端新增基础设施任务创建、按 `nextSequence` 轮询和取消接口，调用方只传 `caseKey`、`stepId`、`executionId`、`projectEnvironmentId`、`attempt`，不提交命令、SQL、目标或凭据。
+2. CDP 回放识别 `server_command`、`database_sql`、`database_native`；这些步骤只在扩展后台创建和轮询 admin 基础设施任务，不会发给 `content/player.js`、CDP 页面上下文或 DOM 回放脚本。
+3. 基础设施任务日志以统一 `AT_PLAYBACK_PROGRESS` 回传；步骤结果补充执行器、任务 ID、退出码和影响行数。用户停止回放时会请求取消正在执行的基础设施任务。
+
+## 修改原因
+
+浏览器扩展不具备 SSH/JDBC 执行边界，且内容脚本不能接触服务器命令、SQL 或凭据。通过 admin 受控任务接口委托执行，才能保持浏览器步骤与基础设施步骤的顺序回放，同时保留鉴权、脱敏、审计和取消能力。
+
+## 验证
+
+已执行：
+
+```bash
+node --check modules/api-client.js
+node --check modules/player-manager.js
+```
+
+结果：语法检查通过。
+
+## 具体代码改动
+
+### `modules/api-client.js`
+
+```diff
+-}
++  createInfrastructureTask(payload) {
++    return this.request('POST', '/automation/infrastructure/tasks', payload, { timeoutMs: 30000 });
++  }
++  getInfrastructureTask(taskId, afterSequence = 0) {
++    const query = afterSequence > 0 ? `?afterSequence=${encodeURIComponent(afterSequence)}` : '';
++    return this.request('GET', `/automation/infrastructure/tasks/${encodeURIComponent(taskId)}${query}`, null, { timeoutMs: 30000 });
++  }
++  cancelInfrastructureTask(taskId) {
++    return this.request('DELETE', `/automation/infrastructure/tasks/${encodeURIComponent(taskId)}`, null, { timeoutMs: 30000 });
++  }
++}
+```
+
+### `modules/player-manager.js`
+
+```diff
++function isInfrastructureStep(step) {
++  return ['server_command', 'database_sql', 'database_native'].includes(
++    String(step?.action_type ?? '').trim().toLowerCase(),
++  );
++}
+```
+
+```diff
+         const executableStep = waitBefore ? { ...runtimeStep, wait_before: 0 } : runtimeStep;
++      if (isInfrastructureStep(executableStep)) {
++        const infrastructureResult = await this._executeInfrastructureStep(sourceCaseKey, executableStep, {
++          ctx,
++          executionId: opts.executionId || runId,
++          projectEnvironmentId: executionSnapshot.project_environment_id,
++          onProgress: (phase, payload) => broadcastProgress(phase, payload),
++        });
++        appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', null, infrastructureResult);
++        continue;
++      }
+```
+
+```diff
+   async stop() {
+     for (const ctx of this._playContexts) {
+       ctx.stopped = true;
++    const taskIds = Array.from(ctx.infrastructureTaskIds || []);
++    await Promise.all(taskIds.map(taskId => this.api.cancelInfrastructureTask(taskId).catch(() => {})));
+    }
+  }
+```
+
+`_executeInfrastructureStep()` 只使用步骤身份创建任务，并按 `taskId` 与 `nextSequence` 轮询服务端已脱敏日志；终态结果回写为统一步骤结果。扩展不会读取、缓存或展示 `target_ref`、原始命令、SQL 或凭据。
+
 # 2026-07-23 CDP 日志契约与历史完整性统一
 
 ## 变更内容
@@ -1365,4 +1815,79 @@ node --check modules/recorder-manager.js
 +      error: saved ? undefined : saveError,
 +      saveContext,
      });
+```
+# 2026-07-31 CueCast 基础设施变量绑定与高权限动作扩展
+
+## 涉及文件
+
+- modules/canonical-action-registry.js
+- modules/variable-context.js
+- modules/player-manager.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. 将 `host_command`、`host_file_lookup`、`host_file_delete`、`server_file_upload` 明确登记为 `admin_infrastructure`，不会落入 CDP 或内容脚本。
+2. 每次回放变量上下文新增步骤引用扫描和 `runtimeBindings` 生成；基础设施任务只携带当前冻结步骤实际引用的根变量。
+3. 文件查询、数据库查询和系统/IP 步骤在 Admin 返回显式变量结果时写回当前回放变量上下文；任务结果不会写入扩展存储或回放报告。
+
+## 修改原因
+
+浏览器回放端不能把已经解析出的变量值直接拼进命令、SQL 或文件配置，也不能把本机/服务器动作误当作 CDP 操作。此次补齐与 Playwright Runner 相同的“一次性绑定、后端冻结步骤解析、用例内存变量回写”边界。
+
+## 验证
+
+已执行：
+
+```powershell
+node --check modules/canonical-action-registry.js
+node --check modules/variable-context.js
+node --check modules/player-manager.js
+node --experimental-default-type=module --input-type=module -e "import { CuecastVariableContext } from './modules/variable-context.js'; const variables = new CuecastVariableContext({ rows: [{ id: '7' }] }); const reference = String.fromCharCode(36) + '{rows[0].id}'; const bindings = variables.bindingsForStep({ sql: reference }); if (bindings.rows[0].id !== '7') process.exit(1);"
+```
+
+结果：三个模块语法检查通过；嵌套变量引用能只生成根变量绑定。
+
+## 具体代码改动
+
+### `modules/canonical-action-registry.js`
+
+```diff
+   { actionType: 'database_native', route: 'admin_infrastructure' },
++  { actionType: 'host_command', route: 'admin_infrastructure' },
++  { actionType: 'host_file_lookup', route: 'admin_infrastructure' },
++  { actionType: 'host_file_delete', route: 'admin_infrastructure' },
++  { actionType: 'server_file_upload', route: 'admin_infrastructure' },
+ ].map((entry) => Object.freeze(entry)));
+```
+
+### `modules/variable-context.js`
+
+```diff
+   resolveStep(step) {
+     return resolveRuntimeValue(step, this, true);
+   }
++
++  bindingsForStep(step) {
++    const bindings = {};
++    for (const reference of this.referencesInStep(step)) {
++      const { root } = this._parseReference(reference);
++      bindings[root] = this.get(root);
++    }
++    return bindings;
++  }
+```
+
+### `modules/player-manager.js`
+
+```diff
+   if (isInfrastructureStep(executableStep)) {
+     const infrastructureResult = await this._executeInfrastructureStep(sourceCaseKey, executableStep, {
+       projectEnvironmentId: executionSnapshot.project_environment_id,
++      runtimeBindings: variableContext.bindingsForStep(step),
+     });
+   }
++  ...(options.runtimeBindings && Object.keys(options.runtimeBindings).length > 0
++    ? { runtimeBindings: options.runtimeBindings }
++    : {}),
 ```

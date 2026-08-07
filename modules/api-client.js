@@ -14,7 +14,7 @@ export class ApiClient {
    * @param {number} [opts.timeoutMs] 超时后 Abort，抛出「请求超时（Nms）」
    */
   async request(method, path, body, opts = {}) {
-    const { timeoutMs } = opts;
+    const { timeoutMs, executionCapability } = opts;
     const url = `${this.base}${path}`;
     const controller = new AbortController();
     let timer;
@@ -24,6 +24,7 @@ export class ApiClient {
     const headers = { 'Content-Type': 'application/json' };
     const token = this._getToken();
     if (token) headers['Authorization'] = `Bearer ${token}`;
+    if (executionCapability) headers['X-Execution-Capability'] = executionCapability;
     try {
       const res = await fetch(url, {
         method,
@@ -64,11 +65,16 @@ export class ApiClient {
 
   getTestCase(id) { return this.request('GET', `/testcases/${id}?raw_values=1`); }
   // 扩展 CDP 回放直接读取 admin 的统一 caseKey，避免在扩展侧重组 CaseDO/StepDO。
-  getAdminPlaywrightCase(caseKey, projectEnvironmentId) {
-    const query = projectEnvironmentId == null || String(projectEnvironmentId).trim() === ''
-      ? ''
-      : `?projectEnvironmentId=${encodeURIComponent(projectEnvironmentId)}`;
-    return this.request('GET', `/automation/playwright/testcases/${encodeAdminCasePath(caseKey)}${query}`);
+  getAdminPlaywrightCase(caseKey, projectEnvironmentId, batchId = '', executionCapability = '') {
+    const query = new URLSearchParams();
+    if (projectEnvironmentId != null && String(projectEnvironmentId).trim() !== '') {
+      query.set('projectEnvironmentId', projectEnvironmentId);
+    }
+    if (batchId) query.set('batchId', batchId);
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    return this.request('GET', `/automation/playwright/testcases/${encodeAdminCasePath(caseKey)}${suffix}`, null, {
+      executionCapability,
+    });
   }
   saveSteps(id, steps) { return this.request('POST', `/testcases/${id}/steps`, { steps }); }
   importRecording(payload) {
@@ -118,29 +124,38 @@ export class ApiClient {
   }
 
   // admin 结果接口与旧 CueCast mock 结果接口分开，保留两条协议的兼容性。
-  saveAdminPlaywrightResult(caseKey, result) {
+  saveAdminPlaywrightResult(caseKey, result, executionCapability = '') {
     return this.request(
       'POST',
       `/automation/playwright/testcases/${encodeURIComponent(caseKey)}/results`,
       result,
-      { timeoutMs: 30000 },
+      { timeoutMs: 30000, executionCapability },
     );
   }
 
   /**
    * 基础设施步骤只提交已冻结用例中的步骤身份；命令、SQL 和凭据始终由 admin/执行节点解析。
    */
-  createInfrastructureTask(payload) {
-    return this.request('POST', '/automation/infrastructure/tasks', payload, { timeoutMs: 30000 });
+  createInfrastructureTask(payload, executionCapability = '') {
+    return this.request('POST', '/automation/infrastructure/tasks', payload, {
+      timeoutMs: 30000,
+      executionCapability,
+    });
   }
 
-  getInfrastructureTask(taskId, afterSequence = 0) {
+  getInfrastructureTask(taskId, afterSequence = 0, executionCapability = '') {
     const query = afterSequence > 0 ? `?afterSequence=${encodeURIComponent(afterSequence)}` : '';
-    return this.request('GET', `/automation/infrastructure/tasks/${encodeURIComponent(taskId)}${query}`, null, { timeoutMs: 30000 });
+    return this.request('GET', `/automation/infrastructure/tasks/${encodeURIComponent(taskId)}${query}`, null, {
+      timeoutMs: 30000,
+      executionCapability,
+    });
   }
 
-  cancelInfrastructureTask(taskId) {
-    return this.request('DELETE', `/automation/infrastructure/tasks/${encodeURIComponent(taskId)}`, null, { timeoutMs: 30000 });
+  cancelInfrastructureTask(taskId, executionCapability = '') {
+    return this.request('DELETE', `/automation/infrastructure/tasks/${encodeURIComponent(taskId)}`, null, {
+      timeoutMs: 30000,
+      executionCapability,
+    });
   }
 
   /**

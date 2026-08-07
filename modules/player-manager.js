@@ -15,6 +15,7 @@ import {
   isCuecastLocalVariableAction,
   toBoolean,
 } from './variable-context.js';
+import { attachOperationDiagnostic } from './operation-diagnostics.js';
 
 /** 改为 true 后：打开扩展 Service Worker 控制台可看到 AI 步骤的节点数与操作计划 */
 const DEBUG_AI_NATURAL = false;
@@ -255,6 +256,71 @@ function resolvePlaybackStartUrl(startUrl, testCase) {
   return raw;
 }
 
+function positiveInteger(value, fallback) {
+  const parsed = Math.round(Number(value));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function enabledFlag(value) {
+  return value === true || value === 1 || String(value ?? '').trim().toLowerCase() === 'true';
+}
+
+export function resolvePlaybackBrowserBootstrap(value) {
+  const mode = String(value || 'launch').trim().toLowerCase();
+  if (!['launch', 'attach', 'none'].includes(mode)) {
+    throw new Error(`不支持的 browser_bootstrap_mode：${mode || '(empty)'}`);
+  }
+  return {
+    mode,
+    initializeBrowser: mode !== 'none',
+  };
+}
+
+/**
+ * Admin 批次必须使用绑定 revision 返回的最终配置；客户端传入值仅保留给 popup/test-lab 兼容链路。
+ */
+export function resolvePlaybackRuntimeConfig(testCase, opts = {}, useAdminCase = false) {
+  const batchId = String(opts.batchId || '').trim();
+  const rawEffectiveConfig = testCase?.effectiveExecutionConfig ?? testCase?.effective_execution_config;
+  const frozenRequired = useAdminCase && batchId !== '';
+  const hasFrozenConfig = rawEffectiveConfig
+    && typeof rawEffectiveConfig === 'object'
+    && !Array.isArray(rawEffectiveConfig)
+    && Object.keys(rawEffectiveConfig).length > 0;
+  if (frozenRequired && !hasFrozenConfig) {
+    throw new Error('Admin 批次未返回 EffectiveExecutionConfig，拒绝在 CueCast 端重新合并默认值');
+  }
+  if (frozenRequired) {
+    const browserBootstrap = resolvePlaybackBrowserBootstrap(rawEffectiveConfig.browser_bootstrap_mode);
+    return {
+      frozen: true,
+      executionConfig: { ...rawEffectiveConfig },
+      startUrl: String(rawEffectiveConfig.start_url || '').trim(),
+      browserBootstrapMode: browserBootstrap.mode,
+      windowSizeMode: rawEffectiveConfig.window_size_mode,
+      viewportWidth: rawEffectiveConfig.viewport_width,
+      viewportHeight: rawEffectiveConfig.viewport_height,
+      pageErrorCheckEnabled: enabledFlag(rawEffectiveConfig.page_error_check_enabled),
+      screenshotMode: String(rawEffectiveConfig.screenshot_mode || 'standard').trim().toLowerCase(),
+      stepTimeoutMs: positiveInteger(rawEffectiveConfig.step_timeout_ms, 6000),
+      caseTimeoutMs: positiveInteger(rawEffectiveConfig.case_timeout_ms, 600000),
+    };
+  }
+  return {
+    frozen: false,
+    executionConfig: null,
+    startUrl: String(opts.startUrl ?? testCase?.start_url ?? testCase?.startUrl ?? '').trim(),
+    browserBootstrapMode: 'launch',
+    windowSizeMode: opts.viewportMode ?? testCase?.window_size_mode ?? testCase?.viewport_mode,
+    viewportWidth: opts.viewportWidth ?? testCase?.viewport_width,
+    viewportHeight: opts.viewportHeight ?? testCase?.viewport_height,
+    pageErrorCheckEnabled: enabledFlag(opts.pageErrorCheckEnabled ?? testCase?.page_error_check_enabled ?? 0),
+    screenshotMode: String(testCase?.screenshot_mode || 'standard').trim().toLowerCase(),
+    stepTimeoutMs: 6000,
+    caseTimeoutMs: 600000,
+  };
+}
+
 function normalizeStartStepIndex(value, stepCount) {
   const n = Number(value);
   if (!Number.isInteger(n) || n < 0) return 0;
@@ -276,6 +342,8 @@ export class PlayerManager {
     this._frameStackByTab = new Map();
     this._frameContextByTab = new Map();
     this._implicitWaitMsByTab = new Map();
+    this._stepTimeoutMsByTab = new Map();
+    this._caseDeadlineByTab = new Map();
     this._pointerPositionByTab = new Map();
     // CDP 的 dialog 只能通过 Page.handleJavaScriptDialog 结束；缓存 opening 事件用于处理
     // “点击触发弹窗 → 下一条 dialog_* 步骤”的正常时序，而不是在页面上下文伪造 alert。
@@ -501,7 +569,7 @@ export class PlayerManager {
         ...payload,
       });
     };
-    const executionSnapshot = {
+    let executionSnapshot = {
       project_environment_id: opts.projectEnvironmentId ?? '',
       batch_id: opts.batchId ?? '',
       window_size_mode: opts.viewportMode ?? '',
@@ -521,10 +589,26 @@ export class PlayerManager {
 
     try {
       const res = useAdminCase
-        ? await this.api.getAdminPlaywrightCase(sourceCaseKey, opts.projectEnvironmentId)
+        ? await this.api.getAdminPlaywrightCase(sourceCaseKey, opts.projectEnvironmentId, opts.batchId, opts.executionCapability)
         : await this.api.getTestCase(testCaseId);
       const testCase = res.data;
       const steps = testCase.steps || [];
+      const runtimeConfig = resolvePlaybackRuntimeConfig(testCase, { ...opts, startUrl }, useAdminCase);
+      const browserBootstrap = resolvePlaybackBrowserBootstrap(runtimeConfig.browserBootstrapMode);
+      const resolvedProjectEnvironmentId = testCase.project_environment_id ?? opts.projectEnvironmentId ?? '';
+      const caseDeadline = runStartedAt + runtimeConfig.caseTimeoutMs;
+      const throwIfCaseTimedOut = () => {
+        if (Date.now() >= caseDeadline) {
+          throw new Error(`用例执行超时（${runtimeConfig.caseTimeoutMs}ms）`);
+        }
+      };
+      const bindRuntimeConfigToTab = (tabId) => {
+        if (tabId == null) return;
+        this._stepTimeoutMsByTab.set(tabId, runtimeConfig.stepTimeoutMs);
+        this._caseDeadlineByTab.set(tabId, caseDeadline);
+        this._pageErrorCheckEnabledByTab = this._pageErrorCheckEnabledByTab || new Map();
+        this._pageErrorCheckEnabledByTab.set(tabId, runtimeConfig.pageErrorCheckEnabled);
+      };
       // 每次回放独立创建变量上下文，不能复用扩展进程状态或将值写入 chrome.storage。
       const variableContext = new CuecastVariableContext(
         opts.initialVariables ?? testCase.initial_variables ?? testCase.initialVariables ?? {},
@@ -534,31 +618,40 @@ export class PlayerManager {
       broadcastProgress('case-loaded', {
         log: { level: 'success', phase: 'case', message: `用例加载完成，共 ${steps.length} 个步骤` },
       });
-      const windowPreference = await resolveWindowPreference({
-        viewportMode: opts.viewportMode ?? testCase.window_size_mode ?? testCase.viewport_mode,
-        viewportWidth: opts.viewportWidth ?? testCase.viewport_width,
-        viewportHeight: opts.viewportHeight ?? testCase.viewport_height,
-        sourceWindowId: opts.sourceWindowId,
-      });
-      const pageErrorCheckEnabled = Number(opts.pageErrorCheckEnabled ?? testCase.page_error_check_enabled ?? 0) !== 0;
-      const screenshotMode = String(testCase.screenshot_mode || '').trim().toLowerCase() === 'full_hd'
+      const windowPreference = browserBootstrap.initializeBrowser
+        ? await resolveWindowPreference({
+            viewportMode: runtimeConfig.windowSizeMode,
+            viewportWidth: runtimeConfig.viewportWidth,
+            viewportHeight: runtimeConfig.viewportHeight,
+            sourceWindowId: opts.sourceWindowId,
+          })
+        : { mode: 'none', width: null, height: null };
+      const pageErrorCheckEnabled = runtimeConfig.pageErrorCheckEnabled;
+      const screenshotMode = runtimeConfig.screenshotMode === 'full_hd'
         ? 'full_hd'
         : 'standard';
-      Object.assign(executionSnapshot, {
-        project_environment_id: testCase.project_environment_id ?? opts.projectEnvironmentId ?? '',
-        project_environment_name: testCase.project_environment_name || '',
-        environment_origin: testCase.environment_origin || '',
-        effective_start_url: testCase.start_url || '',
-        window_size_mode: windowPreference.mode,
-        viewport_width: windowPreference.width ?? null,
-        viewport_height: windowPreference.height ?? null,
-        page_error_check_enabled: pageErrorCheckEnabled ? 1 : 0,
-      });
+      if (runtimeConfig.frozen) {
+        // 原样上报服务端冻结配置及 sources，不能用运行时归一化结果覆盖审计事实。
+        executionSnapshot = { ...runtimeConfig.executionConfig };
+      } else {
+        Object.assign(executionSnapshot, {
+          project_environment_id: resolvedProjectEnvironmentId,
+          project_environment_name: testCase.project_environment_name || '',
+          environment_origin: testCase.environment_origin || '',
+          effective_start_url: runtimeConfig.startUrl,
+          window_size_mode: windowPreference.mode,
+          viewport_width: windowPreference.width ?? null,
+          viewport_height: windowPreference.height ?? null,
+          page_error_check_enabled: pageErrorCheckEnabled ? 1 : 0,
+        });
+      }
       broadcastProgress('log', {
         log: {
           level: 'info',
           phase: 'config',
-          message: `窗口模式=${windowPreference.mode}，页面错误检测=${pageErrorCheckEnabled}`,
+          message: browserBootstrap.initializeBrowser
+            ? `浏览器启动模式=${browserBootstrap.mode}，窗口模式=${windowPreference.mode}，页面错误检测=${pageErrorCheckEnabled}`
+            : '浏览器启动模式=none，纯基础设施用例不创建页面会话',
           detail: true,
         },
       });
@@ -577,7 +670,11 @@ export class PlayerManager {
         startStepIndex > 0
           ? String(steps[startStepIndex]?.url || steps[startStepIndex - 1]?.url || '').trim()
           : '';
-      const targetUrl = resolvePlaybackStartUrl(startUrl || stepStartUrl, testCase);
+      const targetUrl = browserBootstrap.initializeBrowser
+        ? resolvePlaybackStartUrl(runtimeConfig.frozen
+            ? runtimeConfig.startUrl
+            : runtimeConfig.startUrl || stepStartUrl, runtimeConfig.frozen ? null : testCase)
+        : '';
 
       if (this.state.mode === 'recording') {
         playbackOutcome = { ok: false, error: trByLocale(runLocale, '正在录制，无法回放', 'Recording in progress, playback is unavailable') };
@@ -596,10 +693,12 @@ export class PlayerManager {
         reusedTab: false,
         locale: runLocale,
         pageErrorCheckEnabled,
+        caseDeadline,
         startStepIndex,
         activeTabId: null,
         managedWindowId: null,
         managedTabIds: new Set(),
+        executionCapability: String(opts.executionCapability || ''),
         // 初始复用页属于用户已有页面：本次只能管理其派生页，收尾时绝不能关闭它。
         initialManagedTabId: null,
         // 只保存任务 ID，用于用户停止回放时向 admin 请求取消；扩展不持有命令、SQL 或凭据。
@@ -609,95 +708,106 @@ export class PlayerManager {
       this.state.activePlayCount = (this.state.activePlayCount || 0) + 1;
       this.state.testCaseId = testCaseId;
 
-      const reuseTabId = opts.reuseTabId ?? null;
-
-      broadcastProgress('browser-started', {
-        log: { level: 'info', phase: 'browser', message: '正在初始化 CDP 浏览器' },
-      });
-      if (reuseTabId != null) {
-        playTabId = reuseTabId;
-        ctx.tabId = playTabId;
-        ctx.reusedTab = true;
-        const reuseTab = await chrome.tabs.get(playTabId).catch(() => null);
-        if (!reuseTab) {
-          throw new Error(`复用回放标签页不存在：${playTabId}`);
+      let cdpAvailable = false;
+      if (browserBootstrap.initializeBrowser) {
+        const reuseTabId = runtimeConfig.frozen
+          ? (browserBootstrap.mode === 'attach' ? opts.reuseTabId ?? null : null)
+          : opts.reuseTabId ?? null;
+        if (browserBootstrap.mode === 'attach' && reuseTabId == null) {
+          throw new Error('browser_bootstrap_mode=attach 缺少经过授权的受控标签页');
         }
-        ctx.managedWindowId = reuseTab.windowId ?? null;
-        ctx.managedTabIds.add(playTabId);
-        ctx.initialManagedTabId = playTabId;
-        ctx.activeTabId = playTabId;
-        if (reuseTab?.windowId != null) await applyWindowPreference(reuseTab.windowId, windowPreference);
-        await chrome.tabs.update(playTabId, { url: targetUrl, active: true });
-      } else {
-        const active = opts.backgroundTab !== true;
-        const win = await chrome.windows.create(buildWindowCreateData(targetUrl, active, windowPreference));
-        const tab = win.tabs[0];
-        playTabId = tab.id;
-        ctx.tabId = playTabId;
-        ctx.managedWindowId = win.id ?? tab.windowId ?? null;
-        ctx.managedTabIds.add(playTabId);
-        ctx.initialManagedTabId = playTabId;
-        ctx.activeTabId = playTabId;
-      }
-      const viewportLabel = windowPreference.width && windowPreference.height
-        ? `${windowPreference.width}x${windowPreference.height}`
-        : windowPreference.mode;
-      broadcastProgress('browser-ready', {
-        log: { level: 'success', phase: 'browser', message: `浏览器初始化成功，viewport=${viewportLabel}` },
-      });
-      this._playTabByCaseId.set(testCaseId, playTabId);
-      this._pageErrorCheckEnabledByTab = this._pageErrorCheckEnabledByTab || new Map();
-      this._pageErrorCheckEnabledByTab.set(playTabId, pageErrorCheckEnabled);
-      ctx.liveBroadcast = true;
-      this._broadcastPlayback({ type: 'AT_PLAYBACK_LIVE', testCaseId, tabId: playTabId });
-      broadcastProgress('live-ready', {
-        log: { level: 'success', phase: 'live', message: '实时画面已启用，来源=CDP' },
-      });
-      broadcastProgress('navigation-started', {
-        log: { level: 'info', phase: 'navigation', message: '正在打开用例起始页面' },
-      });
-      await this._bringTabToForeground(playTabId);
-      await this._waitForTabLoad(playTabId);
-      broadcastProgress('navigation-finished', {
-        log: { level: 'success', phase: 'navigation', message: '起始页面加载完成' },
-      });
 
-      const tabAfterLoad = await chrome.tabs.get(playTabId).catch(() => null);
-      const urlAfterLoad = tabAfterLoad?.url || '';
-      if (PlayerManager._isForeignExtensionPageUrl(urlAfterLoad)) {
-        throw new Error(
-          `起始页为其他扩展的页面，无法回放：${urlAfterLoad}\n请将用例「起始 URL」改为 http(s) 地址，勿指向其他扩展的 chrome-extension:// 页面。`,
-        );
-      }
-      if (
-        urlAfterLoad.startsWith('chrome://')
-        || urlAfterLoad.startsWith('devtools://')
-        || urlAfterLoad.startsWith('edge://')
-      ) {
-        throw new Error(
-          `起始页为浏览器内置协议，无法注入回放脚本：${urlAfterLoad}\n请改为 http(s) 页面。`,
-        );
-      }
-
-      let cdpAvailable = await this._attachDebugger(playTabId, ctx);
-      if (useAdminCase && !cdpAvailable) {
-        // admin 入口定义为扩展 CDP 回放，不能静默降级 DOM 后仍报告成功；旧本地 mock 路径继续保留降级能力。
-        throw new Error(`admin 扩展 CDP 无法附加到回放标签页：${ctx.cdpAttachError || '未知错误'}`);
-      }
-
-      try {
-        await chrome.scripting.executeScript({
-          target: { tabId: playTabId },
-          files: ['content/player.js'],
+        broadcastProgress('browser-started', {
+          log: { level: 'info', phase: 'browser', message: '正在初始化 CDP 浏览器' },
         });
-      } catch (injErr) {
-        const im = String(injErr && injErr.message ? injErr.message : injErr);
-        if (im.includes('chrome-extension') || im.includes('Cannot access')) {
+        if (reuseTabId != null) {
+          playTabId = reuseTabId;
+          ctx.tabId = playTabId;
+          ctx.reusedTab = true;
+          const reuseTab = await chrome.tabs.get(playTabId).catch(() => null);
+          if (!reuseTab) {
+            throw new Error(`复用回放标签页不存在：${playTabId}`);
+          }
+          ctx.managedWindowId = reuseTab.windowId ?? null;
+          ctx.managedTabIds.add(playTabId);
+          ctx.initialManagedTabId = playTabId;
+          ctx.activeTabId = playTabId;
+          if (reuseTab?.windowId != null) await applyWindowPreference(reuseTab.windowId, windowPreference);
+          await chrome.tabs.update(playTabId, { url: targetUrl, active: true });
+        } else {
+          const active = opts.backgroundTab !== true;
+          const win = await chrome.windows.create(buildWindowCreateData(targetUrl, active, windowPreference));
+          const tab = win.tabs[0];
+          playTabId = tab.id;
+          ctx.tabId = playTabId;
+          ctx.managedWindowId = win.id ?? tab.windowId ?? null;
+          ctx.managedTabIds.add(playTabId);
+          ctx.initialManagedTabId = playTabId;
+          ctx.activeTabId = playTabId;
+        }
+        const viewportLabel = windowPreference.width && windowPreference.height
+          ? `${windowPreference.width}x${windowPreference.height}`
+          : windowPreference.mode;
+        broadcastProgress('browser-ready', {
+          log: { level: 'success', phase: 'browser', message: `浏览器初始化成功，viewport=${viewportLabel}` },
+        });
+        this._playTabByCaseId.set(testCaseId, playTabId);
+        bindRuntimeConfigToTab(playTabId);
+        ctx.liveBroadcast = true;
+        this._broadcastPlayback({ type: 'AT_PLAYBACK_LIVE', testCaseId, tabId: playTabId });
+        broadcastProgress('live-ready', {
+          log: { level: 'success', phase: 'live', message: '实时画面已启用，来源=CDP' },
+        });
+        broadcastProgress('navigation-started', {
+          log: { level: 'info', phase: 'navigation', message: '正在打开用例起始页面' },
+        });
+        await this._bringTabToForeground(playTabId);
+        await this._waitForTabLoad(playTabId);
+        broadcastProgress('navigation-finished', {
+          log: { level: 'success', phase: 'navigation', message: '起始页面加载完成' },
+        });
+
+        const tabAfterLoad = await chrome.tabs.get(playTabId).catch(() => null);
+        const urlAfterLoad = tabAfterLoad?.url || '';
+        if (PlayerManager._isForeignExtensionPageUrl(urlAfterLoad)) {
           throw new Error(
-            `无法向当前页注入回放脚本（受限 URL 或第三方扩展页面）：${urlAfterLoad || targetUrl}\n${im}`,
+            `起始页为其他扩展的页面，无法回放：${urlAfterLoad}\n请将用例「起始 URL」改为 http(s) 地址，勿指向其他扩展的 chrome-extension:// 页面。`,
           );
         }
-        throw injErr;
+        if (
+          urlAfterLoad.startsWith('chrome://')
+          || urlAfterLoad.startsWith('devtools://')
+          || urlAfterLoad.startsWith('edge://')
+        ) {
+          throw new Error(
+            `起始页为浏览器内置协议，无法注入回放脚本：${urlAfterLoad}\n请改为 http(s) 页面。`,
+          );
+        }
+
+        cdpAvailable = await this._attachDebugger(playTabId, ctx);
+        if (useAdminCase && !cdpAvailable) {
+          // admin 入口定义为扩展 CDP 回放，不能静默降级 DOM 后仍报告成功；旧本地 mock 路径继续保留降级能力。
+          throw new Error(`admin 扩展 CDP 无法附加到回放标签页：${ctx.cdpAttachError || '未知错误'}`);
+        }
+
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: playTabId },
+            files: ['content/player.js'],
+          });
+        } catch (injErr) {
+          const im = String(injErr && injErr.message ? injErr.message : injErr);
+          if (im.includes('chrome-extension') || im.includes('Cannot access')) {
+            throw new Error(
+              `无法向当前页注入回放脚本（受限 URL 或第三方扩展页面）：${urlAfterLoad || targetUrl}\n${im}`,
+            );
+          }
+          throw injErr;
+        }
+      } else {
+        broadcastProgress('browser-skipped', {
+          log: { level: 'info', phase: 'browser', message: '纯基础设施用例已跳过浏览器初始化' },
+        });
       }
 
       this._notifyPopup(
@@ -716,8 +826,12 @@ export class PlayerManager {
       const playbackScreenshots = new Array(steps.length).fill('');
       const aiSubtasksByStep = {};
       const stepResults = [];
-      const appendStepResult = (step, index, status, startedAt, error = '', locator = null, executorResult = null) => {
-        const result = {
+      const appendStepResult = (step, index, status, startedAt, error = '', locator = null, executorResult = null, stepDetails = {}) => {
+        const details = {
+          ...(executorResult?.infrastructure ? { infrastructure: executorResult.infrastructure } : {}),
+          ...(stepDetails && typeof stepDetails === 'object' ? stepDetails : {}),
+        };
+        let result = {
           step_id: step?.id ?? '',
           step_index: index,
           action_type: String(step?.action_type || '').trim().toLowerCase(),
@@ -739,7 +853,9 @@ export class PlayerManager {
             affected_rows: executorResult.affectedRows ?? null,
           } : {}),
           ...(error ? { error } : {}),
+          ...(Object.keys(details).length ? { details } : {}),
         };
+        result = attachOperationDiagnostic(result, step, step, { executor: 'extension-cdp' });
         stepResults.push(result);
         broadcastProgress('step-finished', {
           stepIndex: index,
@@ -796,6 +912,7 @@ export class PlayerManager {
         }
 
         const step = steps[i];
+        const runtimeVariableReferences = variableContext.describeReferencesForStep(step);
         const runtimeStep = variableContext.resolveStep(PlayerManager._resolveDynamicStepValue(step));
         const runtimeNextStep = steps[i + 1]
           ? variableContext.resolveStep(PlayerManager._resolveDynamicStepValue(steps[i + 1]))
@@ -828,6 +945,7 @@ export class PlayerManager {
         });
 
         try {
+          throwIfCaseTimedOut();
           let actualLocator = null;
           const waitBefore = Math.max(0, Number(runtimeStep.wait_before) || 0);
           if (waitBefore) await this._sleep(waitBefore);
@@ -837,7 +955,7 @@ export class PlayerManager {
             const infrastructureResult = await this._executeInfrastructureStep(sourceCaseKey, executableStep, {
               ctx,
               executionId: opts.executionId || runId,
-              projectEnvironmentId: executionSnapshot.project_environment_id,
+              projectEnvironmentId: resolvedProjectEnvironmentId,
               runtimeBindings: variableContext.bindingsForStep(step),
               onProgress: (phase, payload) => broadcastProgress(phase, payload),
             });
@@ -847,25 +965,53 @@ export class PlayerManager {
               variableContext,
             );
             if (variable) variableResultsByStep[String(i)] = variable;
-            appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', null, infrastructureResult);
+            throwIfCaseTimedOut();
+            appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', null, infrastructureResult, {
+              ...(variable ? { variable } : {}),
+              ...(runtimeVariableReferences.length ? { variable_references: runtimeVariableReferences } : {}),
+            });
             continue;
           }
 
           const actionType = String(executableStep.action_type || '').trim().toLowerCase();
+          if (actionType === 'wait') {
+            const configuredWait = executableStep.duration_ms ?? executableStep.value;
+            const waitDurationMs = configuredWait == null || configuredWait === ''
+              ? 1000
+              : Math.max(0, Number(configuredWait) || 0);
+            await this._waitWithCountdown(waitDurationMs, (remainingSeconds) => {
+              broadcastProgress('log', {
+                log: {
+                  level: 'info',
+                  phase: 'step',
+                  message: `步骤 ${i + 1}: ${runtimeStep.description || runtimeStep.action_type || '等待'}，正在执行：倒计时<${remainingSeconds}s>`,
+                },
+              });
+            });
+            appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', null, null, {
+              wait_duration_ms: waitDurationMs,
+              ...(runtimeVariableReferences.length ? { variable_references: runtimeVariableReferences } : {}),
+            });
+            continue;
+          }
           if (actionType === 'captcha_ocr') {
             if (!cdpAvailable) throw new Error('验证码 OCR 需要 Chrome CDP 截图能力');
             const imageBase64 = await this._captureCaptchaTargetBase64(playTabId, executableStep);
             const infrastructureResult = await this._executeInfrastructureStep(sourceCaseKey, executableStep, {
               ctx,
               executionId: opts.executionId || runId,
-              projectEnvironmentId: executionSnapshot.project_environment_id,
+              projectEnvironmentId: resolvedProjectEnvironmentId,
               runtimeBindings: variableContext.bindingsForStep(step),
               runtimeInput: { captcha_image_base64: imageBase64 },
               onProgress: (phase, payload) => broadcastProgress(phase, payload),
             });
             const variable = this._applyInfrastructureVariableResult(executableStep, infrastructureResult, variableContext);
             if (variable) variableResultsByStep[String(i)] = variable;
-            appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', null, infrastructureResult);
+            throwIfCaseTimedOut();
+            appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', null, infrastructureResult, {
+              ...(variable ? { variable } : {}),
+              ...(runtimeVariableReferences.length ? { variable_references: runtimeVariableReferences } : {}),
+            });
             continue;
           }
           if (isCuecastLocalVariableAction(actionType)) {
@@ -875,7 +1021,11 @@ export class PlayerManager {
               variableContext,
             );
             if (localResult?.variable) variableResultsByStep[String(i)] = localResult.variable;
-            appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', null);
+            throwIfCaseTimedOut();
+            appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', null, null, {
+              ...(localResult?.variable ? { variable: localResult.variable } : {}),
+              ...(runtimeVariableReferences.length ? { variable_references: runtimeVariableReferences } : {}),
+            });
             continue;
           }
           if (playTabId == null && actionType !== 'switch_page') {
@@ -912,6 +1062,7 @@ export class PlayerManager {
             if (Object.prototype.hasOwnProperty.call(managedTabAction, 'tabId')) {
               playTabId = managedTabAction.tabId;
               cdpAvailable = managedTabAction.cdpAvailable === true;
+              bindRuntimeConfigToTab(playTabId);
             }
           } else if (isAiNaturalStep(executableStep)) {
             if (!cdpAvailable) {
@@ -955,7 +1106,10 @@ export class PlayerManager {
           if (playTabId != null && ['click', 'navigate', 'ai_natural', 'reload', 'switch_page'].includes(actionType)) {
             await this._waitForTabLoad(playTabId);
           }
-          appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', actualLocator);
+          throwIfCaseTimedOut();
+          appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', actualLocator, null, {
+            ...(runtimeVariableReferences.length ? { variable_references: runtimeVariableReferences } : {}),
+          });
         } catch (err) {
           const rawErrMsg = err && err.message ? err.message : String(err);
           errorMsg = localizePlaybackError(ctx.locale, rawErrMsg);
@@ -978,7 +1132,9 @@ export class PlayerManager {
           } else {
             failureContext = { error_message: errorMsg, error_step_index: i, url: targetUrl, cdp_unavailable: true };
           }
-          appendStepResult(runtimeStep, i, 'failed', stepStartedAt, errorMsg);
+          appendStepResult(runtimeStep, i, 'failed', stepStartedAt, errorMsg, null, null, {
+            ...(runtimeVariableReferences.length ? { variable_references: runtimeVariableReferences } : {}),
+          });
           break;
         }
       }
@@ -1080,7 +1236,7 @@ export class PlayerManager {
             execution_config: executionSnapshot,
             execution_logs: progressLogs,
           },
-        });
+        }, opts.executionCapability);
       } else {
         await this.api.saveResult(testCaseId, {
           status: success ? 'success' : 'failed',
@@ -1144,7 +1300,7 @@ export class PlayerManager {
             execution_config: executionSnapshot,
             execution_logs: progressLogs,
           },
-        }).catch(() => {});
+        }, opts.executionCapability).catch(() => {});
       }
       if (msg && !rawMsg.includes('用户手动停止') && !msg.includes('Stopped by user')) {
         this._showNotification(
@@ -1197,7 +1353,9 @@ export class PlayerManager {
       ctx.stopped = true;
       const taskIds = Array.from(ctx.infrastructureTaskIds || []);
       // 取消由 admin 转发给实际执行节点；此处不保存也不重放任何基础设施步骤内容。
-      await Promise.all(taskIds.map(taskId => this.api.cancelInfrastructureTask(taskId).catch(() => {})));
+      await Promise.all(taskIds.map(taskId => this.api
+        .cancelInfrastructureTask(taskId, ctx.executionCapability)
+        .catch(() => {})));
     }
     return { ok: true };
   }
@@ -1345,6 +1503,8 @@ export class PlayerManager {
     this._frameStackByTab.delete(tabId);
     this._frameContextByTab.delete(tabId);
     this._implicitWaitMsByTab.delete(tabId);
+    this._stepTimeoutMsByTab.delete(tabId);
+    this._caseDeadlineByTab.delete(tabId);
     this._pointerPositionByTab.delete(tabId);
     this._dialogOpeningByTab.delete(tabId);
     this._pendingDialogPromptByTab.delete(tabId);
@@ -1515,6 +1675,7 @@ export class PlayerManager {
     }
     const actionType = String(step.action_type || '').trim().toLowerCase();
     const onProgress = typeof options?.onProgress === 'function' ? options.onProgress : () => {};
+    const executionCapability = String(options.ctx?.executionCapability || '');
     const createResponse = await this.api.createInfrastructureTask({
       caseKey,
       stepId,
@@ -1528,7 +1689,7 @@ export class PlayerManager {
       ...(options.runtimeInput && Object.keys(options.runtimeInput).length > 0
         ? { runtimeInput: options.runtimeInput }
         : {}),
-    });
+    }, executionCapability);
     let task = unwrapInfrastructureTask(createResponse);
     const taskId = String(task.taskId || task.id || '').trim();
     if (!taskId) {
@@ -1544,21 +1705,23 @@ export class PlayerManager {
     });
 
     const timeoutMs = Math.max(10000, Math.min(600000, Number(step.timeout_ms || step.timeoutMs) || 30000)) + 10000;
-    const deadline = Date.now() + timeoutMs;
+    const caseDeadline = Number(options.ctx?.caseDeadline) || Number.POSITIVE_INFINITY;
+    const deadline = Math.min(Date.now() + timeoutMs, caseDeadline);
     let afterSequence = 0;
     let lastProgressKey = '';
     try {
       while (!isInfrastructureTerminalStatus(task.status)) {
         if (options.ctx?.stopped) {
-          await this.api.cancelInfrastructureTask(taskId).catch(() => {});
+          await this.api.cancelInfrastructureTask(taskId, executionCapability).catch(() => {});
           throw new Error('用户手动停止');
         }
         if (Date.now() >= deadline) {
-          await this.api.cancelInfrastructureTask(taskId).catch(() => {});
-          throw new Error(`基础设施任务超时（${timeoutMs}ms）`);
+          await this.api.cancelInfrastructureTask(taskId, executionCapability).catch(() => {});
+          throw new Error(deadline === caseDeadline ? '用例执行超时' : `基础设施任务超时（${timeoutMs}ms）`);
         }
         await this._sleep(500);
-        task = unwrapInfrastructureTask(await this.api.getInfrastructureTask(taskId, afterSequence));
+        task = unwrapInfrastructureTask(await this.api
+          .getInfrastructureTask(taskId, afterSequence, executionCapability));
         const sequence = Number(task.nextSequence ?? afterSequence) || afterSequence;
         afterSequence = Math.max(afterSequence, sequence);
         const taskLogs = Array.isArray(task.logs) ? task.logs : [];
@@ -1605,6 +1768,10 @@ export class PlayerManager {
         taskId,
         exitCode: task.exitCode ?? task.exit_code,
         affectedRows: task.affectedRows ?? task.affected_rows,
+        // 受限结果预览进入 step.details；完整输出和大结果只能通过 Admin 受鉴权附件读取。
+        infrastructure: task.result?.infrastructure && typeof task.result.infrastructure === 'object'
+          ? task.result.infrastructure
+          : null,
         // Admin 只对白名单基础设施动作返回受限变量快照；扩展不会读取命令输出或凭据。
         variables: task.result?.variables && typeof task.result.variables === 'object'
           ? task.result.variables
@@ -1996,8 +2163,16 @@ export class PlayerManager {
   /** 当前 tab 设置过隐式等待时，它是后续定位动作的默认超时；否则沿用动作已有默认值。 */
   _getEffectiveWaitTimeout(tabId, fallbackMs) {
     const fallback = Math.max(0, Math.round(Number(fallbackMs) || 0));
-    if (!this._implicitWaitMsByTab.has(tabId)) return fallback;
-    return this._implicitWaitMsByTab.get(tabId);
+    const implicit = this._implicitWaitMsByTab.has(tabId)
+      ? this._implicitWaitMsByTab.get(tabId)
+      : fallback;
+    const stepTimeout = this._stepTimeoutMsByTab.has(tabId)
+      ? this._stepTimeoutMsByTab.get(tabId)
+      : implicit;
+    const caseRemaining = this._caseDeadlineByTab.has(tabId)
+      ? Math.max(0, this._caseDeadlineByTab.get(tabId) - Date.now())
+      : stepTimeout;
+    return Math.max(0, Math.min(implicit, stepTimeout, caseRemaining));
   }
 
   _setImplicitWaitTimeout(tabId, step) {
@@ -6820,6 +6995,16 @@ export class PlayerManager {
   // =========================================================
   // 工具方法
   // =========================================================
+  async _waitWithCountdown(durationMs, onCountdown) {
+    let remainingMs = Math.max(0, Number(durationMs) || 0);
+    while (remainingMs > 0) {
+      onCountdown?.(Math.ceil(remainingMs / 1000));
+      const chunkMs = Math.min(1000, remainingMs);
+      await this._sleep(chunkMs);
+      remainingMs -= chunkMs;
+    }
+  }
+
   _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
   _waitForTabLoad(tabId) {

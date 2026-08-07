@@ -1,3 +1,1044 @@
+# 2026-08-06 CueCast 执行详情统一来源对象与目录字段
+
+## 涉及文件
+
+- modules/operation-diagnostics.js
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+统一 CueCast 与 Playwright、Selenium 的 `details.operation` 参数来源结构，支持 Admin 下发的目录诊断字段元数据，避免同一个 `method_code` 在不同执行器中使用不同的来源格式和参数角色。
+
+## 变更内容
+
+1. `source` 统一输出 `{code,label}`，变量引用保留变量名提示，旧输入仍可由 Admin 兼容处理。
+2. 优先读取 `diagnostic_fields` 生成字段标签、角色和受限展示，未下发时保留旧字段列表兼容。
+3. 执行结果补充状态和事实中文标签，脚本、SQL、命令等受限内容继续不输出原值。
+4. 兼容目录字段未下发时的回退字段列表，补齐 IP 范围和运行属性参数。
+5. 增加 113 个 `form_schema` 字段的逐字段执行详情契约测试。
+
+## 验证
+
+- `node --check modules/operation-diagnostics.js`：通过。
+- `node --experimental-default-type=module --test tests/*.test.js`：12/12 通过。
+
+## 具体代码改动
+
+### `modules/operation-diagnostics.js`
+
+```diff
+@@
+ const URL_KEY = /(^|_)url$/i;
++const SOURCE_LABELS = Object.freeze({
++  variable_reference: '引用变量',
++  literal: '固定值',
++  runtime: '运行时',
++  definition_snapshot: '定义快照',
++  executor: '执行器返回',
++});
+@@
+     outcome: {
+       kind: profile,
++      status: result.status || 'unknown',
+@@
+-  return INPUT_KEYS.map((key) => {
++  const fields = Array.isArray(definitionStep.diagnostic_fields)
++    ? definitionStep.diagnostic_fields.filter((field) => field && typeof field === 'object' && field.name)
++    : [];
++  const descriptors = fields.length
++    ? fields.map((field) => ({ key: String(field.name), field }))
++    : INPUT_KEYS.map((key) => ({ key, field: null }));
++  return descriptors.map(({ key, field }) => {
+@@
+-      role: inputRole(key),
++      ...(field?.label ? { label: String(field.label) } : {}),
++      role: inputRole(key, field),
+@@
+-    if (JSON.stringify(configured) !== JSON.stringify(effective)) return 'runtime';
++    if (JSON.stringify(configured) !== JSON.stringify(effective)) return sourceObject('runtime');
+@@
++function sourceObject(code, label = null) {
++  return { code, label: label || SOURCE_LABELS[code] || code };
++}
++  'keep_trailing_zeros', 'ip_prefix', 'start', 'end', 'profile',
++]);
+```
+
+### `tests/operation-contract.test.js`
+
+```diff
+@@
+-  assert.equal(command.source, 'definition_snapshot');
++  assert.deepEqual(command.source, { code: 'definition_snapshot', label: '定义快照' });
+@@
+-  assert.equal(result.details.operation.inputs.find((item) => item.key === 'format').source, 'literal');
++  assert.deepEqual(result.details.operation.inputs.find((item) => item.key === 'format').source, {
++    code: 'literal',
++    label: '固定值',
++  });
+```
+
+```diff
+@@
+ test('全部 62 个目录方法在 CueCast 中保持方法身份和 profile 契约', () => {
+@@
+ });
++
++test('所有目录 form_schema 字段都进入 CueCast 执行详情', () => {
++  let fieldCount = 0;
++  for (const type of catalog.types) {
++    for (const method of type.methods) {
++      const values = Object.fromEntries(method.form_schema.map((field) => [field.name, 'configured']));
++      const result = attachOperationDiagnostic(
++        { action_type: method.action_type, status: 'passed' },
++        { ...values, method_code: method.method_code, diagnostic_fields: method.form_schema },
++        { ...values, action_type: method.action_type },
++      );
++      assert.deepEqual(result.details.operation.inputs.map((input) => input.key), method.form_schema.map((field) => field.name));
++      fieldCount += method.form_schema.length;
++    }
++  }
++  assert.equal(fieldCount, 113);
++});
+```
+
+# 2026-08-06 CueCast 统一执行参数来源
+
+## 涉及文件
+
+- modules/operation-diagnostics.js
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. 为所有 CueCast `details.operation.inputs` 增加统一 `source` 来源字段。
+2. 变量引用、运行时解析、普通字面量和 SQL/命令/脚本定义快照分别使用稳定来源代码。
+3. 增加变量参数和受限基础设施参数的来源契约断言。
+
+## 验证
+
+- `node --check modules/operation-diagnostics.js`：通过。
+- `node --experimental-default-type=module --test tests/*.test.js`：11/11 通过。
+
+## 具体代码改动
+
+### `modules/operation-diagnostics.js`
+
+```diff
+@@
+     const configured = readValue(definitionStep, key);
+     const effective = readValue(runtimeStep, key);
+     if (configured === undefined && effective === undefined) return null;
++    const source = inputSource(key, configured, effective);
+@@
++      ...(source ? { source } : {}),
+@@
++function inputSource(key, configured, effective) {
++  if (typeof configured === 'string' && /\$\{[^{}]+}/.test(configured)) return 'variable_reference';
++  if (configured !== undefined && effective !== undefined) {
++    if (JSON.stringify(configured) !== JSON.stringify(effective)) return 'runtime';
++    return RESTRICTED_KEY.test(key) ? 'definition_snapshot' : 'literal';
++  }
++  if (configured !== undefined) return RESTRICTED_KEY.test(key) ? 'definition_snapshot' : 'literal';
++  if (effective !== undefined) return 'runtime';
++  return '';
++}
+```
+
+### `tests/operation-contract.test.js`
+
+```diff
+@@
+   const command = result.details.operation.inputs.find((item) => item.key === 'command');
+   assert.equal(command.effective.value_state, 'restricted');
++  assert.equal(command.source, 'definition_snapshot');
+@@
+   assert.deepEqual(
+     result.details.operation.inputs.map((item) => item.key),
+     ['variable_name', 'format', 'date_mode', 'datetime', 'offset_seconds', 'timestamp_unit'],
+   );
++  assert.equal(result.details.operation.inputs.find((item) => item.key === 'format').source, 'literal');
+```
+
+# 2026-08-06 CueCast 补齐变量步骤详情与等待倒计时日志
+
+## 涉及文件
+
+- modules/variable-context.js
+- modules/player-manager.js
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. 将全局变量执行结果和当前步骤引用变量的脱敏预览写入步骤级 `details`，Admin 执行详情可以直接展示变量名、实际值预览和来源。
+2. 固定等待由回放管理器按秒广播倒计时日志，并将等待时长保留为结果事实；不再依赖内容脚本内部等待才能产生历史日志。
+3. 增加变量引用详情契约测试，确认敏感变量不输出原值。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --check modules/variable-context.js`：通过。
+- `node --experimental-default-type=module --test tests/*.test.js`：10/10 通过。
+
+## 具体代码改动
+
+### `modules/variable-context.js`
+
+```diff
+@@
+   describe(name) {
+@@
+   }
++
++  describeReferencesForStep(step) {
++    return this.referencesInStep(step).map((reference) => {
++      const { root } = this._parseReference(reference);
++      const meta = this._metadata.get(root) || {};
++      const description = this.describe(reference);
++      return {
++        reference,
++        variable_name: root,
++        value_masked: meta.masked ? 1 : 0,
++        ...(meta.masked ? {} : { value_preview: description.value_preview }),
++        source: meta.source || '',
++      };
++    });
++  }
+```
+
+### `modules/player-manager.js`
+
+```diff
+@@
+-      const appendStepResult = (step, index, status, startedAt, error = '', locator = null, executorResult = null) => {
++      const appendStepResult = (step, index, status, startedAt, error = '', locator = null, executorResult = null, stepDetails = {}) => {
+@@
++          ...(Object.keys(details).length ? { details } : {}),
+@@
++          if (actionType === 'wait') {
++            const configuredWait = executableStep.duration_ms ?? executableStep.value;
++            const waitDurationMs = configuredWait == null || configuredWait === ''
++              ? 1000
++              : Math.max(0, Number(configuredWait) || 0);
++            await this._waitWithCountdown(waitDurationMs, (remainingSeconds) => {
++              broadcastProgress('log', {
++                log: { level: 'info', phase: 'step', message: `步骤 ${i + 1}: ${runtimeStep.description || runtimeStep.action_type || '等待'}，正在执行：倒计时<${remainingSeconds}s>` },
++              });
++            });
++          }
+```
+
+### `tests/operation-contract.test.js`
+
+```diff
+@@
+ import { attachOperationDiagnostic } from '../modules/operation-diagnostics.js';
++import { CuecastVariableContext } from '../modules/variable-context.js';
+@@
++test('CueCast 变量引用详情只输出脱敏预览并保留来源', () => {
++  const context = new CuecastVariableContext({ order: 'ORD-001' });
++  context.set('token', 'secret-token', { source: 'step', masked: true });
++  assert.deepEqual(context.describeReferencesForStep({ action_type: 'input', value: '${order}-${token}' }), [
++    { reference: 'order', variable_name: 'order', value_masked: 0, value_preview: 'ORD-001', source: 'initial' },
++    { reference: 'token', variable_name: 'token', value_masked: 1, source: 'step' },
++  ]);
++});
+```
+
+# 2026-08-06 CueCast 执行摘要补充操作类型标签
+
+## 涉及文件
+
+- modules/operation-diagnostics.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. 统一执行摘要从 Admin 步骤快照透传 `type_label`，使 UI 能同时展示操作类型和操作方法。
+2. 未提供类型标签的历史步骤继续只展示 `type_code` 或旧 action，不改变原有回放行为。
+
+## 验证
+
+- `node --check modules/operation-diagnostics.js`：通过。
+- `node --experimental-default-type=module --test tests/*.test.js`：通过。
+
+## 具体代码改动
+
+### `modules/operation-diagnostics.js`
+
+```diff
+@@
+       ...(firstText(definitionStep.type_code, definitionStep.typeCode)
+         ? { type_code: firstText(definitionStep.type_code, definitionStep.typeCode) } : {}),
++      ...(firstText(definitionStep.type_label, definitionStep.typeLabel)
++        ? { type_label: firstText(definitionStep.type_label, definitionStep.typeLabel) } : {}),
+       ...(firstText(definitionStep.method_code, definitionStep.methodCode)
+```
+
+# 2026-08-06 CueCast 全操作统一执行摘要适配
+
+## 涉及文件
+
+- modules/operation-diagnostics.js
+- modules/player-manager.js
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. 新增 CueCast/CDP 的统一 `details.operation` builder，按 8 类 profile 生成方法身份、输入摘要、目标摘要和有限结果事实。
+2. 回放结果保留既有 `details.infrastructure` 等 typed facet，同时对 SQL、命令、脚本、路径、URL 敏感参数执行受限展示和脱敏。
+3. 回放步骤统一附加 `executor=extension-cdp` 的执行摘要，旧 test-lab 与非 Admin 保存链路仍保留原结果字段。
+4. 增加命令脱敏和 typed facet 保留契约测试。
+5. 契约测试直接读取 Admin 目录的 62 个方法和 8 个 profile，逐方法校验 CueCast 的 method identity、profile 与 outcome kind。
+
+## 验证
+
+- `node --check modules/operation-diagnostics.js`：通过。
+- `node --check modules/player-manager.js`：通过。
+- `node --experimental-default-type=module --test tests/operation-contract.test.js`：3/3 通过。
+
+## 具体代码改动
+
+### `modules/operation-diagnostics.js`
+
+```diff
+--- /dev/null
++++ b/modules/operation-diagnostics.js
+@@
++const ACTION_PROFILES = Object.freeze({
++  navigate: 'navigation',
++  switch_page: 'navigation',
++  close_page: 'navigation',
++  close_all_pages: 'navigation',
++  reload: 'navigation',
++});
++
++export function attachOperationDiagnostic(result, definitionStep = {}, runtimeStep = definitionStep, options = {}) {
++  if (!result || typeof result !== 'object') return result;
++  const details = result.details && typeof result.details === 'object' ? result.details : {};
++  const { operation_assertion: _operationAssertion, ...cleanResult } = result;
++  return {
++    ...cleanResult,
++    details: {
++      ...details,
++      operation: buildOperationDiagnostic(definitionStep, runtimeStep, result, options),
++    },
++  };
++}
+```
+
+### `modules/player-manager.js`
+
+```diff
+@@
+ import {
+   CuecastVariableContext,
+@@
+ } from './variable-context.js';
++import { attachOperationDiagnostic } from './operation-diagnostics.js';
+@@
+-        const result = {
++        let result = {
+@@
+           ...(error ? { error } : {}),
+         };
++        result = attachOperationDiagnostic(result, step, step, { executor: 'extension-cdp' });
+         stepResults.push(result);
+```
+
+### `tests/operation-contract.test.js`
+
+```diff
+@@
+ import {
+@@
+ } from '../modules/canonical-action-registry.js';
++import { attachOperationDiagnostic } from '../modules/operation-diagnostics.js';
+@@
+ test('CueCast registry covers every canonical action in the 62-method fixture', () => {
+@@
+ });
++
++test('CueCast execution result adds the shared operation detail without exposing restricted input', () => {
++  const result = attachOperationDiagnostic(
++    {
++      action_type: 'server_command',
++      status: 'passed',
++      details: { infrastructure: { kind: 'SERVER_COMMAND', exitCode: 0 } },
++      exit_code: 0,
++    },
++    {
++      action_type: 'server_command',
++      method_code: 'server.shell',
++      command: 'curl -H "Authorization: Bearer secret-token" /health',
++    },
++  );
++  assert.equal(result.details.infrastructure.kind, 'SERVER_COMMAND');
++  assert.equal(result.details.operation.profile, 'infrastructure');
++  const command = result.details.operation.inputs.find((item) => item.key === 'command');
++  assert.equal(command.effective.value_state, 'restricted');
++  assert.equal(JSON.stringify(result).includes('secret-token'), false);
++});
+```
+
+### `tests/operation-contract.test.js`（62 方法合同补充）
+
+```diff
+@@
+ const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
++const catalog = JSON.parse(fs.readFileSync(new URL(
++  '../../sakura-admin/continew-automation/src/main/resources/automation/automation-operation-catalog.json',
++  import.meta.url,
++), 'utf8'));
++const profileByMethod = Object.fromEntries(Object.entries(catalog.diagnostic_profiles)
++  .flatMap(([profile, methods]) => methods.map((methodCode) => [methodCode, profile])));
+@@
++test('全部 62 个目录方法在 CueCast 中保持方法身份和 profile 契约', () => {
++  assert.equal(fixture.methods.length, 62);
++  for (const method of fixture.methods) {
++    const result = attachOperationDiagnostic(
++      { action_type: method.action_type, status: 'passed' },
++      {
++        catalog_version: fixture.catalog_version,
++        method_code: method.method_code,
++        action_type: method.action_type,
++      },
++    );
++    const operation = result.details.operation;
++    assert.equal(operation.catalog_version, fixture.catalog_version);
++    assert.equal(operation.method.method_code, method.method_code);
++    assert.equal(operation.profile, profileByMethod[method.method_code]);
++    assert.equal(operation.outcome.kind, profileByMethod[method.method_code]);
++  }
++});
+```
+
+# 2026-08-04 CueCast 批次冻结配置单一事实源
+
+## 涉及文件
+
+- modules/api-client.js
+- modules/player-manager.js
+- tests/effective-execution-config.test.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. Admin 批次回放强制读取绑定 revision 返回的 `EffectiveExecutionConfig`，缺失时明确拒绝，不再使用消息中的 URL、窗口或页面检测参数重算配置。
+2. `browser_bootstrap_mode=none` 的纯基础设施用例完全跳过窗口、标签页、脚本注入和 debugger；混合用例继续按原步骤顺序执行浏览器与委派步骤。
+3. 基础设施任务创建、轮询和取消统一携带短时 `X-Execution-Capability`，capability 不进入任务请求体或日志。
+4. 服务端冻结的 step/case timeout 进入 CDP 定位等待和基础设施任务轮询上限，并在受控标签页切换后继续生效。
+5. 执行结果原样回传冻结配置及 `sources`，保留 popup/test-lab 无批次回放的旧兼容行为。
+6. 新增六项冻结配置契约测试，覆盖服务端配置优先、缺失拒绝、旧链路兼容、纯基础设施和 capability 传递。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --experimental-default-type=module --test tests/effective-execution-config.test.js tests/operation-contract.test.js`：7/7 通过。
+- `sakura-admin-ui pnpm typecheck`：通过。
+- `sakura-admin-ui pnpm build`：通过。
+- Admin 全量回归：147/147 通过（automation 141 + project 6）；TestPlan 16/16 通过。
+
+## 具体代码改动
+
+### `modules/api-client.js`
+
+```diff
+-  createInfrastructureTask(payload) {
+-    return this.request('POST', '/automation/infrastructure/tasks', payload, { timeoutMs: 30000 });
++  createInfrastructureTask(payload, executionCapability = '') {
++    return this.request('POST', '/automation/infrastructure/tasks', payload, {
++      timeoutMs: 30000,
++      executionCapability,
++    });
+   }
+-  getInfrastructureTask(taskId, afterSequence = 0) {
++  getInfrastructureTask(taskId, afterSequence = 0, executionCapability = '') {
+     const query = afterSequence > 0 ? `?afterSequence=${encodeURIComponent(afterSequence)}` : '';
+-    return this.request('GET', `/automation/infrastructure/tasks/${encodeURIComponent(taskId)}${query}`, null, { timeoutMs: 30000 });
++    return this.request('GET', `/automation/infrastructure/tasks/${encodeURIComponent(taskId)}${query}`, null, {
++      timeoutMs: 30000,
++      executionCapability,
++    });
+   }
+```
+
+### `modules/player-manager.js`
+
+```diff
+-      const windowPreference = await resolveWindowPreference({
+-        viewportMode: opts.viewportMode ?? testCase.window_size_mode ?? testCase.viewport_mode,
+-        viewportWidth: opts.viewportWidth ?? testCase.viewport_width,
+-        viewportHeight: opts.viewportHeight ?? testCase.viewport_height,
+-        sourceWindowId: opts.sourceWindowId,
+-      });
+-      const pageErrorCheckEnabled = Number(opts.pageErrorCheckEnabled ?? testCase.page_error_check_enabled ?? 0) !== 0;
++      const windowPreference = browserBootstrap.initializeBrowser
++        ? await resolveWindowPreference({
++            viewportMode: runtimeConfig.windowSizeMode,
++            viewportWidth: runtimeConfig.viewportWidth,
++            viewportHeight: runtimeConfig.viewportHeight,
++            sourceWindowId: opts.sourceWindowId,
++          })
++        : { mode: 'none', width: null, height: null };
++      const pageErrorCheckEnabled = runtimeConfig.pageErrorCheckEnabled;
+```
+
+```diff
+-    if (!this._implicitWaitMsByTab.has(tabId)) return fallback;
+-    return this._implicitWaitMsByTab.get(tabId);
++    const implicit = this._implicitWaitMsByTab.has(tabId)
++      ? this._implicitWaitMsByTab.get(tabId)
++      : fallback;
++    const stepTimeout = this._stepTimeoutMsByTab.has(tabId)
++      ? this._stepTimeoutMsByTab.get(tabId)
++      : implicit;
++    const caseRemaining = this._caseDeadlineByTab.has(tabId)
++      ? Math.max(0, this._caseDeadlineByTab.get(tabId) - Date.now())
++      : stepTimeout;
++    return Math.max(0, Math.min(implicit, stepTimeout, caseRemaining));
+```
+
+### `tests/effective-execution-config.test.js`
+
+```diff
++test('Admin batch rejects a case response without frozen config', () => {
++  assert.throws(
++    () => resolvePlaybackRuntimeConfig({ start_url: 'https://current.example' }, {
++      batchId: 'BATCH_002',
++      startUrl: 'https://client.example',
++    }, true),
++    /未返回 EffectiveExecutionConfig/,
++  );
++});
++
++test('popup and test-lab playback retain legacy option compatibility', () => {
++  const resolved = resolvePlaybackRuntimeConfig({
++    start_url: 'https://case.example',
++    window_size_mode: 'maximized',
++  }, {
++    startUrl: 'https://popup.example',
++    viewportMode: 'current',
++    pageErrorCheckEnabled: true,
++  }, false);
++
++  assert.equal(resolved.frozen, false);
++  assert.equal(resolved.startUrl, 'https://popup.example');
++  assert.equal(resolved.windowSizeMode, 'current');
++  assert.equal(resolved.pageErrorCheckEnabled, true);
++});
+```
+
+# 2026-08-04 统一 62 条操作目录 CueCast 契约测试
+
+## 涉及文件
+
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. 新增直接读取 Admin 统一 62 条操作目录 fixture 的 CueCast 契约测试。
+2. 校验目录版本、方法总数、每个 canonical action 的注册和非空执行路由，避免仅凭目录登记宣称扩展支持。
+
+## 验证
+
+执行 `node --experimental-default-type=module --test tests/operation-contract.test.js`，退出码为 0。
+
+## 具体代码改动
+
+### `tests/operation-contract.test.js`
+
+```diff
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import test from 'node:test';
++
++import {
++  CUECAST_ACTION_TYPES,
++  OPERATION_CATALOG_VERSION,
++  getCuecastActionRoute,
++} from '../modules/canonical-action-registry.js';
++
++const fixturePath = new URL(
++  '../../sakura-admin/continew-automation/src/test/resources/automation/automation-operation-62-fixture.json',
++  import.meta.url,
++);
++const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
++
++test('CueCast registry covers every canonical action in the 62-method fixture', () => {
++  assert.equal(fixture.catalog_version, OPERATION_CATALOG_VERSION);
++  assert.equal(fixture.methods.length, 62);
++
++  const fixtureActions = [...new Set(fixture.methods.map((method) => method.action_type))];
++  const missing = fixtureActions.filter((actionType) => !CUECAST_ACTION_TYPES.has(actionType));
++  assert.deepEqual(missing, []);
++  for (const actionType of fixtureActions) {
++    assert.notEqual(getCuecastActionRoute(actionType), '', `CueCast action has no route: ${actionType}`);
++  }
++});
+```
+
+# 2026-08-04 CueCast CDP 批次 capability 透传
+
+## 涉及文件
+
+- background.js
+- modules/api-client.js
+- modules/player-manager.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. Admin-ui 发起 extension-cdp 批次回放时，将当前批次的短期 `executionCapability` 传入扩展。
+2. 扩展读取 Admin case 和回传结果时通过 `X-Execution-Capability` 请求头传递 capability，并在读取 URL 中携带 `batchId`。
+3. 非 Admin/test-lab 回放仍沿用原 API 协议，不改变旧链路。
+
+## 验证
+
+已完成扩展脚本静态检查、admin-ui typecheck、Playwright Runner 单元测试及 Admin 后端全 reactor 测试；真实 Admin/Chrome 批次回放仍待服务启动后手工验收。
+
+## 具体代码改动
+
+### `background.js`
+
+```diff
+       void player.start(message.testCaseId, message.startUrl, {
+         adminCaseKey: message.adminCaseKey || message.caseKey,
+         batchId: message.batchId,
++        executionCapability: message.executionCapability,
+         executionId: message.executionId,
+```
+
+### `modules/api-client.js`
+
+```diff
+     const token = this._getToken();
+     if (token) headers['Authorization'] = `Bearer ${token}`;
++    if (executionCapability) headers['X-Execution-Capability'] = executionCapability;
+```
+
+```diff
+-  getAdminPlaywrightCase(caseKey, projectEnvironmentId) {
++  getAdminPlaywrightCase(caseKey, projectEnvironmentId, batchId = '', executionCapability = '') {
+```
+
+### `modules/player-manager.js`
+
+```diff
+       const res = useAdminCase
+-        ? await this.api.getAdminPlaywrightCase(sourceCaseKey, opts.projectEnvironmentId)
++        ? await this.api.getAdminPlaywrightCase(sourceCaseKey, opts.projectEnvironmentId, opts.batchId, opts.executionCapability)
+         : await this.api.getTestCase(testCaseId);
+```
+
+```diff
+-        });
++        }, opts.executionCapability);
+```
+
+# 2026-08-03 CueCast 恢复失败草稿状态查询与重试入口
+
+## 涉及文件
+
+- background.js
+- modules/recorder-manager.js
+- content/bridge.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. 为失败草稿增加 `saveFailed` 标记和错误摘要，避免 Service Worker 重启后把失败草稿误恢复成正在录制。
+2. 新增脱敏的草稿状态查询消息，admin-ui 重新打开录制弹窗时仍能显示重试入口。
+3. 修复目标标签页关闭后导入失败会清理草稿的问题；连续失败仍保留步骤和导入上下文。
+
+## 验证
+
+已执行扩展脚本语法检查、admin-ui `pnpm typecheck`，以及失败停止、标签页关闭、状态查询、Service Worker 恢复和重试清理契约测试，全部通过。
+
+## 具体代码改动
+
+### `background.js`
+
+```diff
+   recordingImport: null,
+   recordingEndUrl: '',
++  recordingSaveFailed: false,
++  recordingSaveError: '',
+@@
++    case 'AT_PLATFORM_RECORDING_DRAFT_STATUS':
++      recorder.getSessionDraftSummary().then(sendResponse);
++      return true;
+```
+
+### `modules/recorder-manager.js`
+
+```diff
+       active: this.state.mode === 'recording',
++      saveFailed: this.state.recordingSaveFailed === true,
++      saveError: this.state.recordingSaveError || '',
+@@
++  async getSessionDraftSummary() {
++    const session = await this._readNewestSessionDraft();
++    if (!session || session.saveFailed !== true) {
++      return { ok: true, available: false };
++    }
++    const recordingImport = session.recordingImport || {};
++    return {
++      ok: true,
++      available: true,
++      testCaseId: session.testCaseId ?? null,
++      stepCount: Array.isArray(session.recordedSteps) ? session.recordedSteps.length : 0,
++      mode: recordingImport.mode || 'legacySaveSteps',
++      targetSceneDbId: recordingImport.targetSceneDbId ?? null,
++      targetCaseId: recordingImport.targetCaseId ?? null,
++      savedAt: session.savedAt ?? null,
++      error: session.saveError || '',
++    };
++  }
+@@
+-    if (!saved) await this._clearSessionDraft();
++    if (!saved && saveError && recorded.length > 0) {
++      await this._markSessionDraftSaveFailed(saveError);
++    } else if (!saved) {
++      await this._clearSessionDraft();
++    }
+```
+
+### `content/bridge.js`
+
+```diff
+       || data.type === 'AT_PLATFORM_RETRY_RECORDING'
++      || data.type === 'AT_PLATFORM_RECORDING_DRAFT_STATUS'
+       || data.type === 'AT_PLATFORM_PLAY'
+```
+
+# 2026-08-03 CueCast 增加录制导入失败草稿重试
+
+## 涉及文件
+
+- background.js
+- modules/recorder-manager.js
+- content/bridge.js
+- README.md
+- 使用说明.md
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. 录制停止或目标标签页关闭后导入失败时，保留包含步骤、导入模式、目标上下文和最终页面地址的 session draft。
+2. 新增扩展重试消息，后台从草稿恢复完整导入 payload；重试失败继续保留草稿，成功后清理草稿并通知 admin-ui。
+3. admin-ui 录制结果增加“重试上传草稿”入口，文档同步说明失败恢复流程。
+
+## 验证
+
+已执行：
+
+```powershell
+node --check background.js
+node --check modules/recorder-manager.js
+node --check content/bridge.js
+node --experimental-default-type=module --input-type=module <recording-draft-retry-contract>
+```
+
+结果：扩展脚本语法检查通过；重试契约测试确认失败保留草稿、成功清理草稿、步骤合并和最终地址未丢失。
+
+## 具体代码改动
+
+### `background.js`
+
+```diff
+   recordingImport: null,
++  recordingEndUrl: '',
+   recordingPaused: false,
+@@
++    case 'AT_PLATFORM_RETRY_RECORDING':
++      state.apiBase = message.apiBase || state.apiBase;
++      state.authToken = message.authToken || state.authToken;
++      recorder.retrySaveDraft().then(sendResponse);
++      return true;
+```
+
+### `modules/recorder-manager.js`
+
+```diff
+       recordingImport: this.state.recordingImport || null,
++      recordingEndUrl: this.state.recordingEndUrl || '',
+@@
++  async retrySaveDraft() {
++    const session = await this._readNewestSessionDraft();
++    if (!session) {
++      return { ok: false, saved: false, retryable: false, error: '没有可重试的录制草稿' };
++    }
++    const recorded = Array.isArray(session.recordedSteps) ? [...session.recordedSteps] : [];
++    const toSave = this._mergeRecordedWithSnapshot(
++      recorded,
++      Array.isArray(session.existingStepsSnapshot) ? session.existingStepsSnapshot : null,
++      session.insertAfterIndex,
++    );
++    const recordingImport = session.recordingImport || null;
++    const recordingEndUrl = session.recordingEndUrl || await this._getRecordingTabUrl(session.currentTabId);
++    const saveOptions = recordingImport
++      ? { ...recordingImport, recordingEndUrl }
++      : recordingImport;
++    try {
++      await this._saveRecordedSteps(session.testCaseId, toSave, saveOptions);
++      await this._clearSessionDraft();
++      return { ok: true, saved: true, retryable: false, stepCount: recorded.length, saveContext };
++    } catch (err) {
++      return { ok: false, saved: false, retryable: true, error, saveContext };
++    }
++  }
+@@
++    // 停止录制前把最终地址写入草稿，上传失败后重试仍能复用完整导入上下文。
++    this.state.recordingEndUrl = recordingEndUrl;
++    await this._saveSessionDraft();
+```
+
+### `content/bridge.js`
+
+```diff
+       data.type === 'AT_PLATFORM_RECORD'
++      || data.type === 'AT_PLATFORM_RETRY_RECORDING'
+       || data.type === 'AT_PLATFORM_PLAY'
+```
+
+### `README.md`
+
+```diff
+ 4. 录制完成后步骤自动上传到后端并刷新中台
++
++如果导入请求失败，扩展会保留本次录制 session draft；admin-ui 录制结果中点击“重试上传草稿”即可继续使用原步骤和导入上下文上传。
+```
+
+### `使用说明.md`
+
+```diff
+ - 将步骤发送到后台并保存到后端
++
++如果录制导入请求失败，后台会保留 session draft。通过 admin-ui 录制结果中的“重试上传草稿”可以再次提交；重试成功后草稿自动清理，连续失败时不会丢失步骤。
+```
+
+# 2026-08-03 CueCast 增加 Admin 中台配置页
+
+## 涉及文件
+
+- manifest.json
+- background.js
+- options/options.html
+- options/options.css
+- options/options.js
+- popup/popup.html
+- popup/popup.css
+- popup/popup.js
+- README.md
+- 使用说明.md
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. 新增扩展选项页，支持配置 Admin API Base、鉴权 Token 和控制台地址，并保存到当前 Chrome 用户的 `chrome.storage.local`。
+2. Service Worker 启动时加载中台配置，监听配置变更并即时更新 API 客户端；中台页面临时传入的鉴权参数仍保持会话级覆盖。
+3. Popup 展示当前中台配置状态，并提供打开选项页入口；README 和使用说明同步更新安装后配置步骤。
+
+## 验证
+
+已执行扩展脚本语法检查和 Popup/Options 配置契约测试，确认配置规范化、保存、重载恢复和入口跳转行为正常。
+
+```powershell
+node --check background.js
+node --check popup/popup.js
+node --check options/options.js
+```
+## 具体代码改动
+
+### `manifest.json`
+
+```diff
+   "action": {
+     "default_popup": "popup/popup.html"
+   },
++  "options_page": "options/options.html",
+   "content_scripts": [
+```
+
+### `background.js`
+
+```diff
+ const state = {
+   apiBase: 'http://localhost:3000/api',
+   authToken: '',
+ };
++const EXTENSION_SETTINGS_KEY = 'cuecastSettings';
++const DEFAULT_EXTENSION_SETTINGS = Object.freeze({
++  apiBase: 'http://localhost:3000/api',
++  authToken: '',
++  dashboardUrl: 'https://app.icuecast.com/dashboard',
++});
++
++function applyExtensionSettings(settings = {}) {
++  state.apiBase = normalizeApiBase(settings.apiBase);
++  state.authToken = String(settings.authToken ?? '').trim();
++}
++
++void restoreExtensionSettings()
++  .then(() => recorder.restoreSessionFromStorage());
+```
+
+### `options/options.html`
+
+```diff
++<form id="settingsForm" class="card">
++  <label><span>Admin API Base</span><input id="apiBase" name="apiBase" type="url" required></label>
++  <label><span>鉴权 Token</span><input id="authToken" name="authToken" type="password" autocomplete="off"></label>
++  <button type="submit" class="primary">保存配置</button>
++</form>
+```
+
+### `options/options.css`
+
+```diff
++.card {
++  display: grid;
++  gap: 18px;
++  padding: 24px;
++  border: 1px solid var(--border);
++  border-radius: 12px;
++  background: var(--card);
++}
+```
+
+### `options/options.js`
+
+```diff
++const SETTINGS_KEY = 'cuecastSettings';
++
++async function saveSettings(event) {
++  event.preventDefault();
++  const settings = normalizedSettings({
++    apiBase: refs.apiBase.value,
++    authToken: refs.authToken.value,
++    dashboardUrl: refs.dashboardUrl.value,
++  });
++  await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
++  setStatus('已保存，后台请求会立即使用新配置。');
++}
+```
+
+### `popup/popup.html`
+
+```diff
++<section class="card config-card">
++  <span>Admin 中台</span>
++  <span id="configState" class="config-state">读取中</span>
++  <p id="adminApiBase" class="config-value">-</p>
++  <button type="button" class="btn-secondary" id="openOptions">配置 API 和 Token</button>
++</section>
+```
+
+### `popup/popup.css`
+
+```diff
++.config-card {
++  display: grid;
++  gap: 8px;
++}
++
++.btn-secondary {
++  width: 100%;
++  border: 1px solid var(--border);
++  background: transparent;
++  color: var(--text);
++}
+```
+
+### `popup/popup.js`
+
+```diff
+-const DEFAULT_DASHBOARD_URL = 'https://app.icuecast.com/dashboard';
++const SETTINGS_KEY = 'cuecastSettings';
++const DEFAULT_SETTINGS = {
++  apiBase: 'http://localhost:3000/api',
++  authToken: '',
++  dashboardUrl: 'https://app.icuecast.com/dashboard',
++};
++
++const result = await chrome.storage.local.get(SETTINGS_KEY);
++const settings = normalizedSettings(result?.[SETTINGS_KEY]);
++adminApiBase.textContent = settings.apiBase;
++configState.textContent = settings.authToken ? '已配置 Token' : '未配置 Token';
+```
+
+### `README.md`
+
+```diff
+ ├── popup/
+ │   ├── popup.html         - 弹窗页面
+ │   └── popup.js           - 弹窗逻辑
++├── options/
++│   ├── options.html       - Admin 中台配置页
++│   ├── options.css        - 配置页样式
++│   └── options.js         - 配置保存逻辑
+```
+
+### `使用说明.md`
+
+```diff
+ - `popup/`：扩展弹窗
++- `options/`：Admin 中台 API、Token 和控制台地址配置页
+ - `test-lab/`：本地实验室与 mock 数据
+```
+
+# 2026-08-03 CueCast 基础设施结果预览写入步骤详情
+
+## 涉及文件
+
+- modules/player-manager.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. CueCast 委托基础设施任务后读取 Admin 返回的受限结果预览，并写入步骤详情。
+2. 结果预览只包含脱敏摘要、影响行数、返回行数、stdout/stderr 预览和截断标记；命令、SQL、目标与凭据仍由 Admin 从冻结 revision 解析，扩展不接触原始执行事实。
+
+## 验证
+
+已执行模块语法检查，确认基础设施结果预览透传和步骤详情写入无语法错误；与 Playwright Runner 的结果契约保持一致。
+
+```powershell
+node --check modules/player-manager.js
+```
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+ return {
+   executor: task.executor || 'infrastructure-service',
+   taskId,
+   exitCode: task.exitCode ?? task.exit_code,
+   affectedRows: task.affectedRows ?? task.affected_rows,
+++  // 受限结果预览进入步骤详情；完整输出和大结果只能通过 Admin 受鉴权附件读取。
+++  infrastructure: task.result?.infrastructure && typeof task.result.infrastructure === 'object'
+++    ? task.result.infrastructure
+++    : null,
+   // Admin 只对白名单基础设施动作返回受限变量快照；扩展不会读取命令输出或凭据。
+
+ ...(executorResult ? {
+   executor: executorResult.executor || 'infrastructure-service',
+   infrastructure_task_id: executorResult.taskId || '',
+   exit_code: executorResult.exitCode ?? null,
+   affected_rows: executorResult.affectedRows ?? null,
+++  ...(executorResult.infrastructure
+++    ? { details: { infrastructure: executorResult.infrastructure } }
+++    : {}),
+ } : {}),
+```
 # 2026-08-03 修复 replaceCase 录制导入缺少定义版本
 
 ## 涉及文件
@@ -1890,4 +2931,64 @@ node --experimental-default-type=module --input-type=module -e "import { Cuecast
 +  ...(options.runtimeBindings && Object.keys(options.runtimeBindings).length > 0
 +    ? { runtimeBindings: options.runtimeBindings }
 +    : {}),
+```
+# 2026-08-06 CueCast 补齐目录参数的统一执行详情
+
+## 涉及文件
+
+- modules/operation-diagnostics.js
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. 将目录中变量操作的读取模式、正则替换、日期时间、时间戳单位、计算尾零策略等参数加入统一执行详情。
+2. 让 CueCast 详情字段与 Admin `automation-operation-catalog.json` 的参数定义保持一致，便于手动添加和录制步骤使用相同展示模型。
+3. 增加目录参数完整性契约测试，确认日期变量的全部参数进入步骤详情。
+
+## 验证
+
+- `node --check modules/operation-diagnostics.js`：通过。
+- `node --experimental-default-type=module --test tests/operation-contract.test.js`：待本轮执行。
+
+## 具体代码改动
+
+### `modules/operation-diagnostics.js`
+
+```diff
+@@
+-  'property_key', 'expression', 'scale', 'timeout_ms', 'sql', 'command', 'script',
++  'property_key', 'expression', 'scale', 'timeout_ms', 'sql', 'command', 'script', 'read_mode',
++  'regex_group', 'replace_from', 'replace_to', 'datetime', 'offset_seconds', 'timestamp_unit',
++  'keep_trailing_zeros',
+ ]);
+```
+
+### `tests/operation-contract.test.js`
+
+```diff
+@@
+ test('CueCast execution result adds the shared operation detail without exposing restricted input', () => {
+@@
+ });
++
++test('CueCast 目录参数完整进入变量执行详情', () => {
++  const result = attachOperationDiagnostic(
++    { action_type: 'global_variable_date', status: 'passed' },
++    {
++      method_code: 'global.variable.date',
++      action_type: 'global_variable_date',
++      variable_name: 'run.date',
++      date_mode: 'offset',
++      format: 'yyyy-MM-dd',
++      datetime: '2026-08-06T00:00:00+08:00',
++      offset_seconds: 60,
++      timestamp_unit: 'second',
++    },
++  );
++  assert.deepEqual(
++    result.details.operation.inputs.map((item) => item.key),
++    ['variable_name', 'format', 'date_mode', 'datetime', 'offset_seconds', 'timestamp_unit'],
++  );
++});
 ```

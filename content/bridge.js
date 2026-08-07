@@ -76,6 +76,8 @@
 
     if (
       data.type === 'AT_PLATFORM_RECORD'
+      || data.type === 'AT_PLATFORM_RETRY_RECORDING'
+      || data.type === 'AT_PLATFORM_RECORDING_DRAFT_STATUS'
       || data.type === 'AT_PLATFORM_PLAY'
       || data.type === 'AT_PLATFORM_STOP'
       || data.type === 'AT_PLATFORM_STOP_PLAYBACK'

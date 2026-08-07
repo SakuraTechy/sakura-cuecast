@@ -111,6 +111,21 @@ export class CuecastVariableContext {
     };
   }
 
+  describeReferencesForStep(step) {
+    return this.referencesInStep(step).map((reference) => {
+      const { root } = this._parseReference(reference);
+      const meta = this._metadata.get(root) || {};
+      const description = this.describe(reference);
+      return {
+        reference,
+        variable_name: root,
+        value_masked: meta.masked ? 1 : 0,
+        ...(meta.masked ? {} : { value_preview: description.value_preview }),
+        source: meta.source || '',
+      };
+    });
+  }
+
   _parseReference(reference) {
     const candidates = [...this._values.keys()]
       .filter((name) => reference === name || reference.startsWith(`${name}.`) || reference.startsWith(`${name}[`))

@@ -23,6 +23,8 @@ export class RecorderManager {
   _buildSessionDraft() {
     return {
       active: this.state.mode === 'recording',
+      saveFailed: this.state.recordingSaveFailed === true,
+      saveError: this.state.recordingSaveError || '',
       testCaseId: this.state.testCaseId ?? null,
       apiBase: this.state.apiBase ?? '',
       authToken: this.state.authToken ?? '',
@@ -31,6 +33,7 @@ export class RecorderManager {
       recordingWindowId: this.state.recordingWindowId ?? null,
       recordingScreenshotMode: this.state.recordingScreenshotMode || 'standard',
       recordingImport: this.state.recordingImport || null,
+      recordingEndUrl: this.state.recordingEndUrl || '',
       recordingPaused: this.state.recordingPaused === true,
       recordedSteps: Array.isArray(this.state.recordedSteps) ? [...this.state.recordedSteps] : [],
       insertAfterIndex: this._insertAfterIndex,
@@ -87,7 +90,7 @@ export class RecorderManager {
   }
 
   _isSessionDraftUsable(session) {
-    return !!(session && typeof session === 'object' && session.active === true);
+    return !!(session && typeof session === 'object' && (session.active === true || session.saveFailed === true));
   }
 
   _pickNewestSessionDraft(...sessions) {
@@ -97,6 +100,14 @@ export class RecorderManager {
     return usable[0];
   }
 
+  async _readNewestSessionDraft() {
+    const [sessionStore, localStore] = await Promise.all([
+      this._readFromArea(chrome.storage.session || null).catch(() => null),
+      this._readFromArea(chrome.storage.local || null).catch(() => null),
+    ]);
+    return this._pickNewestSessionDraft(sessionStore, localStore);
+  }
+
   async _saveSessionDraft() {
     const payload = this._buildSessionDraft();
     try {
@@ -104,6 +115,23 @@ export class RecorderManager {
       await Promise.all(areas.map((area) => this._saveToArea(area, payload)));
     } catch (e) {
       console.warn('[Recorder] 保存录制草稿失败:', e?.message || e);
+    }
+  }
+
+  async _markSessionDraftSaveFailed(error) {
+    try {
+      const draft = await this._readNewestSessionDraft();
+      if (!draft) return;
+      const failedDraft = {
+        ...draft,
+        active: false,
+        saveFailed: true,
+        saveError: String(error || '录制导入失败'),
+        savedAt: Date.now(),
+      };
+      await Promise.all(this._storageAreas().map((area) => this._saveToArea(area, failedDraft)));
+    } catch (e) {
+      console.warn('[Recorder] 标记录制失败草稿失败:', e?.message || e);
     }
   }
 
@@ -119,12 +147,10 @@ export class RecorderManager {
   async _restoreSessionDraft(tabIdHint = null) {
     if (this.state.mode === 'recording') return true;
     try {
-      const [sessionStore, localStore] = await Promise.all([
-        this._readFromArea(chrome.storage.session || null).catch(() => null),
-        this._readFromArea(chrome.storage.local || null).catch(() => null),
-      ]);
-      const session = this._pickNewestSessionDraft(sessionStore, localStore);
+      const session = await this._readNewestSessionDraft();
       if (!session) return false;
+      // 失败草稿只供 admin-ui 重试，不恢复成正在录制，避免误触发停止/心跳流程。
+      if (session.saveFailed === true) return false;
       const restoredTabId = Number.isInteger(Number(session.currentTabId))
         ? Number(session.currentTabId)
         : (Number.isInteger(Number(tabIdHint)) ? Number(tabIdHint) : null);
@@ -142,6 +168,9 @@ export class RecorderManager {
         ? 'full_hd'
         : 'standard';
       this.state.recordingImport = session.recordingImport || null;
+      this.state.recordingEndUrl = session.recordingEndUrl || '';
+      this.state.recordingSaveFailed = false;
+      this.state.recordingSaveError = '';
       this.state.recordingPaused = session.recordingPaused === true;
       this.state.recordingStartedAt = Number(session.savedAt || Date.now()) || Date.now();
       this.state.recordedSteps = Array.isArray(session.recordedSteps) ? [...session.recordedSteps] : [];
@@ -158,6 +187,25 @@ export class RecorderManager {
 
   async restoreSessionFromStorage() {
     return this._restoreSessionDraft(null);
+  }
+
+  async getSessionDraftSummary() {
+    const session = await this._readNewestSessionDraft();
+    if (!session || session.saveFailed !== true) {
+      return { ok: true, available: false };
+    }
+    const recordingImport = session.recordingImport || {};
+    return {
+      ok: true,
+      available: true,
+      testCaseId: session.testCaseId ?? null,
+      stepCount: Array.isArray(session.recordedSteps) ? session.recordedSteps.length : 0,
+      mode: recordingImport.mode || 'legacySaveSteps',
+      targetSceneDbId: recordingImport.targetSceneDbId ?? null,
+      targetCaseId: recordingImport.targetCaseId ?? null,
+      savedAt: session.savedAt ?? null,
+      error: session.saveError || '',
+    };
   }
 
   _clearMergeContext() {
@@ -198,9 +246,8 @@ export class RecorderManager {
    * @param {object[]} recorded 本次会话录到的步骤
    * @returns {object[]|null} 要 POST 的完整列表；null 表示不调用保存（保持服务端不变）
    */
-  _mergeRecordedWithSnapshot(recorded) {
-    const snap = this._existingStepsSnapshot;
-    const insertAfter = this._insertAfterIndex;
+  _mergeRecordedWithSnapshot(recorded, snapshot = this._existingStepsSnapshot, insertAfter = this._insertAfterIndex) {
+    const snap = snapshot;
     if (insertAfter == null || !Array.isArray(snap) || snap.length === 0) {
       return recorded;
     }
@@ -263,6 +310,79 @@ export class RecorderManager {
       return this.api.importRecording(this._buildRecordingImportPayload(testCaseId, steps, importOptions));
     }
     return this.api.saveSteps(testCaseId, this._withSequentialStepIds(steps));
+  }
+
+  /**
+   * 使用保存失败时保留的 session draft 重试导入；失败时不清理草稿，便于再次点击重试。
+   */
+  async retrySaveDraft() {
+    const session = await this._readNewestSessionDraft();
+    if (!session) {
+      return { ok: false, saved: false, retryable: false, error: '没有可重试的录制草稿' };
+    }
+
+    const recorded = Array.isArray(session.recordedSteps) ? [...session.recordedSteps] : [];
+    const testCaseId = session.testCaseId;
+    const toSave = this._mergeRecordedWithSnapshot(
+      recorded,
+      Array.isArray(session.existingStepsSnapshot) ? session.existingStepsSnapshot : null,
+      session.insertAfterIndex,
+    );
+    if (!testCaseId || !toSave || toSave.length === 0) {
+      return { ok: false, saved: false, retryable: false, error: '录制草稿没有可上传的步骤' };
+    }
+
+    const recordingImport = session.recordingImport || null;
+    const recordingEndUrl = session.recordingEndUrl || await this._getRecordingTabUrl(session.currentTabId);
+    const saveOptions = recordingImport
+      ? { ...recordingImport, recordingEndUrl }
+      : recordingImport;
+    const saveContext = {
+      mode: recordingImport?.mode || (recordingImport ? 'recordingImport' : 'legacySaveSteps'),
+      apiBase: this.api.base,
+      appendPosition: recordingImport?.appendPosition,
+      appendAfterCaseId: recordingImport?.appendAfterCaseId,
+      targetStepId: recordingImport?.targetStepId,
+      stepAppendPosition: recordingImport?.stepAppendPosition,
+      appendAfterStepId: recordingImport?.appendAfterStepId,
+      recordingEndUrl,
+      replaceOldStepCount: recordingImport?.replaceOldStepCount,
+      stepCount: toSave.length,
+      recordedStepCount: recorded.length,
+    };
+
+    try {
+      await this._saveRecordedSteps(testCaseId, toSave, saveOptions);
+      await this._clearSessionDraft();
+      this.state.recordingSaveFailed = false;
+      this.state.recordingSaveError = '';
+      this._showNotification('录制重试成功', `已保存 ${toSave.length} 个操作步骤`);
+      this._broadcastRecordingEnd({
+        testCaseId,
+        reason: 'retry_completed',
+        stepCount: recorded.length,
+        saved: true,
+        retryable: false,
+        saveContext,
+      });
+      this._notifyPopup();
+      return { ok: true, saved: true, retryable: false, stepCount: recorded.length, saveContext };
+    } catch (err) {
+      const error = err?.message || String(err);
+      await this._markSessionDraftSaveFailed(error);
+      this._showNotification('录制重试失败', error);
+      this._broadcastRecordingEnd({
+        testCaseId,
+        reason: 'retry_failed',
+        stepCount: recorded.length,
+        saved: false,
+        retryable: true,
+        error,
+        saveContext,
+      });
+      this._notifyPopup();
+      return { ok: false, saved: false, retryable: true, error, saveContext };
+    }
   }
 
   _broadcastToContentScripts(message) {
@@ -371,6 +491,9 @@ export class RecorderManager {
     this.state.recordingWindowId = null;
     this.state.recordingScreenshotMode = 'standard';
     this.state.recordingImport = options.recordingImport || null;
+    this.state.recordingEndUrl = '';
+    this.state.recordingSaveFailed = false;
+    this.state.recordingSaveError = '';
     this.state.recordingPaused = false;
     this.state.recordingStartedAt = Date.now();
     this.state.currentTabId = null;
@@ -441,6 +564,9 @@ export class RecorderManager {
       this.state.recordingWindowId = null;
       this.state.recordingScreenshotMode = 'standard';
       this.state.recordingImport = null;
+      this.state.recordingEndUrl = '';
+      this.state.recordingSaveFailed = false;
+      this.state.recordingSaveError = '';
       this.state.recordingPaused = false;
       this.state.recordingStartedAt = 0;
       this._clearMergeContext();
@@ -594,6 +720,9 @@ export class RecorderManager {
       stepCount: Array.isArray(toSave) ? toSave.length : 0,
       recordedStepCount: recorded.length,
     };
+    // 停止录制前把最终地址写入草稿，上传失败后重试仍能复用完整导入上下文。
+    this.state.recordingEndUrl = recordingEndUrl;
+    await this._saveSessionDraft();
     this._clearMergeContext();
     this.state.mode = 'idle';
     this.state.currentTabId = null;
@@ -601,6 +730,9 @@ export class RecorderManager {
     this.state.recordingWindowId = null;
     this.state.recordingScreenshotMode = 'standard';
     this.state.recordingImport = null;
+    this.state.recordingEndUrl = '';
+    this.state.recordingSaveFailed = false;
+    this.state.recordingSaveError = '';
     this.state.recordingPaused = false;
     this.state.recordingStartedAt = 0;
 
@@ -617,6 +749,7 @@ export class RecorderManager {
         this._showNotification('录制完成', msg);
       } catch (err) {
         const error = err?.message || String(err);
+        await this._markSessionDraftSaveFailed(error);
         this._showNotification('保存失败', error);
         this.state.recordedSteps = [];
         this._broadcastRecordingEnd({
@@ -624,6 +757,7 @@ export class RecorderManager {
           reason: 'completed',
           stepCount: recorded.length,
           saved: false,
+          retryable: true,
           error,
           saveContext,
         });
@@ -682,6 +816,9 @@ export class RecorderManager {
     this.state.recordingWindowId = null;
     this.state.recordingScreenshotMode = 'standard';
     this.state.recordingImport = null;
+    this.state.recordingEndUrl = '';
+    this.state.recordingSaveFailed = false;
+    this.state.recordingSaveError = '';
     this.state.recordingPaused = false;
     this.state.recordingStartedAt = 0;
     await this._clearSessionDraft();
@@ -733,6 +870,9 @@ export class RecorderManager {
       stepCount: Array.isArray(toSave) ? toSave.length : 0,
       recordedStepCount: recorded.length,
     };
+    // 标签页关闭也要先保存最终地址，便于导入失败后从草稿重试。
+    this.state.recordingEndUrl = recordingEndUrl;
+    await this._saveSessionDraft();
     this._clearMergeContext();
     this.state.mode = 'idle';
     this.state.currentTabId = null;
@@ -740,6 +880,9 @@ export class RecorderManager {
     this.state.recordingWindowId = null;
     this.state.recordingScreenshotMode = 'standard';
     this.state.recordingImport = null;
+    this.state.recordingEndUrl = '';
+    this.state.recordingSaveFailed = false;
+    this.state.recordingSaveError = '';
     this.state.recordingPaused = false;
     this.state.recordingStartedAt = 0;
 
@@ -758,7 +901,11 @@ export class RecorderManager {
     } else {
       saveError = '录制标签页已关闭，但没有可保存的步骤。';
     }
-    if (!saved) await this._clearSessionDraft();
+    if (!saved && saveError && recorded.length > 0) {
+      await this._markSessionDraftSaveFailed(saveError);
+    } else if (!saved) {
+      await this._clearSessionDraft();
+    }
     if (recordingWindowId) {
       chrome.windows.remove(recordingWindowId).catch(() => {});
     }
@@ -769,6 +916,7 @@ export class RecorderManager {
       reason: 'tab_closed',
       stepCount: recorded.length,
       saved,
+      retryable: !saved && Boolean(saveError) && recorded.length > 0,
       error: saved ? undefined : saveError,
       saveContext,
     });

@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CueCast 中台配置</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main class="page">
+    <header class="header">
+      <div>
+        <p class="eyebrow">CUECAST</p>
+        <h1>Admin 中台配置</h1>
+        <p class="subtitle">配置会保存在当前 Chrome 用户的扩展存储中，仅用于扩展 API 请求。</p>
+      </div>
+    </header>
+
+    <form id="settingsForm" class="card">
+      <label>
+        <span>Admin API Base</span>
+        <input id="apiBase" name="apiBase" type="url" required placeholder="http://localhost:3000/api" autocomplete="url">
+        <small>例如：<code>http://localhost:3000/api</code>。末尾斜杠会自动去除。</small>
+      </label>
+
+      <label>
+        <span>鉴权 Token</span>
+        <input id="authToken" name="authToken" type="password" placeholder="可留空，支持 Bearer token 内容" autocomplete="off">
+        <small>Token 只写入 Chrome 扩展本地存储，不会展示在页面地址或录制数据中。</small>
+      </label>
+
+      <label>
+        <span>控制台地址</span>
+        <input id="dashboardUrl" name="dashboardUrl" type="url" required placeholder="https://app.icuecast.com/dashboard" autocomplete="url">
+      </label>
+
+      <div class="actions">
+        <button type="submit" class="primary">保存配置</button>
+        <button type="button" id="resetSettings" class="secondary">恢复默认</button>
+        <span id="status" class="status" role="status" aria-live="polite"></span>
+      </div>
+    </form>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>

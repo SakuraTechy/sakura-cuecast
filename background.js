@@ -19,10 +19,35 @@ const state = {
   recordingWindowId: null,
   recordingScreenshotMode: 'standard',
   recordingImport: null,
+  recordingEndUrl: '',
+  recordingSaveFailed: false,
+  recordingSaveError: '',
   recordingPaused: false,
   recordingStartedAt: 0,
   activePlayCount: 0,
 };
+
+const EXTENSION_SETTINGS_KEY = 'cuecastSettings';
+const DEFAULT_EXTENSION_SETTINGS = Object.freeze({
+  apiBase: 'http://localhost:3000/api',
+  authToken: '',
+  dashboardUrl: 'https://app.icuecast.com/dashboard',
+});
+
+function normalizeApiBase(value) {
+  const text = String(value ?? '').trim();
+  return text ? text.replace(/\/+$/, '') : DEFAULT_EXTENSION_SETTINGS.apiBase;
+}
+
+function applyExtensionSettings(settings = {}) {
+  state.apiBase = normalizeApiBase(settings.apiBase);
+  state.authToken = String(settings.authToken ?? '').trim();
+}
+
+async function restoreExtensionSettings() {
+  const stored = await chrome.storage.local.get(EXTENSION_SETTINGS_KEY).catch(() => ({}));
+  applyExtensionSettings(stored?.[EXTENSION_SETTINGS_KEY] || DEFAULT_EXTENSION_SETTINGS);
+}
 
 const api = new ApiClient(() => state.apiBase, () => state.authToken);
 const recorder = new RecorderManager(state, api);
@@ -37,13 +62,19 @@ function clearRecordingKeepalive() {
   void chrome.alarms.clear(RECORDING_KEEPALIVE_ALARM);
 }
 
-void recorder.restoreSessionFromStorage()
+void restoreExtensionSettings()
+  .then(() => recorder.restoreSessionFromStorage())
   .then((restored) => {
     if (restored) {
       armRecordingKeepalive();
     }
   })
   .catch(() => {});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local' || !changes[EXTENSION_SETTINGS_KEY]) return;
+  applyExtensionSettings(changes[EXTENSION_SETTINGS_KEY].newValue || DEFAULT_EXTENSION_SETTINGS);
+});
 const SCREENSHOT_MODE_FULL_HD = 'full_hd';
 const VIEWPORT_MODES = new Set(['maximized', 'current', 'custom']);
 const DEFAULT_VIEWPORT_WIDTH = 1920;
@@ -237,6 +268,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       recorder.setPausedState(message.paused === true).then(sendResponse);
       return true;
 
+    case 'AT_PLATFORM_RECORDING_DRAFT_STATUS':
+      recorder.getSessionDraftSummary().then(sendResponse);
+      return true;
+
+    // 中台录制导入失败后，使用扩展保留的 session draft 重试上传。
+    case 'AT_PLATFORM_RETRY_RECORDING':
+      state.apiBase = message.apiBase || state.apiBase;
+      state.authToken = message.authToken || state.authToken;
+      recorder.retrySaveDraft().then(sendResponse);
+      return true;
+
     // 来自中台或弹窗：开始回放（必须在短时间内 sendResponse，否则 MV3 消息通道会关闭，表现为点击无反应）
     case 'AT_PLATFORM_PLAY':
       state.apiBase = message.apiBase || state.apiBase;
@@ -244,6 +286,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       void player.start(message.testCaseId, message.startUrl, {
         adminCaseKey: message.adminCaseKey || message.caseKey,
         batchId: message.batchId,
+        executionCapability: message.executionCapability,
         executionId: message.executionId,
         projectEnvironmentId: message.projectEnvironmentId,
         dataSource: message.dataSource || message.executionSource,

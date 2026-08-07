@@ -83,6 +83,49 @@ body {
   background: var(--card);
 }
 
+.config-card {
+  display: grid;
+  gap: 8px;
+}
+
+.config-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.config-state {
+  color: var(--volt);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.config-value {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.btn-secondary {
+  width: 100%;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  border-radius: 6px;
+  padding: 9px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn-secondary:hover {
+  border-color: var(--volt);
+}
+
 .btn-primary {
   width: 100%;
   border: 1px solid var(--volt);

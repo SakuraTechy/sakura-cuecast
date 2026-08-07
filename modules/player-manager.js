@@ -97,6 +97,9 @@ function localizePlaybackError(locale, message) {
 }
 
 const MAX_CONCURRENT_PLAYS = 5;
+const DEFAULT_TAB_LOAD_TIMEOUT_MS = 30000;
+const RECORD_CONTEXT_PREPARE_TIMEOUT_MS = 45000;
+const CDP_COMMAND_TIMEOUT_MS = 20000;
 const VIEWPORT_MODES = new Set(['maximized', 'current', 'custom']);
 const DEFAULT_VIEWPORT_WIDTH = 1920;
 const DEFAULT_VIEWPORT_HEIGHT = 1080;
@@ -202,6 +205,14 @@ function normalizeStartStepIndex(value, stepCount) {
   const n = Number(value);
   if (!Number.isInteger(n) || n < 0) return 0;
   if (n >= stepCount) return -1;
+  return n;
+}
+
+function normalizeStopAfterStepIndex(value, stepCount) {
+  if (value == null || value === '') return stepCount - 1;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0) return -1;
+  if (n >= stepCount) return stepCount - 1;
   return n;
 }
 
@@ -359,10 +370,69 @@ export class PlayerManager {
     return { ok: true };
   }
 
-  handlePlayTabClosed(tabId) {
+  async handlePlayTabClosed(tabId) {
     for (const ctx of this._playContexts) {
-      if (ctx.tabId === tabId) ctx.stopped = true;
+      const registryEntry = ctx.tabRegistry && typeof ctx.tabRegistry.entries === 'function'
+        ? [...ctx.tabRegistry.entries()].find(([, item]) => Number(item?.tabId) === Number(tabId))
+        : null;
+      if (registryEntry) {
+        ctx.tabRegistry.delete(registryEntry[0]);
+        if (Number(ctx.tabId) === Number(tabId)) ctx.tabId = null;
+        const alive = await this._livePlaybackTabEntries(ctx);
+        if (alive.length > 0) continue;
+        ctx.closedAllTabs = true;
+        ctx.stopped = true;
+        continue;
+      }
+      if (Number(ctx.tabId) === Number(tabId)) {
+        ctx.tabId = null;
+        const alive = await this._livePlaybackTabEntries(ctx);
+        if (alive.length > 0) continue;
+        ctx.closedAllTabs = true;
+        ctx.stopped = true;
+      }
     }
+  }
+
+  async _livePlaybackTabEntries(ctx) {
+    if (!ctx?.tabRegistry || typeof ctx.tabRegistry.entries !== 'function') return [];
+    const live = [];
+    for (const [index, item] of ctx.tabRegistry.entries()) {
+      if (item?.tabId == null) {
+        ctx.tabRegistry.delete(index);
+        continue;
+      }
+      const tab = await chrome.tabs.get(item.tabId).catch(() => null);
+      if (tab) {
+        live.push([index, item, tab]);
+      } else {
+        ctx.tabRegistry.delete(index);
+        if (Number(ctx.tabId) === Number(item.tabId)) ctx.tabId = null;
+      }
+    }
+    return live;
+  }
+
+  async _ensurePlayableTabBeforeStep(ctx, playTabId, actionType, locale = 'zh') {
+    const tabId = Number(playTabId);
+    if (Number.isInteger(tabId) && tabId > 0) {
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (tab) return tabId;
+    }
+    ctx.tabId = null;
+    const live = await this._livePlaybackTabEntries(ctx);
+    if (live.length > 0 && actionType === 'switch_context') {
+      return null;
+    }
+    if (live.length > 0) {
+      throw new Error(trByLocale(
+        locale,
+        '当前回放标签页已关闭，且下一步不是切换标签页，无法继续执行',
+        'Current playback tab was closed and the next step is not a tab switch, so playback cannot continue',
+      ));
+    }
+    ctx.closedAllTabs = true;
+    throw new Error(trByLocale(locale, '回放标签页已全部关闭', 'All playback tabs have been closed'));
   }
 
   async start(testCaseId, startUrl, opts = {}) {
@@ -376,6 +446,14 @@ export class PlayerManager {
 
     let ctx = null;
     let playTabId = null;
+    let playbackEndPayload = {
+      type: 'AT_PLAYBACK_END',
+      testCaseId,
+      tabId: null,
+      ok: false,
+      error: '',
+      purpose: String(opts.purpose || ''),
+    };
 
     try {
       const res = await this.api.getTestCase(testCaseId);
@@ -400,6 +478,14 @@ export class PlayerManager {
       if (startStepIndex < 0) {
         return { ok: false, error: trByLocale(runLocale, '起始步骤超出用例步骤范围', 'Start step is outside the case step range') };
       }
+      const stopAfterStepIndex = normalizeStopAfterStepIndex(opts.stopAfterStepIndex, steps.length);
+      if (stopAfterStepIndex < startStepIndex) {
+        return { ok: false, error: trByLocale(runLocale, '停止步骤早于起始步骤', 'Stop step is before the start step') };
+      }
+      const variablePrecheck = PlayerManager._validateVariableReferencesForPlayback(steps, startStepIndex, stopAfterStepIndex);
+      if (!variablePrecheck.ok) {
+        throw new Error(PlayerManager._formatVariablePrecheckError(variablePrecheck, runLocale));
+      }
       const stepStartUrl =
         startStepIndex > 0
           ? String(steps[startStepIndex]?.url || steps[startStepIndex - 1]?.url || '').trim()
@@ -419,13 +505,21 @@ export class PlayerManager {
         tabId: null,
         testCaseId,
         reusedTab: false,
+        tabRegistry: new Map(),
         locale: runLocale,
         pageErrorCheckEnabled,
         startStepIndex,
+        stopAfterStepIndex,
+        keepTabOpenAfterPlayback: opts.keepTabOpenAfterPlayback === true,
+        suppressResultSave: opts.suppressResultSave === true,
+        playbackPurpose: String(opts.purpose || ''),
       };
       this._playContexts.add(ctx);
       this.state.activePlayCount = (this.state.activePlayCount || 0) + 1;
       this.state.testCaseId = testCaseId;
+      const tabLoadTimeoutMs = ctx.playbackPurpose === 'record_context_prepare'
+        ? RECORD_CONTEXT_PREPARE_TIMEOUT_MS
+        : DEFAULT_TAB_LOAD_TIMEOUT_MS;
 
       const reuseTabId = opts.reuseTabId ?? null;
 
@@ -446,10 +540,15 @@ export class PlayerManager {
       this._playTabByCaseId.set(testCaseId, playTabId);
       this._pageErrorCheckEnabledByTab = this._pageErrorCheckEnabledByTab || new Map();
       this._pageErrorCheckEnabledByTab.set(playTabId, pageErrorCheckEnabled);
+      ctx.tabRegistry.set(0, {
+        tabId: playTabId,
+        url: targetUrl,
+        openerIndex: null,
+      });
       ctx.liveBroadcast = true;
       this._broadcastPlayback({ type: 'AT_PLAYBACK_LIVE', testCaseId, tabId: playTabId });
       await this._bringTabToForeground(playTabId);
-      await this._waitForTabLoad(playTabId);
+      await this._waitForTabLoad(playTabId, tabLoadTimeoutMs);
 
       const tabAfterLoad = await chrome.tabs.get(playTabId).catch(() => null);
       const urlAfterLoad = tabAfterLoad?.url || '';
@@ -494,6 +593,8 @@ export class PlayerManager {
           )
           : trByLocale(ctx.locale, `开始回放 #${testCaseId}，共 ${steps.length} 步`, `Start playback #${testCaseId}, total ${steps.length} steps`),
       );
+      const dependencySummary = PlayerManager._variableDependencySummary(steps, startStepIndex, ctx.locale);
+      if (dependencySummary) this._notifyPopup(dependencySummary);
 
       const startTime = Date.now();
       let errorStep = null;
@@ -501,17 +602,29 @@ export class PlayerManager {
       let failureContext = null;
       const playbackScreenshots = new Array(steps.length).fill('');
       const aiSubtasksByStep = {};
+      const runtimeVariables = Object.create(null);
+      const runtimeVariableEvents = [];
+      const stepTimings = [];
+      const runtimeStepTargets = [];
 
-      for (let i = startStepIndex; i < steps.length; i++) {
+      for (let i = startStepIndex; i <= stopAfterStepIndex; i++) {
         if (ctx.stopped) {
-          errorMsg = trByLocale(ctx.locale, '用户手动停止', 'Stopped by user');
+          errorMsg = ctx.closedAllTabs
+            ? trByLocale(ctx.locale, '回放标签页已全部关闭', 'All playback tabs have been closed')
+            : trByLocale(ctx.locale, '用户手动停止', 'Stopped by user');
           errorStep = i;
           break;
         }
 
         const step = steps[i];
-        const runtimeStep = PlayerManager._resolveDynamicStepValue(step);
-        const runtimeNextStep = steps[i + 1] ? PlayerManager._resolveDynamicStepValue(steps[i + 1]) : null;
+        const resolvedStepInfo = PlayerManager._resolveRuntimeVariablesWithTrace(
+          PlayerManager._resolveDynamicStepValue(step),
+          runtimeVariables,
+        );
+        const runtimeStep = resolvedStepInfo.step;
+        const runtimeNextStep = steps[i + 1]
+          ? PlayerManager._resolveRuntimeVariablesWithTrace(PlayerManager._resolveDynamicStepValue(steps[i + 1]), runtimeVariables).step
+          : null;
         const at = String(runtimeStep.action_type || '').trim().toLowerCase();
         const stepLine = isAiNaturalStep(step)
           ? trByLocale(ctx.locale, `#${testCaseId} 第 ${i + 1}/${steps.length} 步 · 智能步骤`, `#${testCaseId} Step ${i + 1}/${steps.length} · AI Step`)
@@ -520,16 +633,57 @@ export class PlayerManager {
             : trByLocale(ctx.locale, `#${testCaseId} 第 ${i + 1}/${steps.length} 步: ${runtimeStep.description || runtimeStep.action_type}`, `#${testCaseId} Step ${i + 1}/${steps.length}: ${runtimeStep.description || runtimeStep.action_type}`);
         this._notifyPopup(stepLine);
 
+        const stepStartedAt = Date.now();
+        let stepEndedAt = stepStartedAt;
+        let stepTimingStatus = 'success';
         try {
           const waitBefore = Math.max(0, Number(runtimeStep.wait_before) || 0);
           if (waitBefore) await this._sleep(waitBefore);
           const executableStep = waitBefore ? { ...runtimeStep, wait_before: 0 } : runtimeStep;
+          const actionType = String(executableStep.action_type || '').trim().toLowerCase();
+          const ensuredTabId = await this._ensurePlayableTabBeforeStep(ctx, playTabId, actionType, ctx.locale);
+          if (ensuredTabId != null) playTabId = ensuredTabId;
 
-          if (String(executableStep.action_type || '').trim().toLowerCase() !== 'assert_text') {
+          if (!['assert_text', 'switch_context'].includes(actionType)) {
             await this._throwIfPageError(playTabId);
           }
 
-          const actionType = String(executableStep.action_type || '').trim().toLowerCase();
+          const runtimeTarget = await this._collectRuntimeStepTarget(playTabId, executableStep, cdpAvailable);
+          if (runtimeTarget) {
+            runtimeStepTargets.push({
+              step_index: i,
+              ...runtimeTarget,
+            });
+          }
+
+          if (actionType === 'switch_context') {
+            const switched = await this._switchPlaybackContext(playTabId, executableStep, ctx, cdpAvailable, screenshotMode);
+            playTabId = switched.tabId;
+            cdpAvailable = switched.cdpAvailable;
+            this._playTabByCaseId.set(testCaseId, playTabId);
+            this._broadcastPlayback({ type: 'AT_PLAYBACK_LIVE', testCaseId, tabId: playTabId });
+            await this._sleep(120);
+            continue;
+          }
+          if (actionType === 'set_variable') {
+            const captured = await this._executeSetVariableStep(playTabId, executableStep, cdpAvailable, ctx.locale);
+            const previousValue = Object.prototype.hasOwnProperty.call(runtimeVariables, captured.name)
+              ? String(runtimeVariables[captured.name] ?? '')
+              : null;
+            runtimeVariables[captured.name] = captured.value;
+            runtimeVariableEvents.push({
+              step_index: i,
+              name: captured.name,
+              value: PlayerManager._previewRuntimeValue(captured.value),
+              raw_value: PlayerManager._previewRuntimeValue(captured.raw_value ?? captured.value),
+              extract: captured.extract || { mode: 'full' },
+              source: captured.source || '',
+              overwritten: previousValue != null,
+              previous_value: previousValue == null ? '' : PlayerManager._previewRuntimeValue(previousValue),
+            });
+            await this._sleep(120);
+            continue;
+          }
           const captureInsideCdpStep = cdpAvailable
             && this._canUseCDP(executableStep)
             && ['click', 'double_click', 'right_click', 'hover'].includes(actionType);
@@ -583,16 +737,28 @@ export class PlayerManager {
           await this._sleep(300);
 
           if (['click', 'navigate', 'ai_natural'].includes(String(executableStep.action_type || '').trim().toLowerCase())) {
-            await this._waitForTabLoad(playTabId);
+            await this._waitForTabLoad(playTabId, tabLoadTimeoutMs);
           }
         } catch (err) {
+          stepTimingStatus = 'failed';
           const rawErrMsg = err && err.message ? err.message : String(err);
-          errorMsg = localizePlaybackError(ctx.locale, rawErrMsg);
+          const enhancedErrMsg = PlayerManager._appendVariableResolutionToError(rawErrMsg, resolvedStepInfo.trace);
+          errorMsg = localizePlaybackError(ctx.locale, enhancedErrMsg);
           errorStep = i;
+          const variableExtractionError = err?.variableExtraction || err?.variable_extraction_error || null;
           if (isAiNaturalStep(runtimeStep) && Array.isArray(err?.aiSubtasks) && err.aiSubtasks.length) {
             aiSubtasksByStep[String(i)] = err.aiSubtasks;
           }
-          if (cdpAvailable && playTabId != null) {
+          if (ctx.suppressResultSave && ctx.playbackPurpose === 'record_context_prepare') {
+            failureContext = {
+              error_message: errorMsg,
+              error_step_index: i,
+              url: targetUrl,
+              runtime_variables: runtimeVariableEvents,
+              variable_resolution: resolvedStepInfo.trace,
+              ...(variableExtractionError ? { variable_extraction_error: variableExtractionError } : {}),
+            };
+          } else if (cdpAvailable && playTabId != null) {
             try {
               const failShot = await this._capturePlaybackScreenshot(playTabId, screenshotMode);
               if (failShot) playbackScreenshots[i] = failShot;
@@ -601,36 +767,55 @@ export class PlayerManager {
             }
             try {
               failureContext = await this._collectFailureContext(playTabId, i, errorMsg);
+              failureContext.runtime_variables = runtimeVariableEvents;
+              failureContext.variable_resolution = resolvedStepInfo.trace;
+              if (variableExtractionError) failureContext.variable_extraction_error = variableExtractionError;
             } catch {
-              failureContext = { error_message: errorMsg, error_step_index: i, url: targetUrl };
+              failureContext = { error_message: errorMsg, error_step_index: i, url: targetUrl, runtime_variables: runtimeVariableEvents, variable_resolution: resolvedStepInfo.trace, ...(variableExtractionError ? { variable_extraction_error: variableExtractionError } : {}) };
             }
           } else {
-            failureContext = { error_message: errorMsg, error_step_index: i, url: targetUrl, cdp_unavailable: true };
+            failureContext = { error_message: errorMsg, error_step_index: i, url: targetUrl, cdp_unavailable: true, runtime_variables: runtimeVariableEvents, variable_resolution: resolvedStepInfo.trace, ...(variableExtractionError ? { variable_extraction_error: variableExtractionError } : {}) };
           }
           break;
+        } finally {
+          stepEndedAt = Date.now();
+          stepTimings.push({
+            step_index: i,
+            started_at: stepStartedAt,
+            ended_at: stepEndedAt,
+            duration_ms: Math.max(0, stepEndedAt - stepStartedAt),
+            status: stepTimingStatus,
+          });
         }
       }
 
       const duration = Date.now() - startTime;
       const success = !errorMsg;
       const executedStepIndexes = [];
-      for (let i = startStepIndex; i < steps.length; i++) executedStepIndexes.push(i);
+      for (let i = startStepIndex; i <= stopAfterStepIndex; i++) executedStepIndexes.push(i);
 
-      await this.api.saveResult(testCaseId, {
-        status: success ? 'success' : 'failed',
-        duration,
-        error_message: errorMsg || '',
-        error_step: errorStep,
-        detail: {
-          steps: steps.length,
-          start_step_index: startStepIndex,
-          executed_step_indexes: executedStepIndexes,
-          cdp_mode: cdpAvailable,
-          playback_screenshots: playbackScreenshots,
-          ai_subtasks_by_step: aiSubtasksByStep,
-          ...(failureContext ? { failure_context: failureContext } : {}),
-        },
-      });
+      if (!ctx.suppressResultSave) {
+        await this.api.saveResult(testCaseId, {
+          status: success ? 'success' : 'failed',
+          duration,
+          error_message: errorMsg || '',
+          error_step: errorStep,
+          detail: {
+            steps: steps.length,
+            start_step_index: startStepIndex,
+            stop_after_step_index: stopAfterStepIndex,
+            executed_step_indexes: executedStepIndexes,
+            cdp_mode: cdpAvailable,
+            runtime_variables: runtimeVariableEvents,
+            step_timings: stepTimings,
+            runtime_step_targets: runtimeStepTargets,
+            playback_screenshots: playbackScreenshots,
+            ai_subtasks_by_step: aiSubtasksByStep,
+            ...(failureContext?.variable_extraction_error ? { variable_extraction_error: failureContext.variable_extraction_error } : {}),
+            ...(failureContext ? { failure_context: failureContext } : {}),
+          },
+        });
+      }
 
       this._notifyPopup(
         success
@@ -646,10 +831,30 @@ export class PlayerManager {
           : trByLocale(ctx.locale, `#${testCaseId} 第 ${(errorStep ?? 0) + 1} 步: ${errorMsg}`, `#${testCaseId} Step ${(errorStep ?? 0) + 1}: ${errorMsg}`),
       );
 
+      playbackEndPayload = {
+        type: 'AT_PLAYBACK_END',
+        testCaseId,
+        tabId: playTabId,
+        ok: success,
+        duration,
+        error: errorMsg || '',
+        errorStep,
+        purpose: ctx.playbackPurpose,
+      };
       return { ok: success, duration, error: errorMsg };
     } catch (err) {
       const rawMsg = err && err.message ? err.message : String(err);
       const msg = localizePlaybackError(ctx?.locale ?? runLocale, rawMsg);
+      const quotaDetails = err?.quotaDetails || err?.apiData?.data || err?.response?.data?.data || null;
+      playbackEndPayload = {
+        type: 'AT_PLAYBACK_END',
+        testCaseId,
+        tabId: playTabId,
+        ok: false,
+        error: msg,
+        ...(quotaDetails && typeof quotaDetails === 'object' && quotaDetails.resource ? { quotaDetails } : {}),
+        purpose: ctx?.playbackPurpose || String(opts.purpose || ''),
+      };
       if (msg && !rawMsg.includes('用户手动停止') && !msg.includes('Stopped by user')) {
         this._showNotification(
           trByLocale(ctx?.locale ?? runLocale, '回放无法启动或异常退出', 'Playback failed to start or exited abnormally'),
@@ -658,8 +863,6 @@ export class PlayerManager {
       }
       return { ok: false, error: msg };
     } finally {
-      // 须始终广播 END（含拉取用例失败、无步骤等），否则中台顺序回放会一直等不到结束事件
-      this._broadcastPlayback({ type: 'AT_PLAYBACK_END', testCaseId });
       if (ctx != null) {
         if (ctx.liveBroadcast) {
           this._playTabByCaseId.delete(ctx.testCaseId);
@@ -668,14 +871,23 @@ export class PlayerManager {
           if (ctx.debuggerAttached) await this._detachDebugger(playTabId, ctx).catch(() => {});
           await chrome.tabs.sendMessage(playTabId, { type: 'AT_PLAYER_CLEANUP' }).catch(() => {});
           if (this._pageErrorCheckEnabledByTab) this._pageErrorCheckEnabledByTab.delete(playTabId);
-          if (!ctx.reusedTab) {
-            await chrome.tabs.remove(playTabId).catch(() => {});
+          if (!ctx.reusedTab && !ctx.keepTabOpenAfterPlayback) {
+            const tabIds = new Set([playTabId]);
+            if (ctx.tabRegistry && typeof ctx.tabRegistry.values === 'function') {
+              for (const item of ctx.tabRegistry.values()) {
+                if (item?.tabId != null) tabIds.add(Number(item.tabId));
+              }
+            }
+            await Promise.all([...tabIds].map((tid) => chrome.tabs.remove(tid).catch(() => {})));
           }
         }
         ctx.tabId = null;
         this._playContexts.delete(ctx);
         this.state.activePlayCount = Math.max(0, (this.state.activePlayCount || 0) - 1);
       }
+      // 须始终广播 END（含拉取用例失败、无步骤等），否则中台顺序回放会一直等不到结束事件。
+      // 放在清理之后广播，方便“执行到这里再录制”立即接管保留的 tab。
+      this._broadcastPlayback({ ...playbackEndPayload, tabId: playbackEndPayload.tabId ?? playTabId });
     }
   }
 
@@ -695,6 +907,7 @@ export class PlayerManager {
       'double_click',
       'right_click',
       'input',
+      'select',
       'key',
       'scroll',
       'hover',
@@ -721,9 +934,112 @@ export class PlayerManager {
     ctx.debuggerAttached = false;
   }
 
+  _extractTabContext(step) {
+    const meta = PlayerManager._parseLocatorMetaObject(step?.locator_meta);
+    const tab = meta?.context?.tab;
+    if (!tab || typeof tab !== 'object') {
+      const n = Number(step?.value);
+      return Number.isInteger(n) && n >= 0 ? { index: n, url: step?.url || '' } : null;
+    }
+    const index = Number(tab.index);
+    if (!Number.isInteger(index) || index < 0) return null;
+    return {
+      index,
+      url: String(tab.url || step?.url || '').trim(),
+      openerIndex: Number.isInteger(Number(tab.opener_index)) ? Number(tab.opener_index) : null,
+    };
+  }
+
+  _sameUrlForTabContext(actualUrl, expectedUrl) {
+    const actual = String(actualUrl || '').trim();
+    const expected = String(expectedUrl || '').trim();
+    if (!expected) return true;
+    if (actual === expected) return true;
+    try {
+      const a = new URL(actual);
+      const e = new URL(expected);
+      return a.origin === e.origin && a.pathname === e.pathname;
+    } catch {
+      return false;
+    }
+  }
+
+  async _findPlaybackTabForContext(ctx, tabContext, currentTabId) {
+    if (!ctx.tabRegistry || typeof ctx.tabRegistry.get !== 'function') ctx.tabRegistry = new Map();
+    const existing = ctx.tabRegistry.get(tabContext.index);
+    if (existing?.tabId != null) {
+      const tab = await chrome.tabs.get(existing.tabId).catch(() => null);
+      if (tab) return tab;
+      ctx.tabRegistry.delete(tabContext.index);
+    }
+
+    let currentTab = await chrome.tabs.get(currentTabId).catch(() => null);
+    if (!currentTab) {
+      const live = await this._livePlaybackTabEntries(ctx);
+      currentTab = live[0]?.[2] || null;
+    }
+    const windowId = currentTab?.windowId;
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline) {
+      const tabs = await chrome.tabs.query(windowId != null ? { windowId } : {}).catch(() => []);
+      const candidates = tabs
+        .filter((tab) => tab?.id != null)
+        .filter((tab) => ![...ctx.tabRegistry.values()].some((item) => Number(item.tabId) === Number(tab.id)))
+        .filter((tab) => this._sameUrlForTabContext(tab.url, tabContext.url) || this._sameUrlForTabContext(tab.pendingUrl, tabContext.url));
+      const match = candidates[0] || null;
+      if (match) return match;
+      await this._sleep(300);
+    }
+    return null;
+  }
+
+  async _switchPlaybackContext(currentTabId, step, ctx, cdpAvailable, screenshotMode) {
+    const tabContext = this._extractTabContext(step);
+    if (!tabContext) throw new Error('切换标签页失败：步骤缺少 tab context');
+    if (!ctx.tabRegistry || typeof ctx.tabRegistry.get !== 'function') ctx.tabRegistry = new Map();
+    const currentEntry = [...ctx.tabRegistry.entries()].find(([, item]) => Number(item.tabId) === Number(currentTabId));
+    if (currentEntry && currentEntry[0] === tabContext.index) {
+      return { tabId: currentTabId, cdpAvailable };
+    }
+
+    const targetTab = await this._findPlaybackTabForContext(ctx, tabContext, currentTabId);
+    if (!targetTab?.id) {
+      throw new Error(`切换标签页失败：未找到标签页 #${tabContext.index}${tabContext.url ? ` (${tabContext.url})` : ''}`);
+    }
+
+    if (ctx.debuggerAttached && currentTabId != null) await this._detachDebugger(currentTabId, ctx).catch(() => {});
+    await chrome.tabs.update(targetTab.id, { active: true }).catch(() => {});
+    if (targetTab.windowId != null) await chrome.windows.update(targetTab.windowId, { focused: true }).catch(() => {});
+    await this._waitForTabLoad(targetTab.id);
+    await chrome.scripting.executeScript({
+      target: { tabId: targetTab.id },
+      files: ['content/player.js'],
+    }).catch(() => {});
+    ctx.tabRegistry.set(tabContext.index, {
+      tabId: targetTab.id,
+      url: targetTab.url || tabContext.url || '',
+      openerIndex: tabContext.openerIndex,
+    });
+    ctx.tabId = targetTab.id;
+    this._pageErrorCheckEnabledByTab = this._pageErrorCheckEnabledByTab || new Map();
+    this._pageErrorCheckEnabledByTab.set(targetTab.id, ctx.pageErrorCheckEnabled);
+    const nextCdpAvailable = await this._attachDebugger(targetTab.id, ctx);
+    if (screenshotMode === 'full_hd') await this._sleep(80);
+    return { tabId: targetTab.id, cdpAvailable: nextCdpAvailable };
+  }
+
   async _cdpSend(tabId, method, params = {}) {
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error(`CDP 命令超时：${method}`));
+      }, CDP_COMMAND_TIMEOUT_MS);
       chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
         if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
         else resolve(result);
       });
@@ -759,6 +1075,14 @@ export class PlayerManager {
       }
       if (!el) return { disabled: false };
       const disabledClassRe = /(?:^|\\s)(?:[a-z]+-)?disabled(?:\\s|$)/i;
+      const loadingClassRe = /(?:^|\\s)(?:is-)?(?:loading|spinning|pending|btn-loading|button-loading|ant-btn-loading|ivu-btn-loading|el-button--loading|arco-btn-loading)(?:\\s|$)/i;
+      const loadingIndicatorSel = [
+        '.el-icon-loading', '.el-loading-spinner', '.is-loading',
+        '.ivu-load-loop', '.ivu-icon-ios-loading', '.ivu-spin',
+        '.ant-btn-loading-icon', '.anticon-loading', '.ant-spin-spinning',
+        '.arco-icon-loading', '.arco-spin', '.n-spin',
+        '[data-loading="true"]', '[aria-busy="true"]'
+      ].join(',');
       const formControlSel = 'button,input,select,textarea,option,optgroup';
       const componentRootSel = [
         '.el-select', '.ivu-select', '.ant-select', '.v-select', '.vs__dropdown-toggle', '[role="combobox"]',
@@ -777,11 +1101,31 @@ export class PlayerManager {
         '.n-select', '.n-button', '.n-radio', '.n-checkbox', '.n-switch',
         '.MuiButton-root', '.MuiSelect-root', '.MuiInputBase-root', '.MuiSwitch-root'
       ].join(',');
+      function hasVisibleLoadingIndicator(root) {
+        if (!root || !root.querySelectorAll) return false;
+        var list = root.querySelectorAll(loadingIndicatorSel);
+        for (var i = 0; i < list.length; i++) {
+          var item = list[i];
+          if (!item || item === root) continue;
+          if (item.getAttribute && item.getAttribute('aria-hidden') === 'true') continue;
+          var st = window.getComputedStyle ? window.getComputedStyle(item) : null;
+          if (st && (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || 1) === 0)) continue;
+          var r = item.getBoundingClientRect ? item.getBoundingClientRect() : null;
+          if (r && (r.width > 0 || r.height > 0)) return true;
+        }
+        return false;
+      }
       if (el.disabled || (el.getAttribute && el.getAttribute('disabled') !== null)) {
         return { disabled: true, reason: 'native-disabled', by: brief(el) };
       }
       if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') {
         return { disabled: true, reason: 'aria-disabled', by: brief(el) };
+      }
+      if (el.getAttribute && (el.getAttribute('aria-busy') === 'true' || el.getAttribute('data-loading') === 'true')) {
+        return { disabled: true, reason: 'target-loading-attr', by: brief(el) };
+      }
+      if (loadingClassRe.test(String(el.className || ''))) {
+        return { disabled: true, reason: 'target-loading-class', by: brief(el) };
       }
       const ownerControl = el.closest && el.closest(formControlSel);
       if (ownerControl) {
@@ -790,6 +1134,15 @@ export class PlayerManager {
         }
         if (ownerControl.getAttribute && ownerControl.getAttribute('aria-disabled') === 'true') {
           return { disabled: true, reason: 'owner-aria-disabled', by: brief(ownerControl) };
+        }
+        if (ownerControl.getAttribute && (ownerControl.getAttribute('aria-busy') === 'true' || ownerControl.getAttribute('data-loading') === 'true')) {
+          return { disabled: true, reason: 'owner-loading-attr', by: brief(ownerControl) };
+        }
+        if (loadingClassRe.test(String(ownerControl.className || ''))) {
+          return { disabled: true, reason: 'owner-loading-class', by: brief(ownerControl) };
+        }
+        if (hasVisibleLoadingIndicator(ownerControl)) {
+          return { disabled: true, reason: 'owner-loading-indicator', by: brief(ownerControl) };
         }
         const fieldset = ownerControl.closest && ownerControl.closest('fieldset[disabled]');
         if (fieldset) return { disabled: true, reason: 'fieldset-disabled', by: brief(fieldset) };
@@ -805,6 +1158,15 @@ export class PlayerManager {
           }
           if (disabledClassRe.test(String(cur.className || ''))) {
             return { disabled: true, reason: 'component-disabled-class', by: brief(cur) };
+          }
+          if (cur.getAttribute && (cur.getAttribute('aria-busy') === 'true' || cur.getAttribute('data-loading') === 'true')) {
+            return { disabled: true, reason: 'component-loading-attr', by: brief(cur) };
+          }
+          if (loadingClassRe.test(String(cur.className || ''))) {
+            return { disabled: true, reason: 'component-loading-class', by: brief(cur) };
+          }
+          if (hasVisibleLoadingIndicator(cur)) {
+            return { disabled: true, reason: 'component-loading-indicator', by: brief(cur) };
           }
         }
         cur = cur.parentElement;
@@ -1075,6 +1437,14 @@ export class PlayerManager {
       }
       if (!el) return { disabled: false };
       const disabledClassRe = /(?:^|\\s)(?:[a-z]+-)?disabled(?:\\s|$)/i;
+      const loadingClassRe = /(?:^|\\s)(?:is-)?(?:loading|spinning|pending|btn-loading|button-loading|ant-btn-loading|ivu-btn-loading|el-button--loading|arco-btn-loading)(?:\\s|$)/i;
+      const loadingIndicatorSel = [
+        '.el-icon-loading', '.el-loading-spinner', '.is-loading',
+        '.ivu-load-loop', '.ivu-icon-ios-loading', '.ivu-spin',
+        '.ant-btn-loading-icon', '.anticon-loading', '.ant-spin-spinning',
+        '.arco-icon-loading', '.arco-spin', '.n-spin',
+        '[data-loading="true"]', '[aria-busy="true"]'
+      ].join(',');
       const formControlSel = 'button,input,select,textarea,option,optgroup';
       const componentRootSel = [
         '.el-select', '.ivu-select', '.ant-select', '.v-select', '.vs__dropdown-toggle', '[role="combobox"]',
@@ -1093,11 +1463,31 @@ export class PlayerManager {
         '.n-select', '.n-button', '.n-radio', '.n-checkbox', '.n-switch',
         '.MuiButton-root', '.MuiSelect-root', '.MuiInputBase-root', '.MuiSwitch-root'
       ].join(',');
+      function hasVisibleLoadingIndicator(root) {
+        if (!root || !root.querySelectorAll) return false;
+        var list = root.querySelectorAll(loadingIndicatorSel);
+        for (var i = 0; i < list.length; i++) {
+          var item = list[i];
+          if (!item || item === root) continue;
+          if (item.getAttribute && item.getAttribute('aria-hidden') === 'true') continue;
+          var st = window.getComputedStyle ? window.getComputedStyle(item) : null;
+          if (st && (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || 1) === 0)) continue;
+          var r = item.getBoundingClientRect ? item.getBoundingClientRect() : null;
+          if (r && (r.width > 0 || r.height > 0)) return true;
+        }
+        return false;
+      }
       if (el.disabled || (el.getAttribute && el.getAttribute('disabled') !== null)) {
         return { disabled: true, reason: 'native-disabled', by: brief(el) };
       }
       if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') {
         return { disabled: true, reason: 'aria-disabled', by: brief(el) };
+      }
+      if (el.getAttribute && (el.getAttribute('aria-busy') === 'true' || el.getAttribute('data-loading') === 'true')) {
+        return { disabled: true, reason: 'target-loading-attr', by: brief(el) };
+      }
+      if (loadingClassRe.test(String(el.className || ''))) {
+        return { disabled: true, reason: 'target-loading-class', by: brief(el) };
       }
       const ownerControl = el.closest && el.closest(formControlSel);
       if (ownerControl) {
@@ -1106,6 +1496,15 @@ export class PlayerManager {
         }
         if (ownerControl.getAttribute && ownerControl.getAttribute('aria-disabled') === 'true') {
           return { disabled: true, reason: 'owner-aria-disabled', by: brief(ownerControl) };
+        }
+        if (ownerControl.getAttribute && (ownerControl.getAttribute('aria-busy') === 'true' || ownerControl.getAttribute('data-loading') === 'true')) {
+          return { disabled: true, reason: 'owner-loading-attr', by: brief(ownerControl) };
+        }
+        if (loadingClassRe.test(String(ownerControl.className || ''))) {
+          return { disabled: true, reason: 'owner-loading-class', by: brief(ownerControl) };
+        }
+        if (hasVisibleLoadingIndicator(ownerControl)) {
+          return { disabled: true, reason: 'owner-loading-indicator', by: brief(ownerControl) };
         }
         const fieldset = ownerControl.closest && ownerControl.closest('fieldset[disabled]');
         if (fieldset) return { disabled: true, reason: 'fieldset-disabled', by: brief(fieldset) };
@@ -1121,6 +1520,15 @@ export class PlayerManager {
           }
           if (disabledClassRe.test(String(cur.className || ''))) {
             return { disabled: true, reason: 'component-disabled-class', by: brief(cur) };
+          }
+          if (cur.getAttribute && (cur.getAttribute('aria-busy') === 'true' || cur.getAttribute('data-loading') === 'true')) {
+            return { disabled: true, reason: 'component-loading-attr', by: brief(cur) };
+          }
+          if (loadingClassRe.test(String(cur.className || ''))) {
+            return { disabled: true, reason: 'component-loading-class', by: brief(cur) };
+          }
+          if (hasVisibleLoadingIndicator(cur)) {
+            return { disabled: true, reason: 'component-loading-indicator', by: brief(cur) };
           }
         }
         cur = cur.parentElement;
@@ -1917,6 +2325,412 @@ export class PlayerManager {
     };
   }
 
+  static _replaceRuntimeVariables(value, variables) {
+    if (typeof value !== 'string' || !value.includes('{{')) return value;
+    const bag = variables && typeof variables === 'object' ? variables : {};
+    return value.replace(/\{\{\s*([A-Za-z_$][\w$]*)\s*\}\}/g, (all, name) => (
+      Object.prototype.hasOwnProperty.call(bag, name) ? String(bag[name]) : all
+    ));
+  }
+
+  static _replaceRuntimeVariablesDeep(value, variables) {
+    if (typeof value === 'string') return PlayerManager._replaceRuntimeVariables(value, variables);
+    if (Array.isArray(value)) return value.map((item) => PlayerManager._replaceRuntimeVariablesDeep(item, variables));
+    if (!value || typeof value !== 'object') return value;
+    const out = {};
+    for (const [key, item] of Object.entries(value)) {
+      out[key] = PlayerManager._replaceRuntimeVariablesDeep(item, variables);
+    }
+    return out;
+  }
+
+  static _resolveRuntimeVariables(step, variables) {
+    if (!step || typeof step !== 'object') return step;
+    return {
+      ...step,
+      value: PlayerManager._replaceRuntimeVariables(step.value, variables),
+      value_text: PlayerManager._replaceRuntimeVariables(step.value_text, variables),
+      url: PlayerManager._replaceRuntimeVariables(step.url, variables),
+      target_selector: PlayerManager._replaceRuntimeVariables(step.target_selector, variables),
+      target_xpath: PlayerManager._replaceRuntimeVariables(step.target_xpath, variables),
+      locator_meta: PlayerManager._replaceRuntimeVariablesDeep(step.locator_meta, variables),
+      nl_instruction: PlayerManager._replaceRuntimeVariables(step.nl_instruction, variables),
+    };
+  }
+
+  static _collectRuntimeVariableTrace(value, variables, path, out) {
+    if (typeof value === 'string' && value.includes('{{')) {
+      const resolved = PlayerManager._replaceRuntimeVariables(value, variables);
+      const names = [];
+      value.replace(/\{\{\s*([A-Za-z_$][\w$]*)\s*\}\}/g, (all, name) => {
+        names.push(name);
+        return all;
+      });
+      const missing = names.filter((name) => !Object.prototype.hasOwnProperty.call(variables || {}, name));
+      const empty = names.filter((name) => (
+        Object.prototype.hasOwnProperty.call(variables || {}, name)
+        && String(variables[name] ?? '') === ''
+      ));
+      if (resolved !== value || missing.length || empty.length) {
+        out.push({
+          path,
+          template: value,
+          resolved: PlayerManager._previewRuntimeValue(resolved),
+          missing,
+          empty,
+        });
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => PlayerManager._collectRuntimeVariableTrace(item, variables, `${path}[${index}]`, out));
+      return;
+    }
+    if (value && typeof value === 'object') {
+      Object.entries(value).forEach(([key, item]) => {
+        PlayerManager._collectRuntimeVariableTrace(item, variables, path ? `${path}.${key}` : key, out);
+      });
+    }
+  }
+
+  static _resolveRuntimeVariablesWithTrace(step, variables) {
+    if (!step || typeof step !== 'object') return { step, trace: [] };
+    const trace = [];
+    ['value', 'value_text', 'url', 'target_selector', 'target_xpath', 'nl_instruction'].forEach((key) => {
+      PlayerManager._collectRuntimeVariableTrace(step[key], variables, key, trace);
+    });
+    PlayerManager._collectRuntimeVariableTrace(step.locator_meta, variables, 'locator_meta', trace);
+    return {
+      step: PlayerManager._resolveRuntimeVariables(step, variables),
+      trace: trace.slice(0, 80),
+    };
+  }
+
+  static _collectVariableRefs(value, path = '', out = []) {
+    if (typeof value === 'string' && value.includes('{{')) {
+      value.replace(/\{\{\s*([A-Za-z_$][\w$]*)\s*\}\}/g, (all, name) => {
+        out.push({ name, path, template: value });
+        return all;
+      });
+      return out;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => PlayerManager._collectVariableRefs(item, `${path}[${index}]`, out));
+      return out;
+    }
+    if (value && typeof value === 'object') {
+      Object.entries(value).forEach(([key, item]) => {
+        PlayerManager._collectVariableRefs(item, path ? `${path}.${key}` : key, out);
+      });
+    }
+    return out;
+  }
+
+  static _stepVariableName(step) {
+    if (String(step?.action_type || '').trim().toLowerCase() !== 'set_variable') return '';
+    const raw = String(step?.value || step?.variable_name || step?.name || '').trim();
+    return /^[A-Za-z_$][\w$]*$/.test(raw) ? raw : '';
+  }
+
+  static _stepVariableRefs(step) {
+    return PlayerManager._collectVariableRefs({
+      value: step?.value,
+      value_text: step?.value_text,
+      url: step?.url,
+      target_selector: step?.target_selector,
+      target_xpath: step?.target_xpath,
+      locator_meta: step?.locator_meta,
+      nl_instruction: step?.nl_instruction,
+    });
+  }
+
+  static _validateVariableReferencesForPlayback(steps, startStepIndex = 0, stopAfterStepIndex = null) {
+    const list = Array.isArray(steps) ? steps : [];
+    const start = Math.max(0, Number(startStepIndex) || 0);
+    const stop = stopAfterStepIndex == null || stopAfterStepIndex === ''
+      ? list.length - 1
+      : Math.max(start, Math.min(Number(stopAfterStepIndex) || 0, list.length - 1));
+    const scoped = list.slice(start, stop + 1);
+    const definitions = new Map();
+    scoped.forEach((step, index) => {
+      const name = PlayerManager._stepVariableName(step);
+      if (name && !definitions.has(name)) definitions.set(name, start + index);
+    });
+    const seen = new Set();
+    const issues = [];
+    scoped.forEach((step, relIndex) => {
+      const index = start + relIndex;
+      const refs = PlayerManager._stepVariableRefs(step);
+      refs.forEach((ref) => {
+        if (seen.has(ref.name)) return;
+        const defIndex = definitions.has(ref.name) ? definitions.get(ref.name) : -1;
+        if (defIndex < 0) {
+          issues.push({ type: 'undefined', name: ref.name, stepIndex: index, path: ref.path });
+        } else if (defIndex > index) {
+          issues.push({ type: 'defined_later', name: ref.name, stepIndex: index, defIndex, path: ref.path });
+        }
+      });
+      const defined = PlayerManager._stepVariableName(step);
+      if (defined) seen.add(defined);
+    });
+    return { ok: issues.length === 0, issues };
+  }
+
+  static _formatVariablePrecheckError(validation, locale = 'zh') {
+    const issue = validation?.issues?.[0];
+    if (!issue) return trByLocale(locale, '变量预检失败', 'Variable precheck failed');
+    if (issue.type === 'defined_later') {
+      return trByLocale(
+        locale,
+        `变量预检失败：第 ${issue.stepIndex + 1} 步引用了 {{${issue.name}}}，但第 ${issue.defIndex + 1} 步才定义。请调整步骤顺序或从变量定义步骤之前开始回放。`,
+        `Variable precheck failed: step ${issue.stepIndex + 1} references {{${issue.name}}}, but it is defined at step ${issue.defIndex + 1}. Reorder steps or start playback before the variable is defined.`,
+      );
+    }
+    return trByLocale(
+      locale,
+      `变量预检失败：第 ${issue.stepIndex + 1} 步引用了未定义变量 {{${issue.name}}}。请先添加保存变量步骤，或修正变量名。`,
+      `Variable precheck failed: step ${issue.stepIndex + 1} references undefined variable {{${issue.name}}}. Add a set-variable step or fix the variable name.`,
+    );
+  }
+
+  static _variableDependencySummary(steps, startStepIndex = 0, locale = 'zh') {
+    const list = Array.isArray(steps) ? steps : [];
+    const start = Math.max(0, Number(startStepIndex) || 0);
+    const definitions = new Map();
+    list.forEach((step, index) => {
+      if (index < start) return;
+      const name = PlayerManager._stepVariableName(step);
+      if (name && !definitions.has(name)) definitions.set(name, index);
+    });
+    const pairs = [];
+    list.forEach((step, index) => {
+      if (index < start) return;
+      PlayerManager._stepVariableRefs(step).forEach((ref) => {
+        const defIndex = definitions.get(ref.name);
+        if (defIndex == null || defIndex >= index) return;
+        const label = `{{${ref.name}}}: S${defIndex + 1}->S${index + 1}`;
+        if (!pairs.includes(label)) pairs.push(label);
+      });
+    });
+    if (!pairs.length) return '';
+    const body = pairs.slice(0, 8).join(', ');
+    return trByLocale(locale, `变量依赖: ${body}`, `Variable dependencies: ${body}`);
+  }
+
+  static _previewRuntimeValue(value, max = 240) {
+    const s = String(value ?? '');
+    return s.length > max ? `${s.slice(0, max)}…` : s;
+  }
+
+  static _variableMeta(step) {
+    const meta = PlayerManager._parseLocatorMetaObject(step?.locator_meta);
+    const variable = meta?.context?.variable;
+    return variable && typeof variable === 'object' ? variable : {};
+  }
+
+  static _applyVariableExtraction(rawValue, step, locale = 'zh') {
+    const raw = String(rawValue ?? '');
+    const meta = PlayerManager._variableMeta(step);
+    const extract = meta.extract && typeof meta.extract === 'object' ? meta.extract : { mode: 'full' };
+    const mode = String(extract.mode || 'full');
+    if (mode === 'regex') {
+      const pattern = String(extract.pattern || '');
+      const name = PlayerManager._normalizeVariableName(step.value || step.variable_name || step.name);
+      if (!pattern) {
+        throw PlayerManager._variableExtractionError({
+          locale,
+          name,
+          raw,
+          pattern,
+          group: extract.group,
+          status: 'empty_pattern',
+          messageZh: '保存变量失败：正则表达式为空',
+          messageEn: 'Set variable failed: regex pattern is empty',
+          suggestion: trByLocale(locale, '请填写正则表达式，或把抽取方式改为完整值。', 'Enter a regex pattern or switch extraction to full value.'),
+        });
+      }
+      try {
+        PlayerManager._validateRegexSafety(pattern, locale);
+      } catch (err) {
+        throw PlayerManager._variableExtractionError({
+          locale,
+          name,
+          raw,
+          pattern,
+          group: extract.group,
+          status: 'unsafe_regex',
+          messageZh: err?.message || '保存变量失败：正则不安全',
+          messageEn: err?.message || 'Set variable failed: unsafe regex',
+          suggestion: trByLocale(locale, '请增加固定上下文并避免嵌套重复，例如使用 ^订单已提交：(.+)$。', 'Add fixed context and avoid nested repetition, e.g. ^Order submitted: (.+)$.'),
+        });
+      }
+      let re;
+      try {
+        re = new RegExp(pattern);
+      } catch (err) {
+        throw PlayerManager._variableExtractionError({
+          locale,
+          name,
+          raw,
+          pattern,
+          group: extract.group,
+          status: 'invalid_regex',
+          messageZh: `保存变量失败：正则表达式无效（${err?.message || err}）`,
+          messageEn: `Set variable failed: invalid regex (${err?.message || err})`,
+          suggestion: trByLocale(locale, '请检查括号、转义字符和量词写法。', 'Check parentheses, escapes, and quantifiers.'),
+        });
+      }
+      const match = raw.match(re);
+      if (!match) {
+        throw PlayerManager._variableExtractionError({
+          locale,
+          name,
+          raw,
+          pattern,
+          group: extract.group,
+          status: 'not_matched',
+          messageZh: `保存变量失败：原始值未匹配正则 ${pattern}\n  原始值: ${raw}`,
+          messageEn: `Set variable failed: raw value did not match regex ${pattern}\n  Raw value: ${raw}`,
+          suggestion: PlayerManager._suggestVariableRegexFix(raw, pattern, locale),
+        });
+      }
+      const group = Number.isInteger(Number(extract.group)) ? Number(extract.group) : (match.length > 1 ? 1 : 0);
+      if (match[group] == null) {
+        throw PlayerManager._variableExtractionError({
+          locale,
+          name,
+          raw,
+          pattern,
+          group,
+          status: 'group_missing',
+          match,
+          messageZh: `保存变量失败：正则捕获组 ${group} 不存在\n  原始值: ${raw}`,
+          messageEn: `Set variable failed: regex group ${group} does not exist\n  Raw value: ${raw}`,
+          suggestion: trByLocale(locale, `当前匹配只有 ${Math.max(0, match.length - 1)} 个捕获组，请把捕获组改为 ${match.length > 1 ? 1 : 0}。`, `Current match has ${Math.max(0, match.length - 1)} capture groups. Set group to ${match.length > 1 ? 1 : 0}.`),
+        });
+      }
+      return { value: String(match[group]), raw, extract: { mode: 'regex', pattern, group } };
+    }
+    if (mode === 'after_delimiter') {
+      const delimiter = String(extract.delimiter || '');
+      if (!delimiter) {
+        throw new Error(trByLocale(locale, '保存变量失败：分隔符为空', 'Set variable failed: delimiter is empty'));
+      }
+      const index = raw.indexOf(delimiter);
+      if (index < 0) {
+        throw new Error(trByLocale(
+          locale,
+          `保存变量失败：原始值中未找到分隔符 ${delimiter}\n  原始值: ${raw}`,
+          `Set variable failed: delimiter ${delimiter} was not found\n  Raw value: ${raw}`,
+        ));
+      }
+      let value = raw.slice(index + delimiter.length);
+      if (extract.trim !== false) value = value.trim();
+      return { value, raw, extract: { mode: 'after_delimiter', delimiter, trim: extract.trim !== false } };
+    }
+    return { value: raw, raw, extract: { mode: 'full' } };
+  }
+
+  static _variableExtractionError({ locale = 'zh', name = '', raw = '', pattern = '', group = '', status = '', match = null, messageZh = '', messageEn = '', suggestion = '' }) {
+    const err = new Error(trByLocale(locale, messageZh || '保存变量失败：变量抽取失败', messageEn || 'Set variable failed: variable extraction failed'));
+    const groups = Array.isArray(match) ? match.slice(0, 8).map((item) => String(item ?? '')) : [];
+    err.variableExtraction = {
+      variable_name: name,
+      raw_value: PlayerManager._previewRuntimeValue(raw, 1000),
+      pattern,
+      group: Number.isInteger(Number(group)) ? Number(group) : group,
+      match_status: status,
+      matched_text: Array.isArray(match) && match[0] != null ? PlayerManager._previewRuntimeValue(match[0], 500) : '',
+      capture_groups: groups,
+      suggestion,
+    };
+    return err;
+  }
+
+  static _suggestVariableRegexFix(rawValue, pattern, locale = 'zh') {
+    const raw = String(rawValue || '');
+    const sample = raw.length > 80 ? `${raw.slice(0, 80)}…` : raw;
+    if (raw.includes('：')) {
+      const [prefix] = raw.split('：');
+      return trByLocale(locale, `当前原始值包含“${prefix}：”，可尝试使用 ^${prefix}：(.+)$ 并选择捕获组 1。`, `Raw value contains "${prefix}:". Try ^${prefix}:(.+)$ and use capture group 1.`);
+    }
+    if (raw.includes(':')) {
+      const [prefix] = raw.split(':');
+      return trByLocale(locale, `当前原始值包含“${prefix}:”，可尝试使用 ^${prefix}:(.+)$ 并选择捕获组 1。`, `Raw value contains "${prefix}:". Try ^${prefix}:(.+)$ and use capture group 1.`);
+    }
+    return trByLocale(locale, `请根据原始值“${sample}”调整正则，确保正则能匹配并把目标片段放在捕获组中。`, `Adjust the regex for raw value "${sample}", and put the target segment in a capture group.`);
+  }
+
+  static _hasNestedRegexQuantifier(pattern) {
+    const source = String(pattern || '');
+    for (let i = 0; i < source.length; i++) {
+      if (source[i] !== '(' || source[i + 1] === '?') continue;
+      let escaped = false;
+      let depth = 0;
+      let innerHasQuantifier = false;
+      for (let j = i; j < source.length; j++) {
+        const ch = source[j];
+        if (escaped) { escaped = false; continue; }
+        if (ch === '\\') { escaped = true; continue; }
+        if (ch === '(') depth += 1;
+        if (depth > 0 && ['*', '+'].includes(ch)) innerHasQuantifier = true;
+        if (ch === ')') {
+          depth -= 1;
+          if (depth === 0) {
+            const next = source[j + 1] || '';
+            if (innerHasQuantifier && ['*', '+'].includes(next)) return true;
+            if (innerHasQuantifier && next === '{') return true;
+            break;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  static _validateRegexSafety(pattern, locale = 'zh') {
+    const source = String(pattern || '');
+    if (source.length > 300) {
+      throw new Error(trByLocale(locale, '保存变量失败：正则表达式过长，请缩短后再回放', 'Set variable failed: regex pattern is too long'));
+    }
+    if (PlayerManager._hasNestedRegexQuantifier(source)) {
+      throw new Error(trByLocale(locale, '保存变量失败：正则存在嵌套重复结构，可能导致回放卡顿', 'Set variable failed: regex contains nested repetition and may hang playback'));
+    }
+    if (/(?:\.\*){2,}|(?:\.\+){2,}|\[[^\]]*\\s\\S[^\]]*\][*+][*+]?/.test(source)) {
+      throw new Error(trByLocale(locale, '保存变量失败：正则过宽，可能误匹配大段文本', 'Set variable failed: regex is too broad'));
+    }
+  }
+
+  static _appendVariableResolutionToError(message, trace) {
+    const items = Array.isArray(trace)
+      ? trace.filter((item) => item && (
+        item.template !== item.resolved
+        || (Array.isArray(item.missing) && item.missing.length)
+        || (Array.isArray(item.empty) && item.empty.length)
+      ))
+      : [];
+    if (!items.length) return message;
+    const firstEmpty = items.find((item) => Array.isArray(item.empty) && item.empty.length);
+    const firstMissing = items.find((item) => Array.isArray(item.missing) && item.missing.length);
+    const lead = firstMissing
+      ? `变量 {{${firstMissing.missing[0]}}} 未定义，导致本步骤中的变量模板无法解析。`
+      : firstEmpty
+        ? `变量 {{${firstEmpty.empty[0]}}} 当前值为空，可能导致本步骤定位、输入或选择失败。`
+        : '';
+    const lines = items.slice(0, 10).map((item) => (
+      `  - ${item.path}: ${JSON.stringify(item.template)} -> ${JSON.stringify(item.resolved)}${Array.isArray(item.missing) && item.missing.length ? ` (missing: ${item.missing.join(', ')})` : ''}${Array.isArray(item.empty) && item.empty.length ? ` (empty: ${item.empty.join(', ')})` : ''}`
+    ));
+    return `${lead ? `${lead}\n` : ''}${message}\n变量解析:\n${lines.join('\n')}`;
+  }
+
+  static _normalizeVariableName(input) {
+    const raw = String(input || '').trim();
+    if (!raw) return '';
+    const normalized = raw.replace(/[^\w$]+/g, '_').replace(/^_+|_+$/g, '');
+    if (!normalized) return '';
+    return /^[A-Za-z_$]/.test(normalized) ? normalized : `v_${normalized}`;
+  }
+
   static _extractRevealTriggerFromLocatorMeta(locatorMeta) {
     const meta = PlayerManager._parseLocatorMetaObject(locatorMeta);
     const reveal = meta?.context?.reveal;
@@ -2250,7 +3064,94 @@ export class PlayerManager {
             } catch (e2) {}
           }
         }
-        return { ok: true, x: cx, y: cy, via: '${via}', hitOk: hitOk, hit: hitBrief };
+        function normText(v, max) {
+          return String(v || '').replace(/\\s+/g, ' ').trim().slice(0, max || 160);
+        }
+        function pushUnique(arr, v) {
+          var t = normText(v, 180);
+          if (t && arr.indexOf(t) < 0) arr.push(t);
+        }
+        function labelText(node) {
+          var parts = [];
+          try {
+            if (node.labels && node.labels.length) {
+              Array.prototype.forEach.call(node.labels, function(lb){ pushUnique(parts, lb.innerText || lb.textContent); });
+            }
+          } catch (e1) {}
+          try {
+            var ids = node.getAttribute && node.getAttribute('aria-labelledby');
+            if (ids) {
+              ids.split(/\\s+/).forEach(function(id){
+                var n = document.getElementById(id);
+                if (n) pushUnique(parts, n.innerText || n.textContent);
+              });
+            }
+          } catch (e2) {}
+          try { pushUnique(parts, node.getAttribute && node.getAttribute('aria-label')); } catch (e3) {}
+          try {
+            var ownLabel = node.closest && node.closest('label');
+            if (ownLabel) pushUnique(parts, ownLabel.innerText || ownLabel.textContent);
+          } catch (e4) {}
+          try {
+            var formItem = node.closest && node.closest('.ant-form-item,.ivu-form-item,.el-form-item,.form-item,[class*="form-item"],[role="group"],fieldset');
+            if (formItem) {
+              var lab = formItem.querySelector('label,.ant-form-item-label,.ivu-form-item-label,.el-form-item__label,.form-label,[class*="label"]');
+              if (lab) pushUnique(parts, lab.innerText || lab.textContent);
+            }
+          } catch (e5) {}
+          return parts.join(' | ');
+        }
+        function tableContext(node) {
+          try {
+            var row = node.closest && (node.closest('tr') || node.closest('[role="row"]') || node.closest('.el-table__row,.ivu-table-row,.ant-table-row'));
+            if (!row) return '';
+            var cells = row.querySelectorAll(':scope > td, :scope > th, :scope > .ant-table-cell, :scope > .el-table__cell, :scope > [role="gridcell"], :scope > .ivu-table-cell');
+            var parts = [];
+            for (var i = 0; i < cells.length; i++) {
+              var cell = cells[i];
+              if (cell.contains(node)) continue;
+              pushUnique(parts, cell.innerText || cell.textContent);
+            }
+            if (parts.length) return parts.join(' | ');
+            return normText(row.innerText || row.textContent, 180);
+          } catch (e) {
+            return '';
+          }
+        }
+        function describe(node, original) {
+          var targetNode = node || original;
+          var originalNode = original || node;
+          var tag = String((targetNode && targetNode.tagName) || '').toLowerCase();
+          var role = '';
+          var type = '';
+          var stable = '';
+          var texts = [];
+          try { role = String(targetNode.getAttribute && targetNode.getAttribute('role') || ''); } catch (e1) {}
+          try { type = String(targetNode.getAttribute && targetNode.getAttribute('type') || ''); } catch (e2) {}
+          pushUnique(texts, labelText(originalNode));
+          pushUnique(texts, targetNode && targetNode.getAttribute && targetNode.getAttribute('placeholder'));
+          pushUnique(texts, targetNode && targetNode.getAttribute && targetNode.getAttribute('title'));
+          pushUnique(texts, targetNode && targetNode.value && tag !== 'input' ? targetNode.value : '');
+          pushUnique(texts, targetNode && (targetNode.innerText || targetNode.textContent));
+          pushUnique(texts, tableContext(originalNode));
+          try {
+            var stableAttrs = ['data-testid', 'data-test', 'data-qa', 'data-cy', 'name', 'aria-label'];
+            for (var ai = 0; ai < stableAttrs.length; ai++) {
+              var av = targetNode.getAttribute && targetNode.getAttribute(stableAttrs[ai]);
+              if (av) { stable = stableAttrs[ai] + ': ' + normText(av, 120); break; }
+            }
+          } catch (e3) {}
+          return {
+            label: texts[0] || stable || '',
+            text: texts[1] || '',
+            tag: tag,
+            role: role,
+            type: type,
+            stable_attr: stable,
+            via: '${via}',
+          };
+        }
+        return { ok: true, x: cx, y: cy, via: '${via}', hitOk: hitOk, hit: hitBrief, target_summary: describe(target, el) };
       } catch(e) {
         return ${structured ? `{ ok: false, reason: 'lookup_error', message: String(e && e.message || e), via: '${via}' }` : 'null'};
       }
@@ -2322,7 +3223,7 @@ export class PlayerManager {
         }
         metaParts.push(wrap(
           PlayerManager._contextAwarePickExpr(PlayerManager._xpathSnapshotNodesExpr(safeMetaXp), locatorContextJson),
-          'meta-xpath',
+          `meta-${type}`,
         ));
         continue;
       }
@@ -2330,8 +3231,12 @@ export class PlayerManager {
       if (type === 'text_exact' && !skipDisabledCheck) {
         metaParts.push(wrap(
           `(function(){const t=${JSON.stringify(value.trim().replace(/\s+/g, ' '))};` +
-          `for(const e of document.querySelectorAll('li,option,[role="option"],[role="menuitem"],button,a,label,span,div'))` +
-          `{if((e.textContent||'').trim().replace(/\\s+/g,' ')===t)return e;}return null;})()`,
+          `const n=e=>String((e&&e.textContent)||'').trim().replace(/\\s+/g,' ');` +
+          `const owner=e=>e&&e.closest&&e.closest('button,a,label,[role="button"],[role="menuitem"],li,option,[role="option"],.ivu-btn,.ant-btn,.el-button,.arco-btn,.n-button');` +
+          `for(const e of document.querySelectorAll('button,a,label,[role="button"],[role="menuitem"],li,option,[role="option"],.ivu-btn,.ant-btn,.el-button,.arco-btn,.n-button'))` +
+          `{if(n(e)===t)return e;}` +
+          `for(const e of document.querySelectorAll('span,[class*="btn"],[class*="button"]'))` +
+          `{if(n(e)===t)return owner(e)||e;}return null;})()`,
           'meta-text'
         ));
         continue;
@@ -2436,6 +3341,54 @@ export class PlayerManager {
     })()`;
   }
 
+  static _buildVariableValueExpr(selector, xpath) {
+    let safeSel = selector && !/:\w+-of-type\(0\)/.test(selector) ? selector : '';
+    if (PlayerManager._isVolatileRcCss(safeSel)) safeSel = '';
+
+    let safeXp = xpath || '';
+    if (PlayerManager._isVolatileRcXPath(safeXp)) safeXp = '';
+
+    if (safeXp && !safeXp.startsWith('//') && !safeXp.startsWith('/html') && !safeXp.startsWith('/*')) {
+      safeXp = `/${safeXp}`;
+    }
+
+    const cssIsStableId = Boolean(
+      safeSel && /^#[\w-]+$/.test(safeSel) && !PlayerManager._isVolatileRcCss(selector)
+    );
+    const cssFindOne = safeSel
+      ? (cssIsStableId
+        ? `document.querySelector(${JSON.stringify(safeSel)})`
+        : PlayerManager._modalAwareCssPickExpr(safeSel))
+      : null;
+
+    const elParts = [];
+    if (cssIsStableId && cssFindOne) elParts.push(`(${cssFindOne})`);
+    if (safeXp) elParts.push(PlayerManager._xpathSnapshotPickExpr(safeXp));
+    if (!cssIsStableId && cssFindOne) elParts.push(`(${cssFindOne})`);
+    const chain = elParts.length ? elParts.join(' || ') : 'null';
+
+    return `(function(){
+      try {
+        var el = ${chain};
+        if (!el) return { ok: false, err: 'not_found' };
+        var tag = el.tagName && String(el.tagName).toLowerCase() || '';
+        var value = '';
+        if (tag === 'textarea' || tag === 'input' || tag === 'select') {
+          value = el.value != null ? String(el.value) : '';
+        } else if (el.isContentEditable || (el.closest && el.closest('[contenteditable="true"]'))) {
+          var editable = el.isContentEditable ? el : el.closest('[contenteditable="true"]');
+          value = editable && editable.textContent != null ? String(editable.textContent) : '';
+        } else {
+          var text = el.innerText != null ? el.innerText : el.textContent;
+          value = text != null ? String(text) : '';
+        }
+        return { ok: true, value: value };
+      } catch (e) {
+        return { ok: false, err: e && e.message ? String(e.message) : 'error' };
+      }
+    })()`;
+  }
+
   async _waitForDomTextRawCDP(tabId, selector, xpath, timeout = 8000, skipPageErrorCheck = false) {
     let remaining = timeout;
     const wallEnd = Date.now() + PlayerManager.LOADING_WAIT_WALL_MS;
@@ -2450,6 +3403,71 @@ export class PlayerManager {
       if (!loading) remaining -= 400;
     }
     return null;
+  }
+
+  async _waitForVariableValueCDP(tabId, step, timeout = 8000) {
+    let remaining = timeout;
+    const wallEnd = Date.now() + PlayerManager.LOADING_WAIT_WALL_MS;
+    const expr = PlayerManager._buildVariableValueExpr(step.target_selector, step.target_xpath);
+    while (Date.now() < wallEnd && remaining > 0) {
+      await this._throwIfPageError(tabId);
+      const loading = await this._isPageLoadingUi(tabId);
+      const res = await this._cdpSend(tabId, 'Runtime.evaluate', { expression: expr, returnByValue: true });
+      const v = res?.result?.value;
+      if (v && v.ok && typeof v.value === 'string') return v.value;
+      await this._sleep(400);
+      if (!loading) remaining -= 400;
+    }
+    return null;
+  }
+
+  async _executeSetVariableStep(tabId, step, cdpAvailable, locale = 'zh') {
+    const name = PlayerManager._normalizeVariableName(step.value || step.variable_name || step.name);
+    if (!name) {
+      throw new Error(trByLocale(locale, '保存变量失败：变量名为空', 'Set variable failed: variable name is empty'));
+    }
+
+    if (cdpAvailable) {
+      const rawValue = await this._waitForVariableValueCDP(tabId, step, 8000);
+      if (rawValue == null) {
+        const treeDiag = await this._getTreeWaitDiagnosticSuffix(tabId, step.locator_meta);
+        throw new Error(
+          trByLocale(
+            locale,
+            `保存变量失败：找不到目标元素${treeDiag}\n  CSS: ${step.target_selector || '—'}\n  XPath: ${step.target_xpath || '—'}`,
+            `Set variable failed: target element not found\n  CSS: ${step.target_selector || '—'}\n  XPath: ${step.target_xpath || '—'}`,
+          ),
+        );
+      }
+      const extracted = PlayerManager._applyVariableExtraction(rawValue, step, locale);
+      return {
+        name,
+        value: extracted.value,
+        raw_value: extracted.raw,
+        extract: extracted.extract,
+        source: PlayerManager._variableMeta(step).source || '',
+      };
+    }
+
+    const result = await new Promise((resolve) => {
+      chrome.tabs.sendMessage(tabId, { type: 'AT_EXTRACT_VARIABLE', step, locale }, (response) => {
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, error: chrome.runtime.lastError.message });
+          return;
+        }
+        resolve(response);
+      });
+    });
+    if (!result || result.ok !== true) {
+      throw new Error(localizePlaybackError(locale, result?.error || '保存变量失败：页面脚本无有效响应'));
+    }
+    return {
+      name: result.name || name,
+      value: String(result.value ?? ''),
+      raw_value: String(result.raw_value ?? result.value ?? ''),
+      extract: result.extract || PlayerManager._variableMeta(step).extract || { mode: 'full' },
+      source: PlayerManager._variableMeta(step).source || '',
+    };
   }
 
   async _executeAssertJsonStep(tabId, step, testCaseId) {
@@ -2534,8 +3552,9 @@ export class PlayerManager {
   static _resolveAssertionConfig(step, hasLocator = false) {
     const meta = PlayerManager._parseLocatorMetaObject(step?.locator_meta);
     const raw = meta?.assertion && typeof meta.assertion === 'object' ? meta.assertion : {};
-    const target = ['page', 'element', 'error'].includes(String(raw.target || '')) ? String(raw.target) : (hasLocator ? 'element' : 'page');
-    const match = ['contains', 'equals', 'not_contains', 'regex'].includes(String(raw.match || '')) ? String(raw.match) : (hasLocator ? 'equals' : 'contains');
+    const target = ['page', 'element', 'error', 'url'].includes(String(raw.target || '')) ? String(raw.target) : (hasLocator ? 'element' : 'page');
+    const rawMatch = ['contains', 'equals', 'not_contains', 'regex', 'visible'].includes(String(raw.match || '')) ? String(raw.match) : (hasLocator ? 'equals' : 'contains');
+    const match = rawMatch === 'visible' && target !== 'element' ? 'contains' : rawMatch;
     return { target, match };
   }
 
@@ -2552,6 +3571,39 @@ export class PlayerManager {
       }
     }
     return a.includes(e);
+  }
+
+  static _assertionMatchLabel(mode = 'contains') {
+    if (mode === 'equals') return '等于';
+    if (mode === 'not_contains') return '不包含';
+    if (mode === 'regex') return '匹配正则';
+    if (mode === 'visible') return '可见';
+    return '包含';
+  }
+
+  static _assertionTargetLabel(target = 'page') {
+    if (target === 'element') return '指定元素';
+    if (target === 'error') return '错误提示';
+    if (target === 'url') return 'URL';
+    return '整页文本';
+  }
+
+  static _previewAssertionValue(value, max = 500) {
+    const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+    if (!text) return '（空）';
+    return text.length > max ? `${text.slice(0, max)}…` : text;
+  }
+
+  static _formatAssertionFailure({ target, match, expected, actual, css, xpath }) {
+    return [
+      '断言失败：实际值不满足预期',
+      `断言目标: ${PlayerManager._assertionTargetLabel(target)}`,
+      `匹配方式: ${PlayerManager._assertionMatchLabel(match)}`,
+      `期望值: ${PlayerManager._previewAssertionValue(expected)}`,
+      `实际值: ${PlayerManager._previewAssertionValue(actual)}`,
+      `CSS: ${css || '—'}`,
+      `XPath: ${xpath || '—'}`,
+    ].join('\n  ');
   }
 
   async _waitForPageErrorTextCDP(tabId, timeout = 10000) {
@@ -2571,12 +3623,11 @@ export class PlayerManager {
   async _executeAssertTextStepCDP(tabId, step) {
     if (step.wait_before) await this._sleep(step.wait_before);
     const expected = step.value != null ? String(step.value) : '';
-    if (expected.trim() === '') {
-      throw new Error('断言失败：未配置断言文本（「输入值」不能为空或仅空白）');
-    }
-
     const hasLocator = String(step.target_selector || '').trim() !== '' || String(step.target_xpath || '').trim() !== '';
     const assertion = PlayerManager._resolveAssertionConfig(step, hasLocator);
+    if (assertion.match !== 'visible' && expected.trim() === '') {
+      throw new Error('断言失败：未配置断言文本（「输入值」不能为空或仅空白）');
+    }
 
     if (assertion.target === 'error') {
       const actual = await this._waitForPageErrorTextCDP(tabId, 10000);
@@ -2590,7 +3641,42 @@ export class PlayerManager {
         xpath: '',
       });
       if (!hit) {
-        throw new Error(`断言失败：错误提示未满足预期 "${expected.slice(0, 200)}"`);
+        throw new Error(PlayerManager._formatAssertionFailure({
+          target: assertion.target,
+          match: assertion.match,
+          expected,
+          actual,
+          css: '',
+          xpath: '',
+        }));
+      }
+      return;
+    }
+
+    if (assertion.target === 'url') {
+      const res = await this._cdpSend(tabId, 'Runtime.evaluate', {
+        expression: 'String(location.href || "")',
+        returnByValue: true,
+      });
+      const actual = String(res?.result?.value || '');
+      const hit = PlayerManager._matchAssertionText(actual, expected, assertion.match);
+      this._logAssertTextCdpDebug({
+        mode: `url_${assertion.match}`,
+        expected,
+        actual,
+        hit,
+        css: '',
+        xpath: '',
+      });
+      if (!hit) {
+        throw new Error(PlayerManager._formatAssertionFailure({
+          target: assertion.target,
+          match: assertion.match,
+          expected,
+          actual,
+          css: '',
+          xpath: '',
+        }));
       }
       return;
     }
@@ -2603,6 +3689,7 @@ export class PlayerManager {
           `断言失败：找不到目标元素${treeDiag}\n  CSS: ${step.target_selector || '—'}\n  XPath: ${step.target_xpath || '—'}`,
         );
       }
+      if (assertion.match === 'visible') return;
       const hit = PlayerManager._matchAssertionText(actual, expected, assertion.match);
       this._logAssertTextCdpDebug({
         mode: 'element',
@@ -2613,9 +3700,14 @@ export class PlayerManager {
         xpath: step.target_xpath || '',
       });
       if (!hit) {
-        throw new Error(
-          `断言失败：元素内容与「输入值」不一致`,
-        );
+        throw new Error(PlayerManager._formatAssertionFailure({
+          target: assertion.target,
+          match: assertion.match,
+          expected,
+          actual,
+          css: step.target_selector || '',
+          xpath: step.target_xpath || '',
+        }));
       }
       return;
     }
@@ -2641,8 +3733,14 @@ export class PlayerManager {
       xpath: '',
     });
     if (!hit) {
-      const preview = expected.length > 200 ? `${expected.slice(0, 200)}…` : expected;
-      throw new Error(`断言失败：页面中未找到文本 "${preview}"`);
+      throw new Error(PlayerManager._formatAssertionFailure({
+        target: assertion.target,
+        match: assertion.match,
+        expected,
+        actual: pageText,
+        css: '',
+        xpath: '',
+      }));
     }
   }
 
@@ -2757,6 +3855,65 @@ export class PlayerManager {
     return result && result.ok ? result.box : null;
   }
 
+  async _collectRuntimeStepTarget(tabId, step, cdpAvailable) {
+    if (!cdpAvailable || tabId == null || !step) return null;
+    const actionType = String(step.action_type || '').trim().toLowerCase();
+    if (['navigate', 'switch_context', 'scroll', 'wait', 'ai_natural'].includes(actionType)) return null;
+    const hasLocator = String(step.target_selector || '').trim() || String(step.target_xpath || '').trim() || step.locator_meta;
+    if (!hasLocator) return null;
+    const textFallback = ['click', 'double_click', 'right_click', 'hover', 'select'].includes(actionType)
+      ? String(step.value || step.value_text || '')
+      : '';
+    try {
+      const result = await this._getElementBoxResult(
+        tabId,
+        step.target_selector || '',
+        step.target_xpath || '',
+        textFallback,
+        1200,
+        true,
+        step.locator_meta,
+      );
+      const summary = result?.ok && result.box?.target_summary ? result.box.target_summary : null;
+      if (!summary || typeof summary !== 'object') return null;
+      const label = String(summary.label || summary.text || summary.stable_attr || '').trim();
+      if (!label) return null;
+      const via = String(summary.via || '');
+      return {
+        label: PlayerManager._previewRuntimeValue(label, 180),
+        tag: String(summary.tag || ''),
+        role: String(summary.role || ''),
+        type: String(summary.type || ''),
+        via,
+        locator: PlayerManager._previewRuntimeValue(PlayerManager._runtimeLocatorValueForVia(step, via), 500),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  static _runtimeLocatorValueForVia(step, via) {
+    const rawVia = String(via || '').trim();
+    if (!step || !rawVia) return '';
+    if (rawVia === 'css') return String(step.target_selector || '');
+    if (rawVia === 'xpath') return String(step.target_xpath || '');
+    if (rawVia === 'text') return String(step.value || step.value_text || '');
+    if (!rawVia.startsWith('meta-')) return '';
+    const type = rawVia.slice(5);
+    const meta = PlayerManager._parseLocatorMetaObject(step.locator_meta);
+    const candidates = Array.isArray(meta?.candidates) ? meta.candidates : [];
+    if (type === 'xpath') {
+      const xpathCandidate = candidates.find((item) => String(item?.type || '').includes('xpath') && String(item?.value || '').trim());
+      return String(xpathCandidate?.value || step.target_xpath || '');
+    }
+    if (type === 'text') {
+      const textCandidate = candidates.find((item) => String(item?.type || '').startsWith('text_') && String(item?.value || '').trim());
+      return String(textCandidate?.value || step.value || step.value_text || '');
+    }
+    const candidate = candidates.find((item) => String(item?.type || '') === type);
+    return String(candidate?.value || '');
+  }
+
   _formatTreeWaitDiagnostic(tree) {
     if (!tree || typeof tree !== 'object' || !tree.framework || !tree.kind) return '';
     const title = tree.title ? `「${tree.title}」` : '目标节点';
@@ -2852,6 +4009,8 @@ export class PlayerManager {
   async _clickOverlayItem(tabId, step, locale = 'zh', options = {}) {
     const textToFind = step.value || '';
     const hadReveal = options.hadReveal === true;
+    const virtualMeta = PlayerManager._parseLocatorMetaObject(step?.locator_meta)?.context?.virtual_scroll;
+    const hasVirtualContext = virtualMeta && ['maybe', 'true'].includes(String(virtualMeta.hint || ''));
 
     if (hadReveal) {
       const helpers = PlayerManager._customOverlayCollectFnSource();
@@ -2894,7 +4053,11 @@ export class PlayerManager {
       }
     }
 
-    if (!box && (step.target_xpath || step.target_selector)) {
+    if (!box) {
+      box = await this._findVirtualScrollTargetBoxCDP(tabId, step, { overlayOnly: true });
+    }
+
+    if (!box && !hasVirtualContext && (step.target_xpath || step.target_selector)) {
       box = await this._getElementBox(
         tabId,
         step.target_selector || '',
@@ -2930,6 +4093,171 @@ export class PlayerManager {
     }
 
     return box;
+  }
+
+  async _findVirtualScrollTargetBoxCDP(tabId, step, options = {}) {
+    const meta = PlayerManager._parseLocatorMetaObject(step?.locator_meta);
+    const vs = meta?.context?.virtual_scroll;
+    if (!vs || !['maybe', 'true'].includes(String(vs.hint || ''))) return null;
+    const text = String(step?.value || vs.item_text || vs.option_text || '').replace(/\s+/g, ' ').trim();
+    if (!text) return null;
+    const payload = JSON.stringify({
+      text,
+      virtual_scroll: vs,
+      overlayOnly: options.overlayOnly === true,
+    });
+    return this._cdpSend(tabId, 'Runtime.evaluate', {
+      expression: `(() => {
+        const payload = ${payload};
+        const needle = String(payload.text || '').replace(/\\s+/g, ' ').trim();
+        const ctx = payload.virtual_scroll || {};
+        const overlayOnly = payload.overlayOnly === true;
+        if (!needle) return null;
+
+        const overlaySel = ${JSON.stringify(PlayerManager.OVERLAY_CONTAINER_SEL)};
+        const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim();
+        const byXpath = (xp) => {
+          if (!xp) return null;
+          try { return document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue; } catch (e) { return null; }
+        };
+        const visible = (el) => {
+          if (!el || !el.getBoundingClientRect) return false;
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          const st = window.getComputedStyle(el);
+          return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity || 1) > 0.02;
+        };
+        const isScrollable = (el) => {
+          if (!visible(el)) return false;
+          const st = window.getComputedStyle(el);
+          const overflow = [st.overflow, st.overflowY, st.overflowX].join(' ');
+          return /(auto|scroll|overlay)/i.test(overflow)
+            && ((el.scrollHeight - el.clientHeight > 2) || (el.scrollWidth - el.clientWidth > 2));
+        };
+        const zIndex = (el) => {
+          let z = 0, cur = el;
+          while (cur && cur !== document.body) {
+            const zi = parseInt(window.getComputedStyle(cur).zIndex, 10);
+            if (!isNaN(zi) && zi > z) z = zi;
+            cur = cur.parentElement;
+          }
+          return z;
+        };
+        const itemSelector = [
+          'li',
+          '[role="option"]',
+          '[role="row"]',
+          '[role="treeitem"]',
+          '[role="menuitem"]',
+          'tr',
+          '[data-index]',
+          '[aria-rowindex]',
+          '.ant-select-item',
+          '.ant-select-item-option',
+          '.ant-select-item-option-content',
+          '.el-select-dropdown__item',
+          '.el-option',
+          '.ivu-select-item',
+          '[class*="virtual"]',
+          '[class*="row"]',
+          '[class*="item"]'
+        ].join(',');
+        const itemText = (el) => {
+          try {
+            const title = el.querySelector && el.querySelector('.truncate, [class*="font-medium"]');
+            const titleText = norm(title && (title.innerText || title.textContent));
+            if (titleText) return titleText;
+          } catch (e) {}
+          return norm(el.innerText || el.textContent || '');
+        };
+        const clickableFor = (item) => {
+          if (!item) return null;
+          if (item.matches && item.matches('button,a,[role="button"],input[type="button"],input[type="submit"],li,[role="option"],[role="menuitem"],.ant-select-item,.el-select-dropdown__item,.el-option,.ivu-select-item')) return item;
+          return item.querySelector && (item.querySelector('button,a,[role="button"],input[type="button"],input[type="submit"]') || item);
+        };
+        const boxFor = (el) => {
+          if (!el) return null;
+          try { el.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' }); } catch (e) {}
+          const r = el.getBoundingClientRect();
+          if (!r || r.width <= 0 || r.height <= 0) return null;
+          const x = r.left + r.width / 2;
+          const y = r.top + r.height / 2;
+          const hit = document.elementFromPoint(x, y);
+          let hitOk = false;
+          let cur = hit;
+          while (cur) {
+            if (cur === el) { hitOk = true; break; }
+            cur = cur.parentElement;
+          }
+          return { x, y, width: r.width, height: r.height, via: 'virtual-scroll-text', hitOk };
+        };
+        const findIn = (container) => {
+          const rows = Array.from(container.querySelectorAll(itemSelector)).filter(visible);
+          const exact = rows.find((row) => itemText(row) === needle);
+          const partial = exact ? null : rows.find((row) => {
+            const text = itemText(row);
+            return needle.length >= 1 && text.includes(needle);
+          });
+          const row = exact || partial;
+          return row ? boxFor(clickableFor(row)) : null;
+        };
+        const looksVirtual = (container) => {
+          if (!container) return false;
+          if (String(ctx.hint || '') === 'true') return true;
+          const cls = norm([container.className, container.parentElement && container.parentElement.className, container.firstElementChild && container.firstElementChild.className].join(' ')).toLowerCase();
+          if (/virtual|virtual-list|virtual-scroll|rc-virtual-list|cdk-virtual|v-virtual/.test(cls)) return true;
+          const rows = Array.from(container.querySelectorAll(itemSelector)).filter(visible);
+          const ratio = container.clientHeight > 0 ? container.scrollHeight / container.clientHeight : 1;
+          return ratio > 2.2 && rows.length > 0 && rows.length <= 80;
+        };
+
+        const candidates = [];
+        const add = (el) => {
+          if (!el || candidates.includes(el)) return;
+          if (isScrollable(el)) candidates.push(el);
+        };
+        if (ctx.container_selector) {
+          try { add(document.querySelector(ctx.container_selector)); } catch (e) {}
+        }
+        add(byXpath(ctx.container_xpath));
+        if (overlayOnly) {
+          const overlays = Array.from(document.querySelectorAll(overlaySel)).filter(visible).sort((a, b) => zIndex(b) - zIndex(a));
+          for (const overlay of overlays) {
+            add(overlay);
+            Array.from(overlay.querySelectorAll('*')).forEach(add);
+          }
+        } else {
+          Array.from(document.querySelectorAll('*')).forEach(add);
+        }
+        const filtered = candidates.filter(looksVirtual);
+        const searchTargets = filtered.length ? filtered : candidates.filter((el) => String(ctx.hint || '') === 'maybe' && isScrollable(el));
+        for (const container of searchTargets.slice(0, 8)) {
+          const originalTop = container.scrollTop;
+          const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+          const recordedTop = Number(ctx.scroll_top);
+          const stepSize = Math.max(40, Math.floor((container.clientHeight || 160) * 0.82));
+          const positions = [];
+          const pushPos = (v) => {
+            if (!Number.isFinite(v)) return;
+            const n = Math.max(0, Math.min(maxTop, Math.round(v)));
+            if (!positions.includes(n)) positions.push(n);
+          };
+          pushPos(recordedTop);
+          pushPos(originalTop);
+          pushPos(0);
+          for (let p = 0; p <= maxTop && positions.length < 16; p += stepSize) pushPos(p);
+          pushPos(maxTop);
+          for (const pos of positions) {
+            container.scrollTop = pos;
+            try { container.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (e) {}
+            const found = findIn(container);
+            if (found) return found;
+          }
+        }
+        return null;
+      })()`,
+      returnByValue: true,
+    }).then(r => r?.result?.value || null).catch(() => null);
   }
 
   // 执行一次 CDP 鼠标点击（完整序列：move→press→release）
@@ -3434,6 +4762,19 @@ export class PlayerManager {
         function normText(s) {
           return String(s || '').trim().replace(/\\s+/g, ' ').slice(0, 500);
         }
+        function findTextSignal(source, keywords) {
+          var raw = String(source || '');
+          var lower = raw.toLowerCase();
+          for (var si = 0; si < keywords.length; si++) {
+            var kw = String(keywords[si] || '');
+            if (!kw) continue;
+            var idx = lower.indexOf(kw.toLowerCase());
+            if (idx < 0) continue;
+            var snippet = raw.slice(Math.max(0, idx - 80), Math.min(raw.length, idx + kw.length + 140)).replace(/\\s+/g, ' ').trim();
+            return { hit: true, keyword: kw, snippet: snippet };
+          }
+          return null;
+        }
         function isVisible(el) {
           if (!el) return false;
           var r = el.getBoundingClientRect();
@@ -3511,6 +4852,77 @@ export class PlayerManager {
             pageErrorSignal = { keyword: '[overlay-error]', snippet: errorOverlays[0].text };
           }
         } catch (eSignal) {}
+        var sessionStateSignal = null;
+        try {
+          var href = String(location.href || '');
+          var lowerHref = href.toLowerCase();
+          var loweredText = String(text || '').toLowerCase();
+          var hasPassword = Boolean(document.querySelector('input[type="password"]'));
+          var loginUrlHit = /(^|[/?#&])(login|signin|sign-in|auth|sso|cas|oauth|passport)([/?#&=]|$)/i.test(lowerHref)
+            || /(^|[/?#&])user\\/login([/?#&=]|$)/i.test(lowerHref);
+          var loginButtonHit = false;
+          var buttons = document.querySelectorAll('button,input[type="submit"],a,[role="button"]');
+          for (var b = 0; b < Math.min(buttons.length, 100); b++) {
+            var btnText = String(buttons[b].innerText || buttons[b].value || buttons[b].getAttribute('aria-label') || '').trim().toLowerCase();
+            if (/^(登录|登陆|log in|login|sign in|signin)$/.test(btnText)) {
+              loginButtonHit = true;
+              break;
+            }
+          }
+          var titleText = String(document.title || '').trim();
+          var headingText = '';
+          var headings = document.querySelectorAll('h1,h2,h3,[role="heading"],form legend,form [class*="title"],form [class*="header"]');
+          for (var h = 0; h < Math.min(headings.length, 30); h++) {
+            headingText += ' ' + String(headings[h].innerText || headings[h].textContent || '').trim();
+          }
+          var loginPageTextHit = /(登录|登陆|用户登录|账号登录|密码登录|sign in|log in|login)/i.test(titleText + ' ' + headingText);
+          var unauthorizedMatch = loweredText.match(/unauthorized|forbidden|session expired|please sign in|please log in|登录已失效|请先登录|未登录|无权限|会话过期|登录超时|登录过期/i);
+          var unauthorizedHit = Boolean(unauthorizedMatch);
+          var passwordLoginFormHit = hasPassword && (loginButtonHit || loginPageTextHit);
+          var loggedOut = loginUrlHit || unauthorizedHit || passwordLoginFormHit;
+          var loggedInTextHit = /(退出登录|用户中心|个人中心|工作台|项目管理|测试用例|执行计划|dashboard|logout|sign out|profile|workspace|projects)/i.test(titleText + ' ' + text);
+          var loggedInUrlHit = !loginUrlHit && /(dashboard|workspace|project|console|home|admin|case|testcase|plan)/i.test(lowerHref);
+          var loggedIn = !loggedOut && (loggedInTextHit || loggedInUrlHit);
+          var snippet = '';
+          if (unauthorizedMatch && unauthorizedMatch.index != null) {
+            snippet = String(text || '').slice(Math.max(0, unauthorizedMatch.index - 60), Math.min(String(text || '').length, unauthorizedMatch.index + String(unauthorizedMatch[0]).length + 140)).replace(/\\s+/g, ' ').trim();
+          } else if (loginPageTextHit) {
+            snippet = String(titleText + ' ' + headingText).replace(/\\s+/g, ' ').trim().slice(0, 240);
+          } else if (loggedInTextHit) {
+            snippet = String(titleText + ' ' + text).replace(/\\s+/g, ' ').trim().slice(0, 240);
+          }
+          sessionStateSignal = {
+            logged_out: loggedOut,
+            logged_in: loggedIn,
+            href: href,
+            snippet: snippet,
+            signals: { hasPassword: hasPassword, loginUrlHit: loginUrlHit, loginButtonHit: loginButtonHit, loginPageTextHit: loginPageTextHit, unauthorizedHit: unauthorizedHit, passwordLoginFormHit: passwordLoginFormHit, loggedInTextHit: loggedInTextHit, loggedInUrlHit: loggedInUrlHit }
+          };
+        } catch (eSession) {}
+        var overlayText = errorOverlays.map(function(item) { return item && item.text ? item.text : ''; }).join(' ');
+        var permissionSignal = null;
+        var emptyStateSignal = null;
+        var businessErrorSignal = null;
+        var pageStateSignal = null;
+        try {
+          var signalText = [String(document.title || ''), String(text || ''), overlayText].join(' ');
+          permissionSignal = findTextSignal(signalText, [
+            '无权限', '权限不足', '没有权限', '访问被拒绝', '未授权',
+            'forbidden', 'permission denied', 'access denied', 'not authorized', 'not authorised', '403'
+          ]);
+          emptyStateSignal = findTextSignal(signalText, [
+            '无匹配数据', '暂无数据', '没有数据', '未查询到', '查询为空', '列表为空',
+            'no data', 'no results', 'no matching data', 'not found in list', 'option not found'
+          ]);
+          businessErrorSignal = findTextSignal([overlayText, pageErrorSignal && pageErrorSignal.snippet].join(' '), [
+            '保存失败', '提交失败', '创建失败', '删除失败', '操作失败', '执行失败',
+            '校验失败', '验证失败', '名称重复', '已存在',
+            'failed to save', 'save failed', 'submit failed', 'operation failed', 'already exists', 'duplicate'
+          ]);
+          pageStateSignal = findTextSignal(signalText, [
+            '页面不存在', '资源不存在', '404', 'not found', 'not available', 'state mismatch'
+          ]);
+        } catch (eSignals) {}
         var resources = [];
         try {
           var entries = performance.getEntriesByType('resource');
@@ -3528,6 +4940,11 @@ export class PlayerManager {
           body_text_excerpt: text.slice(0, 8000),
           error_overlays: errorOverlays,
           page_error_signal: pageErrorSignal,
+          session_state_signal: sessionStateSignal,
+          permission_signal: permissionSignal,
+          empty_state_signal: emptyStateSignal,
+          business_error_signal: businessErrorSignal,
+          page_state_signal: pageStateSignal,
           failed_requests_hint: resources
         });
       } catch (e) {
@@ -3660,6 +5077,497 @@ export class PlayerManager {
     return structure;
   }
 
+  static _cleanAiVisionSelector(value) {
+    return String(value || '')
+      .trim()
+      .replace(/^[`"'“”‘’]+|[`"'“”‘’]+$/g, '')
+      .replace(/[，,；;。]+$/g, '')
+      .trim();
+  }
+
+  static _readAiVisionSelectorByLabel(text, labels) {
+    for (const label of labels) {
+      const re = new RegExp(`${label}\\s*(?:selector|选择器)?\\s*[:：=]\\s*([^\\n,，;；]+)`, 'i');
+      const m = String(text || '').match(re);
+      if (m?.[1]) return PlayerManager._cleanAiVisionSelector(m[1]);
+    }
+    return '';
+  }
+
+  static _readAiVisionSelectorAfter(text, phrases) {
+    for (const phrase of phrases) {
+      const re = new RegExp(`${phrase}\\s*[「\\[\\(（'"\`“”‘’]?\\s*([^\\s，,；;」\\]\\)）'"\`“”‘’]+)`, 'i');
+      const m = String(text || '').match(re);
+      if (m?.[1]) return PlayerManager._cleanAiVisionSelector(m[1]);
+    }
+    return '';
+  }
+
+  static _looksLikeSelector(value) {
+    const s = String(value || '').trim();
+    if (!s) return false;
+    if (s.startsWith('#') || s.startsWith('.') || s.startsWith('[')) return true;
+    if (s.startsWith('//') || s.startsWith('/html') || s.startsWith('(')) return true;
+    if (/[>:[\]#.=~*+]/.test(s) && /^[a-zA-Z_*][\w-]*/.test(s)) return true;
+    return false;
+  }
+
+  static _normalizeAiVisionSelector(value) {
+    const selector = PlayerManager._cleanAiVisionSelector(value);
+    return PlayerManager._looksLikeSelector(selector) ? selector : '';
+  }
+
+  static _parseAiVisionInstruction(instruction) {
+    const text = String(instruction || '').trim();
+    if (!/(验证码|图片识别|识别.{0,12}图片|ocr|captcha|vision)/i.test(text)) return null;
+
+    const imageSelector =
+      PlayerManager._normalizeAiVisionSelector(PlayerManager._readAiVisionSelectorByLabel(text, ['image', 'img', 'captcha', '图片', '验证码'])) ||
+      PlayerManager._normalizeAiVisionSelector(PlayerManager._readAiVisionSelectorAfter(text, ['识别图片', '识别验证码图片', '识别验证码', '识别', 'ocr', 'captcha']));
+    const inputSelector =
+      PlayerManager._normalizeAiVisionSelector(PlayerManager._readAiVisionSelectorByLabel(text, ['input', 'field', 'target', '输入框', '验证码输入框'])) ||
+      PlayerManager._normalizeAiVisionSelector(PlayerManager._readAiVisionSelectorAfter(text, ['输入到', '填入到', '填入', '写入到', '写入']));
+    const submitSelector =
+      PlayerManager._normalizeAiVisionSelector(PlayerManager._readAiVisionSelectorByLabel(text, ['submit', 'button', 'login', '提交按钮', '登录按钮'])) ||
+      PlayerManager._normalizeAiVisionSelector(PlayerManager._readAiVisionSelectorAfter(text, ['然后点击', '并点击', '点击']));
+
+    const promptMatch = text.match(/(?:prompt|提示词|识别要求)\s*[:：=]\s*([\s\S]+)$/i);
+    const prompt = promptMatch?.[1]
+      ? PlayerManager._cleanAiVisionSelector(promptMatch[1])
+      : '请识别图片中的验证码内容。只返回验证码字符或算术结果，不要解释，不要添加标点。如果无法识别，请只返回 UNKNOWN。';
+    return {
+      imageSelector,
+      inputSelector,
+      submitSelector,
+      autoDetect: !imageSelector || !inputSelector,
+      autoSubmit: !submitSelector && /(登录|登陆|提交|sign\s*in|log\s*in|submit)/i.test(text),
+      prompt,
+    };
+  }
+
+  static _selectorKind(selector) {
+    const s = String(selector || '').trim();
+    if (s.startsWith('//') || s.startsWith('/html') || s.startsWith('(')) return 'xpath';
+    return 'css';
+  }
+
+  async _detectAiVisionTargets(tabId) {
+    const expr = `(function(){
+      var captchaRe = /(captcha|verify|verification|checkcode|validcode|authcode|code|验证码|校验码|图形码|图片码)/i;
+      var loginRe = /(login|log in|sign in|submit|登录|登陆|提交|进入)/i;
+      function arr(list) { return Array.prototype.slice.call(list || []); }
+      function norm(s) { return String(s || '').replace(/\\s+/g, ' ').trim(); }
+      function cssEscape(s) {
+        if (window.CSS && CSS.escape) return CSS.escape(String(s));
+        return String(s).replace(/[^a-zA-Z0-9_-]/g, function(ch){ return '\\\\' + ch; });
+      }
+      function visible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        var r = el.getBoundingClientRect();
+        if (r.width < 4 || r.height < 4) return false;
+        var cur = el;
+        while (cur && cur.nodeType === 1) {
+          var st = window.getComputedStyle(cur);
+          if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) < 0.03) return false;
+          if (cur.getAttribute && cur.getAttribute('aria-hidden') === 'true') return false;
+          cur = cur.parentElement;
+        }
+        return true;
+      }
+      function selector(el) {
+        if (!el || el.nodeType !== 1) return '';
+        if (el.id) return '#' + cssEscape(el.id);
+        var testid = el.getAttribute && (el.getAttribute('data-testid') || el.getAttribute('data-test') || el.getAttribute('data-cy'));
+        if (testid) return '[' + (el.getAttribute('data-testid') ? 'data-testid' : el.getAttribute('data-test') ? 'data-test' : 'data-cy') + '="' + String(testid).replace(/"/g, '\\\\"') + '"]';
+        var name = el.getAttribute && el.getAttribute('name');
+        var tag = String(el.tagName || '').toLowerCase();
+        if (name && /^(input|textarea|select|button|img)$/i.test(tag)) return tag + '[name="' + String(name).replace(/"/g, '\\\\"') + '"]';
+        var parts = [];
+        var cur = el;
+        while (cur && cur.nodeType === 1 && cur !== document.body && parts.length < 5) {
+          var curTag = String(cur.tagName || '').toLowerCase();
+          var part = curTag;
+          if (cur.classList && cur.classList.length) {
+            var stable = arr(cur.classList).filter(function(c){ return c && !/\\d{3,}|css-|hash|active|focus|hover|selected|open|loading/i.test(c); }).slice(0, 2);
+            if (stable.length) part += '.' + stable.map(cssEscape).join('.');
+          }
+          if (cur.parentElement) {
+            var siblings = arr(cur.parentElement.children).filter(function(n){ return n.tagName === cur.tagName; });
+            if (siblings.length > 1) part += ':nth-of-type(' + (siblings.indexOf(cur) + 1) + ')';
+          }
+          parts.unshift(part);
+          cur = cur.parentElement;
+        }
+        return parts.join(' > ');
+      }
+      function attrs(el) {
+        if (!el || !el.getAttribute) return '';
+        return norm([
+          el.id,
+          el.className,
+          el.getAttribute('name'),
+          el.getAttribute('alt'),
+          el.getAttribute('title'),
+          el.getAttribute('aria-label'),
+          el.getAttribute('placeholder'),
+          el.getAttribute('src'),
+          el.getAttribute('type'),
+          el.getAttribute('inputmode')
+        ].join(' '));
+      }
+      function nearText(el) {
+        var parts = [];
+        function push(v) {
+          var t = norm(v);
+          if (t && parts.indexOf(t) < 0) parts.push(t);
+        }
+        try {
+          push(el.getAttribute && el.getAttribute('aria-label'));
+          var label = el.closest && el.closest('label');
+          push(label && label.innerText);
+          if (el.id) {
+            arr(document.querySelectorAll('label[for="' + cssEscape(el.id) + '"]')).forEach(function(l){ push(l.innerText); });
+          }
+          var box = el.closest && el.closest('.field,.form-item,.ivu-form-item,.el-form-item,.ant-form-item,[class*="form-item"],[class*="field"],td,th');
+          push(box && box.innerText);
+          var p = el.parentElement;
+          for (var i = 0; p && i < 2; i++, p = p.parentElement) push(p.innerText);
+        } catch (e) {}
+        return norm(parts.join(' ')).slice(0, 500);
+      }
+      function rect(el) {
+        var r = el.getBoundingClientRect();
+        return { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) };
+      }
+      function distance(a, b) {
+        var ar = a.getBoundingClientRect();
+        var br = b.getBoundingClientRect();
+        var ax = ar.left + ar.width / 2;
+        var ay = ar.top + ar.height / 2;
+        var bx = br.left + br.width / 2;
+        var by = br.top + br.height / 2;
+        return Math.sqrt(Math.pow(ax - bx, 2) + Math.pow(ay - by, 2));
+      }
+      function containerScore(root) {
+        var score = 0;
+        var text = norm(root.innerText || root.textContent || '');
+        if (root.querySelector('input[type="password"]')) score += 45;
+        if (loginRe.test(text)) score += 25;
+        if (captchaRe.test(text)) score += 35;
+        if (root.matches && root.matches('form')) score += 15;
+        return score;
+      }
+      function imageScore(el) {
+        var r = el.getBoundingClientRect();
+        var score = 0;
+        var a = attrs(el);
+        var n = nearText(el);
+        if (captchaRe.test(a)) score += 90;
+        if (captchaRe.test(n)) score += 55;
+        if (r.width >= 50 && r.width <= 260 && r.height >= 20 && r.height <= 110) score += 30;
+        if (/^(img|canvas|svg)$/i.test(el.tagName || '')) score += 12;
+        if (String(el.getAttribute && el.getAttribute('src') || '').startsWith('data:image')) score += 10;
+        return score;
+      }
+      function inputScore(el) {
+        var score = 0;
+        var a = attrs(el);
+        var n = nearText(el);
+        var max = Number(el.getAttribute && el.getAttribute('maxlength'));
+        var type = String(el.getAttribute && el.getAttribute('type') || '').toLowerCase();
+        if (type === 'hidden' || type === 'password') return -999;
+        if (captchaRe.test(a)) score += 95;
+        if (captchaRe.test(n)) score += 60;
+        if (max >= 4 && max <= 8) score += 20;
+        if (/numeric|decimal|tel/i.test(String(el.getAttribute && el.getAttribute('inputmode') || ''))) score += 12;
+        return score;
+      }
+      function submitScore(el) {
+        var text = norm(el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '');
+        var score = loginRe.test(text) ? 80 : 0;
+        if (String(el.getAttribute && el.getAttribute('type') || '').toLowerCase() === 'submit') score += 15;
+        return score;
+      }
+      function bestIn(root, query, scorer, minScore) {
+        return arr(root.querySelectorAll(query))
+          .filter(visible)
+          .map(function(el){ return { el: el, score: scorer(el), selector: selector(el), rect: rect(el), text: norm((el.innerText || el.value || el.getAttribute('alt') || el.getAttribute('placeholder') || '').slice(0, 80)) }; })
+          .filter(function(c){ return c.selector && c.score >= minScore; })
+          .sort(function(a, b){ return b.score - a.score; });
+      }
+      var roots = arr(document.querySelectorAll('form,[role="dialog"],[role="alertdialog"],.ant-modal,.ivu-modal,.el-dialog,.login-card,.auth-captcha-lab,[class*="login"],[class*="Login"],[class*="auth"],[class*="Auth"]'))
+        .filter(visible);
+      roots.push(document.body);
+      roots = roots
+        .map(function(root){ return { root: root, score: containerScore(root), selector: selector(root) || 'body' }; })
+        .sort(function(a, b){ return b.score - a.score; })
+        .slice(0, 8);
+      var best = null;
+      var debug = [];
+      roots.forEach(function(item){
+        var root = item.root;
+        var images = bestIn(root, 'img,canvas,svg,[style*="background-image"]', imageScore, 55).slice(0, 5);
+        var inputs = bestIn(root, 'input,textarea', inputScore, 55).slice(0, 5);
+        var submits = bestIn(root, 'button,input[type="submit"],input[type="button"],[role="button"]', submitScore, 30).slice(0, 3);
+        debug.push({
+          root: item.selector,
+          root_score: item.score,
+          images: images.map(function(c){ return { selector: c.selector, score: c.score, rect: c.rect, text: c.text }; }),
+          inputs: inputs.map(function(c){ return { selector: c.selector, score: c.score, rect: c.rect, text: c.text }; }),
+          submits: submits.map(function(c){ return { selector: c.selector, score: c.score, text: c.text }; })
+        });
+        images.forEach(function(img){
+          inputs.forEach(function(input){
+            var d = distance(img.el, input.el);
+            var pairScore = item.score + img.score + input.score + (d < 260 ? 35 : d < 520 ? 15 : 0);
+            var submit = submits[0] || null;
+            if (!best || pairScore > best.score) {
+              best = { image: img, input: input, submit: submit, score: pairScore, root_score: item.score };
+            }
+          });
+        });
+      });
+      if (!best || best.score < 190) {
+        return { ok: false, reason: 'low_confidence', debug: debug.slice(0, 5) };
+      }
+      return {
+        ok: true,
+        imageSelector: best.image.selector,
+        inputSelector: best.input.selector,
+        submitSelector: best.submit ? best.submit.selector : '',
+        confidence: Math.min(0.99, Math.round(best.score) / 300),
+        score: Math.round(best.score),
+        debug: debug.slice(0, 5)
+      };
+    })()`;
+    const res = await this._cdpSend(tabId, 'Runtime.evaluate', { expression: expr, returnByValue: true });
+    const out = res?.result?.value;
+    if (!out?.ok) {
+      const err = new Error('AI 图片识别：未能自动识别验证码图片和输入框，请在指令中指定 image/input 选择器');
+      err.autoDetectDebug = out?.debug || [];
+      throw err;
+    }
+    return out;
+  }
+
+  async _getElementRectBySelector(tabId, selector) {
+    const kind = PlayerManager._selectorKind(selector);
+    const expr = `(function(){
+      var selector = ${JSON.stringify(selector)};
+      var kind = ${JSON.stringify(kind)};
+      function q(s) { try { return document.querySelector(s); } catch(e) { return null; } }
+      function x(p) {
+        try { return document.evaluate(p, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue; }
+        catch(e) { return null; }
+      }
+      function rectUsable(r) {
+        return r && r.width >= 1 && r.height >= 1;
+      }
+      function rectInViewport(r) {
+        return rectUsable(r)
+          && r.top >= 0
+          && r.left >= 0
+          && r.bottom <= window.innerHeight
+          && r.right <= window.innerWidth;
+      }
+      var el = kind === 'xpath' ? x(selector) : q(selector);
+      if (!el) return { ok: false, reason: 'not_found' };
+      var r = el.getBoundingClientRect();
+      if (!rectInViewport(r)) {
+        try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch(e) { el.scrollIntoView(); }
+        r = el.getBoundingClientRect();
+      }
+      if (!rectUsable(r)) return { ok: false, reason: 'invisible' };
+      var pad = 3;
+      var x0 = Math.max(0, r.left - pad);
+      var y0 = Math.max(0, r.top - pad);
+      var x1 = Math.min(window.innerWidth, r.right + pad);
+      var y1 = Math.min(window.innerHeight, r.bottom + pad);
+      return {
+        ok: true,
+        x: x0,
+        y: y0,
+        width: Math.max(1, x1 - x0),
+        height: Math.max(1, y1 - y0),
+        centerX: r.left + r.width / 2,
+        centerY: r.top + r.height / 2
+      };
+    })()`;
+    const res = await this._cdpSend(tabId, 'Runtime.evaluate', { expression: expr, returnByValue: true });
+    const out = res?.result?.value;
+    if (!out?.ok) throw new Error(`AI 图片识别：找不到图片元素 ${selector}（${out?.reason || 'unknown'}）`);
+    return out;
+  }
+
+  async _captureElementImageDataUrl(tabId, selector) {
+    const rect = await this._getElementRectBySelector(tabId, selector);
+    const res = await this._cdpSend(tabId, 'Page.captureScreenshot', {
+      format: 'png',
+      fromSurface: true,
+      clip: {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        scale: 1,
+      },
+    });
+    if (!res?.data) throw new Error(`AI 图片识别：验证码截图失败 ${selector}`);
+    return `data:image/png;base64,${res.data}`;
+  }
+
+  async _clickBySelectorCDP(tabId, selector) {
+    const rect = await this._getElementRectBySelector(tabId, selector);
+    await this._cdpClick(tabId, rect.centerX, rect.centerY);
+  }
+
+  async _executeAiVisionStep(tabId, task, ctx, meta = {}) {
+    const stepIndex = meta.stepIndex ?? '?';
+    const stepTotal = meta.stepTotal ?? '?';
+    const tcid = ctx.testCaseId ?? '?';
+    const subtasks = [];
+    const fail = (message) => {
+      const err = new Error(message);
+      err.aiSubtasks = subtasks;
+      throw err;
+    };
+
+    const nextIndex = () => subtasks.length + 1;
+    const resolvedTask = { ...task };
+    if (resolvedTask.autoDetect || !resolvedTask.imageSelector || !resolvedTask.inputSelector || (resolvedTask.autoSubmit && !resolvedTask.submitSelector)) {
+      try {
+        this._notifyPopup(`#${tcid} 第 ${stepIndex}/${stepTotal} 步 · 正在自动识别验证码区域…`);
+        const detected = await this._detectAiVisionTargets(tabId);
+        if (!resolvedTask.imageSelector) resolvedTask.imageSelector = detected.imageSelector;
+        if (!resolvedTask.inputSelector) resolvedTask.inputSelector = detected.inputSelector;
+        if (!resolvedTask.submitSelector && resolvedTask.autoSubmit) resolvedTask.submitSelector = detected.submitSelector || '';
+        subtasks.push({
+          index: nextIndex(),
+          instruction: '自动识别验证码图片、输入框和提交按钮',
+          status: 'success',
+          reason: `图片 ${resolvedTask.imageSelector}，输入框 ${resolvedTask.inputSelector}${resolvedTask.submitSelector ? `，提交 ${resolvedTask.submitSelector}` : ''}`,
+          operations_count: 1,
+        });
+      } catch (e) {
+        subtasks.push({
+          index: nextIndex(),
+          instruction: '自动识别验证码图片、输入框和提交按钮',
+          status: 'failed',
+          error_message: e?.message || String(e),
+          operations_count: 1,
+        });
+        fail(e?.message || 'AI 图片识别：自动识别验证码区域失败');
+      }
+    }
+
+    if (!resolvedTask.imageSelector || !resolvedTask.inputSelector) {
+      fail('AI 图片识别：缺少验证码图片或输入框选择器，请使用 image/input 显式指定');
+    }
+
+    let image = '';
+    let text = '';
+    try {
+      this._notifyPopup(`#${tcid} 第 ${stepIndex}/${stepTotal} 步 · 正在截取验证码图片…`);
+      image = await this._captureElementImageDataUrl(tabId, resolvedTask.imageSelector);
+      subtasks.push({
+        index: nextIndex(),
+        instruction: `截取验证码图片 ${resolvedTask.imageSelector}`,
+        status: 'success',
+        reason: '已截取目标图片区域',
+        operations_count: 1,
+      });
+    } catch (e) {
+      subtasks.push({
+        index: nextIndex(),
+        instruction: `截取验证码图片 ${resolvedTask.imageSelector}`,
+        status: 'failed',
+        error_message: e?.message || String(e),
+        operations_count: 1,
+      });
+      fail(e?.message || 'AI 图片识别：验证码截图失败');
+    }
+
+    try {
+      this._notifyPopup(`#${tcid} 第 ${stepIndex}/${stepTotal} 步 · 正在识别图片…`);
+      const res = await this.api.aiVisionRecognize(
+        { image, prompt: task.prompt, mode: 'captcha' },
+        { timeoutMs: 60000 },
+      );
+      text = String(res?.data?.text || '').trim();
+      if (!text || /^unknown$/i.test(text)) {
+        throw new Error('AI 图片识别：模型未能识别出验证码');
+      }
+      subtasks.push({
+        index: nextIndex(),
+        instruction: '识别验证码图片文本',
+        status: 'success',
+        reason: `识别结果：${text}`,
+        operations_count: 1,
+      });
+    } catch (e) {
+      subtasks.push({
+        index: nextIndex(),
+        instruction: '识别验证码图片文本',
+        status: 'failed',
+        error_message: e?.message || String(e),
+        operations_count: 1,
+      });
+      fail(e?.message || 'AI 图片识别失败');
+    }
+
+    try {
+      const kind = PlayerManager._selectorKind(resolvedTask.inputSelector);
+      await this._setInputValueCDP(
+        tabId,
+        kind === 'css' ? resolvedTask.inputSelector : '',
+        kind === 'xpath' ? resolvedTask.inputSelector : '',
+        text,
+        null,
+        false,
+      );
+      subtasks.push({
+        index: nextIndex(),
+        instruction: `输入识别结果到 ${resolvedTask.inputSelector}`,
+        status: 'success',
+        reason: `已输入：${text}`,
+        operations_count: 1,
+      });
+    } catch (e) {
+      subtasks.push({
+        index: nextIndex(),
+        instruction: `输入识别结果到 ${resolvedTask.inputSelector}`,
+        status: 'failed',
+        error_message: e?.message || String(e),
+        operations_count: 1,
+      });
+      fail(e?.message || 'AI 图片识别：输入识别结果失败');
+    }
+
+    if (resolvedTask.submitSelector) {
+      try {
+        await this._sleep(180);
+        await this._clickBySelectorCDP(tabId, resolvedTask.submitSelector);
+        subtasks.push({
+          index: nextIndex(),
+          instruction: `点击提交按钮 ${resolvedTask.submitSelector}`,
+          status: 'success',
+          reason: '已点击提交按钮',
+          operations_count: 1,
+        });
+      } catch (e) {
+        subtasks.push({
+          index: nextIndex(),
+          instruction: `点击提交按钮 ${resolvedTask.submitSelector}`,
+          status: 'failed',
+          error_message: e?.message || String(e),
+          operations_count: 1,
+        });
+        fail(e?.message || 'AI 图片识别：点击提交按钮失败');
+      }
+    }
+    return subtasks;
+  }
+
   /**
    * @param {{ stepIndex?: number, stepTotal?: number }} meta 用于状态栏「第 N/M 步」与规划中/完成文案
    */
@@ -3669,6 +5577,11 @@ export class PlayerManager {
     await this._throwIfPageError(tabId);
     const instruction = (step.nl_instruction || step.description || '').trim();
     if (!instruction) throw new Error('AI 步骤缺少自然语言指令（请在「自然语言指令」或步骤描述中填写）');
+
+    const visionTask = PlayerManager._parseAiVisionInstruction(instruction);
+    if (visionTask) {
+      return this._executeAiVisionStep(tabId, visionTask, ctx, meta);
+    }
 
     const stepIndex = meta.stepIndex ?? '?';
     const stepTotal = meta.stepTotal ?? '?';
@@ -4154,9 +6067,59 @@ export class PlayerManager {
       if (!el && xp) el = x(xp);
       if (!el && sel) el = pickFromCssMulti(sel, xp);
       if (!el && volatileRc) el = antSearchFallback();
+      if (el && el.tagName === 'SELECT') {
+        var matched = false;
+        var opts = Array.prototype.slice.call(el.options || []);
+        for (var oi = 0; oi < opts.length; oi++) {
+          if (String(opts[oi].value) === String(val)) {
+            el.value = opts[oi].value;
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) {
+          for (var ti = 0; ti < opts.length; ti++) {
+            if (String(opts[ti].text || '').trim() === String(val).trim()) {
+              el.value = opts[ti].value;
+              matched = true;
+              break;
+            }
+          }
+        }
+        if (!matched) return { ok: false, reason: 'option_not_found' };
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return { ok: true, control: 'select' };
+      }
+      if (el && (el.isContentEditable || (el.closest && el.closest('[contenteditable="true"]')))) {
+        el = el.isContentEditable ? el : el.closest('[contenteditable="true"]');
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        try { el.focus({ preventScroll: true }); } catch (em0) {}
+        el.textContent = String(val);
+        try {
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: String(val) }));
+        } catch (e0) {
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return { ok: true, control: 'contenteditable' };
+      }
       if (el && el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') {
-        var inner = el.querySelector && el.querySelector('input,textarea');
+        var inner = el.querySelector && el.querySelector('input,textarea,[contenteditable="true"]');
         if (inner) el = inner;
+      }
+      if (el && (el.isContentEditable || (el.closest && el.closest('[contenteditable="true"]')))) {
+        el = el.isContentEditable ? el : el.closest('[contenteditable="true"]');
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        try { el.focus({ preventScroll: true }); } catch (em1) {}
+        el.textContent = String(val);
+        try {
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: String(val) }));
+        } catch (e01) {
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return { ok: true, control: 'contenteditable' };
       }
       if (!el || (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA')) return { ok: false };
       function isTextLike(ae) {
@@ -4196,6 +6159,16 @@ export class PlayerManager {
     const res = await this._cdpSend(tabId, 'Runtime.evaluate', { expression: expr, returnByValue: true });
     const o = res?.result?.value;
     if (!o || !o.ok) throw new Error('无法设置输入框（未找到元素或非 INPUT/TEXTAREA）');
+  }
+
+  async _setSelectValueCDP(tabId, selector, xpath, value, valueText = '', locatorMeta = null) {
+    try {
+      await this._setInputValueCDP(tabId, selector, xpath, value, locatorMeta, false);
+      return;
+    } catch (e) {
+      if (!valueText || String(valueText) === String(value)) throw e;
+    }
+    await this._setInputValueCDP(tabId, selector, xpath, valueText, locatorMeta, false);
   }
 
   async _dispatchKeyOnFocusedCDP(tabId, selector, xpath, key, locatorMeta = null) {
@@ -4618,6 +6591,13 @@ export class PlayerManager {
       && PlayerManager._sameRecordedTarget(step, nextStep);
   }
 
+  static _stepLooksLikeOverlay(step) {
+    const locatorContext = PlayerManager._parseLocatorMetaObject(step?.locator_meta)?.context || {};
+    return (step?.is_overlay && String(step?.value || '').trim() !== '')
+      || (locatorContext.overlay === true && String(step?.value || '').trim() !== '')
+      || (!step?.target_selector && step?.value);
+  }
+
   async _executeStepCDP(tabId, step, baseUrl, locale = 'zh', nextStep = null, hooks = {}) {
     if (step.wait_before) await this._sleep(step.wait_before);
     switch (step.action_type) {
@@ -4633,12 +6613,10 @@ export class PlayerManager {
         // 判断依据：
         //   1. 明确标记了 is_overlay
         //   2. CSS 选择器为空且有文本值（录制器对浮层返回空 CSS）
-        //   3. XPath 中含 normalize-space() （文本定位模式，录制器专门为浮层生成的）
-        const looksLikeOverlay = (step.is_overlay && String(step.value || '').trim() !== '')
-          || (!step.target_selector && step.value)
-          || (step.target_xpath && step.target_xpath.includes('normalize-space()'));
+        const looksLikeOverlay = PlayerManager._stepLooksLikeOverlay(step);
 
         let box;
+        let virtualAligned = false;
         if (looksLikeOverlay) {
           box = await this._clickOverlayItem(tabId, step, locale, { hadReveal: !!revealTrigger });
         } else {
@@ -4647,6 +6625,11 @@ export class PlayerManager {
             tabId, step.target_selector, step.target_xpath, step.value || '', 6000, false, step.locator_meta
           );
           box = boxResult && boxResult.ok ? boxResult.box : null;
+          const virtualBox = await this._findVirtualScrollTargetBoxCDP(tabId, step, { overlayOnly: false });
+          if (virtualBox) {
+            box = virtualBox;
+            virtualAligned = true;
+          }
           if (!box) {
             throw new Error(this._formatElementWaitFailure(boxResult, step.target_selector, step.target_xpath));
           }
@@ -4654,12 +6637,29 @@ export class PlayerManager {
 
         // scrollIntoView 后等一帧让浏览器重排，再重取坐标（防止滚动偏差）
         await this._sleep(120);
-        const freshBox = await this._cdpSend(tabId, 'Runtime.evaluate', {
-          expression: looksLikeOverlay
-            ? PlayerManager._findInOverlayCode(step.value || '')
-            : this._buildFindCode(step.target_selector, step.target_xpath, '', false, step.locator_meta),
-          returnByValue: true,
-        }).then(r => r?.result?.value || null);
+        let freshBox = null;
+        if (!virtualAligned) {
+          if (looksLikeOverlay) {
+            freshBox = await this._cdpSend(tabId, 'Runtime.evaluate', {
+              expression: PlayerManager._findInOverlayCode(step.value || ''),
+              returnByValue: true,
+            }).then(r => r?.result?.value || null);
+          } else {
+            const freshResult = await this._getElementBoxResult(
+              tabId,
+              step.target_selector,
+              step.target_xpath,
+              step.value || '',
+              2500,
+              false,
+              step.locator_meta,
+            );
+            if (!freshResult || !freshResult.ok || !freshResult.box) {
+              throw new Error(this._formatElementWaitFailure(freshResult, step.target_selector, step.target_xpath));
+            }
+            freshBox = freshResult.box;
+          }
+        }
         const merged = freshBox || box;
         const { x, y } = merged;
         if (merged && merged.hitOk === false) {
@@ -4720,6 +6720,32 @@ export class PlayerManager {
           }
         }
         if (lastErr) throw new Error(`输入失败（等待超时）\n  CSS: ${step.target_selector}\n  XPath: ${step.target_xpath}\n  ${lastErr.message}`);
+        await this._sleep(120);
+        break;
+      }
+
+      case 'select': {
+        const deadline = Date.now() + 8000;
+        let lastErr = null;
+        while (Date.now() < deadline) {
+          await this._throwIfPageError(tabId);
+          try {
+            await this._setSelectValueCDP(
+              tabId,
+              step.target_selector,
+              step.target_xpath,
+              step.value || '',
+              step.value_text || '',
+              step.locator_meta
+            );
+            lastErr = null;
+            break;
+          } catch (e) {
+            lastErr = e;
+            await this._sleep(400);
+          }
+        }
+        if (lastErr) throw new Error(`选择失败（等待超时）\n  CSS: ${step.target_selector}\n  XPath: ${step.target_xpath}\n  ${lastErr.message}`);
         await this._sleep(120);
         break;
       }
@@ -4802,7 +6828,9 @@ export class PlayerManager {
     if (result == null || result.ok !== true) {
       const errText = (result && result.error) || '步骤执行失败（页面脚本无有效响应，请刷新目标页后重试）';
       console.error('[Player] DOM 步骤失败', step.action_type, result);
-      throw new Error(localizePlaybackError(locale, errText));
+      const err = new Error(localizePlaybackError(locale, errText));
+      if (result?.variable_extraction_error) err.variableExtraction = result.variable_extraction_error;
+      throw err;
     }
   }
 
@@ -4811,11 +6839,16 @@ export class PlayerManager {
   // =========================================================
   _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  _waitForTabLoad(tabId) {
-    return new Promise((resolve) => {
+  _waitForTabLoad(tabId, timeoutMs = DEFAULT_TAB_LOAD_TIMEOUT_MS) {
+    const timeoutAt = Date.now() + Math.max(1000, Number(timeoutMs) || DEFAULT_TAB_LOAD_TIMEOUT_MS);
+    return new Promise((resolve, reject) => {
       const check = async () => {
         const tab = await chrome.tabs.get(tabId).catch(() => null);
         if (!tab || tab.status === 'complete') { resolve(); return; }
+        if (Date.now() >= timeoutAt) {
+          reject(new Error('等待页面加载完成超时'));
+          return;
+        }
         setTimeout(check, 300);
       };
       setTimeout(check, 500);

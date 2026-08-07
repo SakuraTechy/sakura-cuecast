@@ -32,7 +32,15 @@ export class ApiClient {
         signal: controller.signal,
       });
       const data = await res.json();
-      if (data.code !== 0) throw new Error(data.message || '请求失败');
+      if (data.code !== 0) {
+        const err = new Error(data.message || '请求失败');
+        err.response = { status: res.status, data };
+        err.apiData = data;
+        if (data?.data && typeof data.data === 'object' && data.data.resource) {
+          err.quotaDetails = data.data;
+        }
+        throw err;
+      }
       return data;
     } catch (e) {
       if (e && e.name === 'AbortError') {
@@ -46,6 +54,16 @@ export class ApiClient {
 
   getTestCase(id) { return this.request('GET', `/testcases/${id}?raw_values=1`); }
   saveSteps(id, steps) { return this.request('POST', `/testcases/${id}/steps`, { steps }); }
+  createRecordingSession(id, body) { return this.request('POST', `/testcases/${id}/recording-sessions`, body || {}); }
+  saveRecordingSessionStep(id, sessionId, body) {
+    return this.request('POST', `/testcases/${id}/recording-sessions/${encodeURIComponent(sessionId)}/steps`, body || {});
+  }
+  commitRecordingSession(id, sessionId, body) {
+    return this.request('POST', `/testcases/${id}/recording-sessions/${encodeURIComponent(sessionId)}/commit`, body || {});
+  }
+  discardRecordingSession(id, sessionId) {
+    return this.request('POST', `/testcases/${id}/recording-sessions/${encodeURIComponent(sessionId)}/discard`, {});
+  }
   /**
    * 保存执行结果（30s 超时 + 1 次重试），避免大 payload 间歇性失败导致结果丢失。
    * 仅对超时和网络错误重试，业务错误（code !== 0）不重试。
@@ -79,6 +97,16 @@ export class ApiClient {
     const q = opts.debug ? '?debug=1' : '';
     const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 100000;
     return this.request('POST', `/ai/step-plan${q}`, body, { timeoutMs });
+  }
+
+  aiVariableExtractRule(body, opts = {}) {
+    const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 60000;
+    return this.request('POST', '/ai/variable-extract-rule', body, { timeoutMs });
+  }
+
+  aiVisionRecognize(body, opts = {}) {
+    const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 60000;
+    return this.request('POST', '/ai/vision-recognize', body, { timeoutMs });
   }
 
   /**

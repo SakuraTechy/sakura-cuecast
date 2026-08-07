@@ -18,36 +18,80 @@
   // =========================================================
   // 元素选择器生成算法
   // =========================================================
-  /** React/Ant Design/rc 组件等运行时自增 id，重渲染后会变，不能用于稳定定位 */
-  function isVolatileAutoId(id) {
-    if (!id || typeof id !== 'string') return true;
-    if (/^\d+$/.test(id)) return true;
-    if (/[a-f0-9]{8,}/i.test(id)) return true;
-    // ant-design / rc-select / rc-input 等：rc_xxx_数字
-    if (/^rc_[a-z0-9_]+_\d+$/i.test(id)) return true;
-    // React useId 常见形式
-    if (/^:r[a-z0-9]*:$/i.test(id)) return true;
-    if (/^radix-/i.test(id)) return true;
-    if (/^headlessui/i.test(id)) return true;
+  function normalizeAttrValue(value) {
+    return String(value || '').trim();
+  }
+
+  function hasLongRandomSegment(value) {
+    const v = normalizeAttrValue(value);
+    if (!v) return false;
+    if (/[a-f0-9]{8,}/i.test(v)) return true;
+    if (/[a-z0-9]{10,}/i.test(v) && /\d/.test(v) && /[a-z]/i.test(v)) return true;
     return false;
+  }
+
+  /** React/Vue/组件库等运行时自增 id，重渲染后会变，不能用于稳定定位 */
+  function isVolatileAutoId(id) {
+    const v = normalizeAttrValue(id);
+    if (!v) return true;
+    if (/^\d+$/.test(v)) return true;
+    if (/^[0-9]{10,}$/.test(v)) return true;
+    if (/^[a-f0-9]{8,}$/i.test(v)) return true;
+    if (/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(v)) return true;
+    if (/^(?:id|input|select|dropdown|listbox|menu|tooltip|popover|dialog|panel|option|item|field|label|form)[-_]?\d+$/i.test(v)) return true;
+    if (/^(?:input|select|dropdown|listbox|menu|tooltip|popover|dialog|panel|option|item|field|label|form)[-_][a-z0-9]{6,}$/i.test(v)) return true;
+    if (/^(?:el-id|el-popper|el-tooltip|el-popover|el-select|el-cascader|el-date-picker)-\d+(?:-\d+)*$/i.test(v)) return true;
+    // ant-design / rc-select / rc-input 等：rc_xxx_数字
+    if (/^rc_[a-z0-9_]+_\d+$/i.test(v)) return true;
+    if (/^rc_[a-z0-9_]+_\d+(?:_[a-z0-9]+)*$/i.test(v)) return true;
+    // React useId 常见形式
+    if (/^:r[a-z0-9]*:$/i.test(v)) return true;
+    if (/^radix-/i.test(v)) return true;
+    if (/^headlessui/i.test(v)) return true;
+    if (/^(?:mui|mantine|chakra|react-select|downshift|reach|floating-ui|tippy)-/i.test(v) && hasLongRandomSegment(v)) return true;
+    return false;
+  }
+
+  function isVolatileAttributeValue(attr, value) {
+    const name = String(attr || '').toLowerCase();
+    const v = normalizeAttrValue(value);
+    if (!v) return true;
+    if (name === 'role') return false;
+    if (['aria-controls', 'aria-describedby', 'aria-labelledby', 'aria-owns', 'aria-activedescendant', 'for'].includes(name)) {
+      return v.split(/\s+/).some((token) => isVolatileAutoId(token));
+    }
+    if (['id', 'data-id'].includes(name)) return isVolatileAutoId(v);
+    if (name.startsWith('data-v-')) return true;
+    if (['data-testid', 'data-test', 'data-qa', 'data-cy', 'name', 'aria-label', 'placeholder', 'title'].includes(name)) {
+      return false;
+    }
+    return isVolatileAutoId(v);
   }
 
   const selectorCore = window.__AT_SELECTOR_CORE__ || {};
   const isVolatileStateClass = typeof selectorCore.isVolatileStateClass === 'function'
     ? selectorCore.isVolatileStateClass.bind(selectorCore)
     : (cls) => !!cls && /(?:^|[-_])(focus|focused|focusing|hover|hovered|active|activated|selected|selecting|current|checked|open|opened|expanded)(?:$|[-_])/i.test(cls);
+  const isVolatileClass = typeof selectorCore.isVolatileClass === 'function'
+    ? selectorCore.isVolatileClass.bind(selectorCore)
+    : function fallbackIsVolatileClass(cls) {
+      const c = String(cls || '').trim();
+      if (!c) return true;
+      if (c.startsWith('__at_')) return true;
+      if (isVolatileStateClass(c)) return true;
+      if (/^[a-f0-9]{6,}$/i.test(c)) return true;
+      if (/^css-[a-z0-9]{5,}$/i.test(c)) return true;
+      if (/^sc-[a-z0-9]{5,}$/i.test(c)) return true;
+      if (/^[a-z0-9]+-[a-z0-9]{8,}$/i.test(c) && /\d/.test(c)) return true;
+      if (/^[A-Za-z0-9_-]+__[A-Za-z0-9_-]{5,}$/i.test(c) && /\d/.test(c)) return true;
+      if (/^(?:ivu-table-column|el-table_\d+_column|ant-table-cell-[a-z0-9]+|v-\d+)-/i.test(c)) return true;
+      return false;
+    };
   const cleanClasses = typeof selectorCore.cleanClasses === 'function'
     ? selectorCore.cleanClasses.bind(selectorCore)
     : function fallbackCleanClasses(el) {
       if (!el.className || typeof el.className !== 'string') return [];
-      return el.className.trim().split(/\s+/).filter(c =>
-        c
-        && !c.startsWith('__at_')
-        && !/^[a-f0-9]{6,}$/.test(c)
-        && !/(?:^|[-_])(focus|focused|focusing|hover|hovered|active|activated|selected|selecting|current|checked|open|opened|expanded)(?:$|[-_])/i.test(c)
-        && !/^is-(focused|active|selected|current|checked|open|expanded)$/i.test(c)
-        && !/^has-(focus|focused)$/i.test(c)
-      );
+      return el.className.trim().split(/\s+/).filter(c => !isVolatileClass(c));
     };
 
   function getStateClasses(el) {
@@ -701,6 +745,8 @@
     const attrs = [
       ['data-testid', 1.0],
       ['data-test', 0.98],
+      ['data-qa', 0.97],
+      ['data-cy', 0.97],
       ['name', 0.92],
       ['aria-label', 0.9],
       ['placeholder', 0.82],
@@ -710,6 +756,7 @@
     for (const [attr, rawBaseScore] of attrs) {
       const v = el?.getAttribute?.(attr);
       if (!v) continue;
+      if (isVolatileAttributeValue(attr, v)) continue;
       const baseScore = attr === 'placeholder' && isSelectLikeElement(el)
         ? 0.58
         : rawBaseScore;
@@ -831,8 +878,8 @@
   function getUniqueSelector(el) {
     if (!el || el.nodeType !== Node.ELEMENT_NODE) return '';
 
-    // 浮层选项（teleport 下拉框）：CSS 结构路径不稳定，留空让 XPath 定位
-    if (getOverlayAncestor(el)) return '';
+    // 浮层选项（teleport 下拉框/菜单）：CSS 结构路径不稳定，留空让 XPath/文本定位
+    if (getOptionItemElement(el)) return '';
 
     const tablePosEarly = resolveTableCellPosition(el);
     if (tablePosEarly?.scoped_css) {
@@ -864,9 +911,9 @@
     }
 
     // 2. 语义化属性
-    for (const attr of ['data-testid', 'data-test', 'data-id', 'name', 'aria-label', 'role']) {
+    for (const attr of ['data-testid', 'data-test', 'data-qa', 'data-cy', 'data-id', 'name', 'aria-label', 'role']) {
       const val = el.getAttribute(attr);
-      if (val) {
+      if (val && !isVolatileAttributeValue(attr, val)) {
         const sel = `${el.tagName.toLowerCase()}[${attr}="${CSS.escape(val)}"]`;
         if (document.querySelectorAll(sel).length === 1) return sel;
       }
@@ -884,7 +931,7 @@
           if (rowIdx >= 0) {
             const tag = section.tagName.toLowerCase();
             let prefix = '';
-            if (table && table.id && !/^\d+$/.test(table.id) && !/[a-f0-9]{8,}/i.test(table.id)) {
+            if (table && table.id && !isVolatileAutoId(table.id)) {
               const tid = '#' + CSS.escape(table.id);
               try {
                 if (document.querySelectorAll(tid).length === 1) prefix = tid + ' ';
@@ -915,7 +962,7 @@
     // 4. 按钮/链接：用文本内容 + tag 辅助定位
     if (['BUTTON', 'A'].includes(el.tagName)) {
       const title = el.getAttribute('title');
-      if (title) {
+      if (title && !isVolatileAttributeValue('title', title)) {
         const sel = `${el.tagName.toLowerCase()}[title="${CSS.escape(title)}"]`;
         if (document.querySelectorAll(sel).length === 1) return sel;
       }
@@ -1001,8 +1048,7 @@
     return parts.join(' > ');
   }
 
-  // 检测元素是否在被 teleport 到 body 的浮层里（iView/Element UI/Ant Design 下拉框等）
-  // 这类元素在 DOM 中只有浮层展开时才存在，结构路径极度不稳定
+  // 检测元素是否在被 teleport 到 body 的浮层里。广义浮层包含下拉、菜单、tooltip、弹窗等。
   const OVERLAY_CLASSES = [
     'ivu-select-dropdown', 'ivu-dropdown-menu', 'ivu-transfer-list',
     'ivu-tooltip-popper',
@@ -1010,6 +1056,30 @@
     'ant-select-dropdown', 'ant-dropdown', 'ant-cascader-menus',
     'v-menu__content', 'vs__dropdown-menu',
   ];
+  const OPTION_OVERLAY_CLASSES = [
+    'ivu-select-dropdown', 'ivu-dropdown-menu', 'ivu-transfer-list',
+    'el-select-dropdown', 'el-dropdown-menu', 'el-cascader__dropdown',
+    'ant-select-dropdown', 'ant-dropdown', 'ant-cascader-menus',
+    'v-menu__content', 'vs__dropdown-menu',
+  ];
+  const OPTION_ITEM_SELECTOR = [
+    'li',
+    'option',
+    '[role="option"]',
+    '[role="menuitem"]',
+    '[role="menuitemcheckbox"]',
+    '[role="menuitemradio"]',
+    '.ivu-select-item',
+    '.ivu-dropdown-item',
+    '.el-select-dropdown__item',
+    '.el-option',
+    '.el-dropdown-menu__item',
+    '.el-cascader-node',
+    '.ant-select-item',
+    '.ant-select-item-option',
+    '.ant-dropdown-menu-item',
+    '.ant-cascader-menu-item',
+  ].join(', ');
 
   function getOverlayAncestor(el) {
     let cur = el;
@@ -1023,6 +1093,27 @@
       cur = cur.parentElement;
     }
     return null;
+  }
+
+  function getOptionOverlayAncestor(el) {
+    let cur = el;
+    while (cur && cur !== document.body) {
+      if (OPTION_OVERLAY_CLASSES.some(cls => cur.classList?.contains(cls))) return cur;
+      const role = String(cur.getAttribute?.('role') || '').toLowerCase();
+      if (['listbox', 'menu', 'tree', 'grid'].includes(role)) {
+        const broad = getOverlayAncestor(cur);
+        if (broad && broad.contains(cur)) return cur;
+      }
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+
+  function getOptionItemElement(el) {
+    const optionOverlay = getOptionOverlayAncestor(el);
+    if (!optionOverlay) return null;
+    const item = el?.closest?.(OPTION_ITEM_SELECTOR);
+    return item && optionOverlay.contains(item) ? item : null;
   }
 
   /** 可见的自定义浮层根节点（含二次子菜单独立面板） */
@@ -1084,6 +1175,136 @@
     }
     const item = el.closest('li, option, [class*="item"], [class*="option"]') || el;
     return (item.textContent || '').trim().replace(/\s+/g, ' ');
+  }
+
+  function normalizeRecordText(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function isScrollableContainer(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    const st = window.getComputedStyle(el);
+    const overflow = `${st.overflow || ''} ${st.overflowY || ''} ${st.overflowX || ''}`;
+    return /(auto|scroll|overlay)/i.test(overflow)
+      && ((el.scrollHeight - el.clientHeight > 2) || (el.scrollWidth - el.clientWidth > 2));
+  }
+
+  function getVirtualItemText(el) {
+    const item = el?.closest?.([
+      'li',
+      '[role="option"]',
+      '[role="row"]',
+      '[role="treeitem"]',
+      '[role="menuitem"]',
+      'tr',
+      '[data-index]',
+      '[aria-rowindex]',
+      '.ant-select-item',
+      '.ant-select-item-option',
+      '.el-select-dropdown__item',
+      '.el-option',
+      '.ivu-select-item',
+      '[class*="virtual"]',
+      '[class*="row"]',
+      '[class*="item"]',
+    ].join(','));
+    return normalizeRecordText((item || el)?.innerText || (item || el)?.textContent || '').slice(0, 220);
+  }
+
+  function findVirtualScrollContainer(el) {
+    let cur = el && el.nodeType === Node.ELEMENT_NODE ? el : el?.parentElement;
+    while (cur && cur !== document.body && cur !== document.documentElement) {
+      if (isScrollableContainer(cur)) return cur;
+      cur = cur.parentElement;
+    }
+    const overlay = getOverlayAncestor(el);
+    if (overlay) {
+      const scrollable = Array.from(overlay.querySelectorAll('*')).find(isScrollableContainer);
+      if (scrollable) return scrollable;
+      if (isScrollableContainer(overlay)) return overlay;
+    }
+    return null;
+  }
+
+  function detectVirtualHint(container) {
+    if (!container) return { hint: 'false', reasons: [] };
+    const reasons = [];
+    const rawClass = normalizeRecordText([
+      container.className,
+      container.parentElement?.className,
+      container.firstElementChild?.className,
+    ].join(' ')).toLowerCase();
+    if (/virtual|virtual-list|virtual-scroll|rc-virtual-list|cdk-virtual|v-virtual/.test(rawClass)) {
+      reasons.push('virtual-class');
+    }
+    const items = Array.from(container.querySelectorAll([
+      'li',
+      '[role="option"]',
+      '[role="row"]',
+      '[data-index]',
+      '[aria-rowindex]',
+      '.ant-select-item',
+      '.el-select-dropdown__item',
+      '.el-option',
+      '.ivu-select-item',
+    ].join(','))).filter((node) => {
+      const r = node.getBoundingClientRect();
+      return r.width > 0 || r.height > 0;
+    });
+    const scrollRatio = container.clientHeight > 0 ? container.scrollHeight / container.clientHeight : 1;
+    if (scrollRatio > 2.2 && items.length > 0 && items.length <= 80) reasons.push('large-scroll-few-items');
+    const positioned = items.some((node) => {
+      const st = window.getComputedStyle(node);
+      const inline = String(node.getAttribute('style') || '').toLowerCase();
+      return st.position === 'absolute'
+        || st.transform !== 'none'
+        || inline.includes('translate')
+        || node.hasAttribute('data-index')
+        || node.hasAttribute('aria-rowindex');
+    });
+    if (positioned) reasons.push('positioned-items');
+    const hint = reasons.includes('virtual-class')
+      || (reasons.includes('large-scroll-few-items') && reasons.includes('positioned-items'))
+      ? 'true'
+      : reasons.includes('large-scroll-few-items') || reasons.includes('positioned-items')
+        ? 'maybe'
+        : 'false';
+    return { hint, reasons, item_count: items.length, scroll_ratio: scrollRatio };
+  }
+
+  function attachVirtualScrollContext(step, targetEl, rawEl, textFallback = '') {
+    if (!step || !targetEl) return;
+    const container = findVirtualScrollContainer(rawEl || targetEl);
+    if (!container) return;
+    const analysis = detectVirtualHint(container);
+    if (analysis.hint === 'false' && !getOverlayAncestor(container)) return;
+    let selector = '';
+    let xpath = '';
+    try { selector = ensureUniqueSelector(container, getUniqueSelector(container)); } catch (e) { selector = ''; }
+    try { xpath = getXPath(container); } catch (e) { xpath = ''; }
+    const itemText = getVirtualItemText(rawEl || targetEl) || normalizeRecordText(textFallback);
+    if (!itemText) return;
+    if (!step.locator_meta || typeof step.locator_meta !== 'object') {
+      step.locator_meta = { version: 1, candidates: [], context: {} };
+    }
+    if (!step.locator_meta.context || typeof step.locator_meta.context !== 'object') {
+      step.locator_meta.context = {};
+    }
+    step.locator_meta.context.virtual_scroll = {
+      hint: analysis.hint,
+      reasons: analysis.reasons || [],
+      item_text: itemText,
+      option_text: normalizeRecordText(textFallback),
+      container_selector: selector,
+      container_xpath: xpath,
+      scroll_top: Number(container.scrollTop || 0),
+      scroll_left: Number(container.scrollLeft || 0),
+      scroll_height: Number(container.scrollHeight || 0),
+      client_height: Number(container.clientHeight || 0),
+      item_count: analysis.item_count || 0,
+      scroll_ratio: Number((analysis.scroll_ratio || 0).toFixed(2)),
+      overlay: !!getOverlayAncestor(container),
+    };
   }
 
   /** Poptip/Modal 内文本框、富文本：不应记成「浮层选择选项」（无选项文案） */
@@ -1192,13 +1413,14 @@
       }
     }
 
-    // 浮层选项：用文本内容生成可跨状态定位的 XPath
-    const overlay = getOverlayAncestor(el);
-    if (overlay) {
+    // 浮层选项：仅对真实下拉/菜单项用文本内容生成可跨状态定位的 XPath。
+    // Dialog/Modal 内的普通 button 不能走这里，否则会把弹窗正文拼进 normalize-space。
+    const optionItem = getOptionItemElement(el);
+    if (optionItem) {
       const text = getOptionText(el);
-      if (text) {
+      if (text && text.length <= 160) {
         // 找最近的 li / 选项容器
-        const itemEl = el.closest('li, [class*="select-item"], [class*="option-item"]') || el;
+        const itemEl = optionItem;
         const itemTag = itemEl.tagName.toLowerCase();
         const itemCls = Array.from(itemEl.classList).find(c =>
           c.includes('item') || c.includes('option')
@@ -1299,6 +1521,19 @@
     if (node.nodeType === Node.ELEMENT_NODE) return node;
     if (node.nodeType === Node.TEXT_NODE) return node.parentElement;
     return null;
+  }
+
+  function isRecorderUiElement(node) {
+    const el = normalizeToElement(node);
+    return !!el?.closest?.('#__at_toolbar__,#__at_variable_dialog__,#__at_assertion_dialog__');
+  }
+
+  function isRecorderUiEvent(event) {
+    return isRecorderUiElement(event?.target);
+  }
+
+  function isTrustedRecordingEvent(event) {
+    return event?.isTrusted !== false;
   }
 
   /**
@@ -1462,7 +1697,7 @@
     };
   }
 
-  function captureStepThumbnailByCrop(crop) {
+  function captureStepThumbnailByCrop(crop, step = null) {
     return new Promise((resolve) => {
       try {
         if (!crop) {
@@ -1480,6 +1715,7 @@
               resolve('');
               return;
             }
+            if (step && resp?.fullDataUrl) step.screenshot_full = resp.fullDataUrl;
             resolve(resp && resp.dataUrl ? resp.dataUrl : '');
           },
         );
@@ -1490,13 +1726,18 @@
   }
 
   /** 截取当前视口内目标元素区域缩略图（由 background 裁剪整页截图） */
-  function captureStepThumbnail(el) {
-    return captureStepThumbnailByCrop(getThumbCropRect(el));
+  function captureStepThumbnail(el, step = null) {
+    return captureStepThumbnailByCrop(getThumbCropRect(el), step);
   }
 
   let pendingClickRecordTimer = null;
   let toolbarActionTimer = null;
   let heartbeatTimer = null;
+  let variableCaptureMode = false;
+  let assertionCaptureMode = false;
+  let pendingVariableTarget = null;
+  let pendingAssertionTarget = null;
+  const recordedVariableNames = new Set();
 
   function preparePointerStepScreenshot(step, visualEl, clientX, clientY) {
     const crop = getThumbCropRect(visualEl);
@@ -1504,7 +1745,7 @@
     const fr = crop ? focusRectInCrop(crop, visualEl, 6) : null;
     return (async () => {
       try {
-        const thumb = await captureStepThumbnailByCrop(crop);
+        const thumb = await captureStepThumbnailByCrop(crop, step);
         if (thumb) {
           step.screenshot = thumb;
           if (focus) step.screenshot_focus = focus;
@@ -1521,11 +1762,784 @@
     })();
   }
 
+  function setVariableCaptureMode(enabled) {
+    variableCaptureMode = !!enabled;
+    if (variableCaptureMode) setAssertionCaptureMode(false);
+    const btn = document.getElementById('__at_save_var_btn__');
+    if (btn) {
+      btn.classList.toggle('__at_active__', variableCaptureMode);
+      const label = btn.querySelector('.__at_btn_label__');
+      if (label) label.textContent = '保存变量';
+    }
+    const dragTitle = document.querySelector('#__at_toolbar_drag__ strong');
+    if (dragTitle) {
+      dragTitle.textContent = variableCaptureMode ? '选择变量来源' : (isPaused ? '录制已暂停' : '录制中');
+    }
+  }
+
+  function setAssertionCaptureMode(enabled) {
+    assertionCaptureMode = !!enabled;
+    if (assertionCaptureMode && variableCaptureMode) {
+      variableCaptureMode = false;
+      const varBtn = document.getElementById('__at_save_var_btn__');
+      varBtn?.classList.toggle('__at_active__', false);
+    }
+    const btn = document.getElementById('__at_add_assert_btn__');
+    if (btn) btn.classList.toggle('__at_active__', assertionCaptureMode);
+    const dragTitle = document.querySelector('#__at_toolbar_drag__ strong');
+    if (dragTitle) {
+      dragTitle.textContent = assertionCaptureMode ? '选择断言元素' : (isPaused ? '录制已暂停' : '录制中');
+    }
+  }
+
+  function normalizeVariableName(input) {
+    const raw = String(input || '').trim();
+    if (!raw) return '';
+    const normalized = raw
+      .replace(/[^\w$]+/g, '_')
+      .replace(/^_+|_+$/g, '');
+    if (!normalized) return '';
+    return /^[A-Za-z_$]/.test(normalized) ? normalized : `v_${normalized}`;
+  }
+
+  function isValidVariableName(input) {
+    return /^[A-Za-z_$][\w$]*$/.test(String(input || '').trim());
+  }
+
+  function getVariableSourceValue(el) {
+    if (!el) return '';
+    const tag = String(el.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') {
+      return String(el.value ?? '');
+    }
+    if (el.isContentEditable || el.closest?.('[contenteditable="true"]')) {
+      const editable = el.isContentEditable ? el : el.closest('[contenteditable="true"]');
+      return String(editable?.textContent ?? '');
+    }
+    return String(el.innerText ?? el.textContent ?? '');
+  }
+
+  function getAssertionSourceValue(el) {
+    return getVariableSourceValue(el);
+  }
+
+  function defaultAssertionMatchFromElement(el) {
+    const tag = String(el?.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') return 'equals';
+    return 'contains';
+  }
+
+  function normalizeAssertionTarget(target) {
+    return ['element', 'page', 'url'].includes(String(target || '')) ? String(target) : 'element';
+  }
+
+  function normalizeAssertionMatch(match, target = 'element') {
+    const raw = String(match || '');
+    if (raw === 'visible') return target === 'element' ? 'visible' : 'contains';
+    return ['contains', 'equals', 'not_contains', 'regex'].includes(raw) ? raw : 'contains';
+  }
+
+  function assertionTargetLabel(target) {
+    if (target === 'page') return '整页文本';
+    if (target === 'url') return 'URL';
+    return '指定元素';
+  }
+
+  function assertionMatchLabel(match) {
+    if (match === 'equals') return '等于';
+    if (match === 'not_contains') return '不包含';
+    if (match === 'regex') return '正则匹配';
+    if (match === 'visible') return '元素可见';
+    return '包含';
+  }
+
+  function applyVariableExtraction(rawValue, extract) {
+    const raw = String(rawValue ?? '');
+    const mode = String(extract?.mode || 'full');
+    if (mode === 'regex') {
+      const pattern = String(extract?.pattern || '');
+      if (!pattern) return { ok: false, error: '请填写正则表达式。', value: '' };
+      const safetyError = validateRegexSafety(pattern);
+      if (safetyError) return { ok: false, error: safetyError, value: '' };
+      let re;
+      try {
+        re = new RegExp(pattern);
+      } catch (e) {
+        return { ok: false, error: `正则表达式无效：${e?.message || e}`, value: '' };
+      }
+      const match = raw.match(re);
+      if (!match) return { ok: false, error: '当前抽取值未匹配该正则。', value: '' };
+      const group = Number.isInteger(Number(extract?.group)) ? Number(extract.group) : (match.length > 1 ? 1 : 0);
+      if (match[group] == null) return { ok: false, error: `捕获组 ${group} 不存在。`, value: '' };
+      return { ok: true, value: String(match[group]) };
+    }
+    return { ok: true, value: raw };
+  }
+
+  function hasNestedRegexQuantifier(pattern) {
+    const source = String(pattern || '');
+    for (let i = 0; i < source.length; i++) {
+      if (source[i] !== '(' || source[i + 1] === '?') continue;
+      let escaped = false;
+      let depth = 0;
+      let innerHasQuantifier = false;
+      for (let j = i; j < source.length; j++) {
+        const ch = source[j];
+        if (escaped) { escaped = false; continue; }
+        if (ch === '\\') { escaped = true; continue; }
+        if (ch === '(') depth += 1;
+        if (depth > 0 && ['*', '+'].includes(ch)) innerHasQuantifier = true;
+        if (ch === ')') {
+          depth -= 1;
+          if (depth === 0) {
+            const next = source[j + 1] || '';
+            if (innerHasQuantifier && ['*', '+'].includes(next)) return true;
+            if (innerHasQuantifier && next === '{') return true;
+            break;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  function validateRegexSafety(pattern) {
+    const source = String(pattern || '');
+    if (source.length > 300) return '正则表达式过长，请缩短后再保存。';
+    if (hasNestedRegexQuantifier(source)) return '正则存在嵌套重复结构，可能导致页面或回放卡顿，请改写后再保存。';
+    if (/(?:\.\*){2,}|(?:\.\+){2,}|\[[^\]]*\\s\\S[^\]]*\][*+][*+]?/.test(source)) {
+      return '正则过宽，可能误匹配大段文本，请增加固定上下文后再保存。';
+    }
+    return '';
+  }
+
+  function normalizeVariableExtractConfig(config) {
+    const mode = String(config?.mode || 'full');
+    if (mode === 'regex') {
+      return {
+        mode,
+        pattern: String(config?.pattern || ''),
+        group: Number.isInteger(Number(config?.group)) ? Number(config.group) : 0,
+      };
+    }
+    return { mode: 'full' };
+  }
+
+  function applyGeneratedVariableRule(rule, controls) {
+    const mode = String(rule?.mode || 'full');
+    if (mode === 'regex') {
+      controls.regexInput.value = String(rule.pattern || '');
+      controls.groupInput.value = String(Number.isInteger(Number(rule.group)) ? Number(rule.group) : 0);
+      return true;
+    }
+    if (mode === 'full') {
+      return true;
+    }
+    return false;
+  }
+
+  function requestVariableExtractRule(rawValue, instruction) {
+    return new Promise((resolve) => {
+      chrome.runtime.sendMessage(
+        { type: 'AT_AI_VARIABLE_EXTRACT_RULE', rawValue: String(rawValue ?? ''), instruction: String(instruction || '') },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            resolve({ ok: false, error: chrome.runtime.lastError.message });
+            return;
+          }
+          resolve(response || { ok: false, error: '智能抽取服务无响应' });
+        },
+      );
+    });
+  }
+
+  function buildSetVariableStep(el, variableName, rawValue, extractConfig = { mode: 'full' }) {
+    const targetSelector = ensureUniqueSelector(el, getUniqueSelector(el));
+    const targetXpath = getXPath(el);
+    const raw = String(rawValue ?? '');
+    const extract = normalizeVariableExtractConfig(extractConfig);
+    const extracted = applyVariableExtraction(raw, extract);
+    const value = extracted.ok ? extracted.value : raw;
+    const meta = buildSmartLocatorMeta(el, targetSelector, targetXpath, value);
+    if (!meta.context || typeof meta.context !== 'object') meta.context = {};
+    meta.context.variable = {
+      name: variableName,
+      source: getVariableSourceKind(el),
+      raw_preview: raw.trim().replace(/\s+/g, ' ').slice(0, 200),
+      preview: value.trim().replace(/\s+/g, ' ').slice(0, 200),
+      extract,
+      duplicate_at_recording: recordedVariableNames.has(variableName),
+    };
+    return {
+      action_type: 'set_variable',
+      target_selector: targetSelector,
+      target_xpath: targetXpath,
+      value: variableName,
+      value_text: raw,
+      url: location.href,
+      description: `保存变量 {{${variableName}}}: "${value.trim().replace(/\s+/g, ' ').slice(0, 50)}"`,
+      locator_meta: meta,
+    };
+  }
+
+  function buildAssertionStep(el, target, match, expectedValue) {
+    const assertionTarget = normalizeAssertionTarget(target);
+    const assertionMatch = normalizeAssertionMatch(match, assertionTarget);
+    const usesElement = assertionTarget === 'element';
+    const targetSelector = usesElement ? ensureUniqueSelector(el, getUniqueSelector(el)) : '';
+    const targetXpath = usesElement ? getXPath(el) : '';
+    const expected = assertionMatch === 'visible' ? '' : String(expectedValue ?? '');
+    const meta = usesElement
+      ? buildSmartLocatorMeta(el, targetSelector, targetXpath, expected)
+      : { version: 1, candidates: [], context: {} };
+    if (!meta.context || typeof meta.context !== 'object') meta.context = {};
+    meta.assertion = { target: assertionTarget, match: assertionMatch };
+    meta.context.assertion = {
+      target: assertionTarget,
+      match: assertionMatch,
+      source: usesElement ? getVariableSourceKind(el) : assertionTarget,
+      preview: String(expectedValue ?? '').trim().replace(/\s+/g, ' ').slice(0, 200),
+    };
+    const targetLabel = assertionTargetLabel(assertionTarget);
+    const matchLabel = assertionMatchLabel(assertionMatch);
+    return {
+      action_type: 'assert_text',
+      target_selector: targetSelector,
+      target_xpath: targetXpath,
+      value: expected,
+      value_text: expected,
+      url: location.href,
+      description: assertionMatch === 'visible'
+        ? `断言${targetLabel}可见`
+        : `断言${targetLabel}${matchLabel}: "${expected.trim().replace(/\s+/g, ' ').slice(0, 50)}"`,
+      locator_meta: meta,
+    };
+  }
+
+  function getVariableSourceKind(el) {
+    if (!el) return 'text';
+    const tag = String(el.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') return 'value';
+    if (el.isContentEditable || el.closest?.('[contenteditable="true"]')) return 'contenteditable';
+    return 'text';
+  }
+
+  function closeVariableDialog() {
+    const dialog = document.getElementById('__at_variable_dialog__');
+    if (dialog) dialog.remove();
+    pendingVariableTarget = null;
+  }
+
+  function closeAssertionDialog() {
+    const dialog = document.getElementById('__at_assertion_dialog__');
+    if (dialog) dialog.remove();
+    pendingAssertionTarget = null;
+  }
+
+  function defaultVariableNameFromElement(el) {
+    const raw = [
+      el?.getAttribute?.('data-testid'),
+      el?.getAttribute?.('aria-label'),
+      el?.getAttribute?.('name'),
+      el?.id,
+    ].find((x) => String(x || '').trim());
+    return normalizeVariableName(raw || 'test') || 'test';
+  }
+
+  function showVariableDialog(el, rawValue) {
+    closeVariableDialog();
+    pendingVariableTarget = { el, rawValue };
+    const preview = String(rawValue ?? '').trim().replace(/\s+/g, ' ');
+    const defaultName = defaultVariableNameFromElement(el);
+    const overlay = document.createElement('div');
+    overlay.id = '__at_variable_dialog__';
+    overlay.innerHTML = `
+      <div class="__at_var_card__" role="dialog" aria-modal="true" aria-labelledby="__at_var_title__">
+        <div class="__at_var_head__">
+          <div>
+            <div class="__at_var_kicker__">Runtime variable</div>
+            <div id="__at_var_title__" class="__at_var_title__">保存变量</div>
+          </div>
+          <button type="button" class="__at_icon_btn__" id="__at_var_close__" aria-label="关闭">×</button>
+        </div>
+        <label class="__at_var_field__">
+          <span class="__at_var_label__">变量名</span>
+          <input id="__at_var_name__" value="${escapeHtml(defaultName)}" autocomplete="off" spellcheck="false" />
+        </label>
+        <div class="__at_var_preview__">
+          <span class="__at_var_label__">原始值</span>
+          <code>${escapeHtml(preview || '(empty)')}</code>
+        </div>
+        <div class="__at_var_field__">
+          <span class="__at_var_label__">抽取方式</span>
+          <input id="__at_var_extract_mode__" type="hidden" value="full" />
+          <div class="__at_select__" id="__at_extract_select__">
+            <button type="button" class="__at_select_trigger__" id="__at_extract_select_trigger__" aria-haspopup="listbox" aria-expanded="false">
+              <span id="__at_extract_select_label__">完整值</span>
+              <span class="__at_select_chevron__">⌄</span>
+            </button>
+            <div class="__at_select_menu__" id="__at_extract_select_menu__" role="listbox" hidden>
+              <button type="button" class="__at_select_option__ __at_selected__" data-extract-mode="full" role="option" aria-selected="true">完整值</button>
+              <button type="button" class="__at_select_option__" data-extract-mode="regex" role="option" aria-selected="false">正则匹配</button>
+            </div>
+          </div>
+        </div>
+        <div id="__at_var_regex_fields__" class="__at_var_extract_fields__" hidden>
+          <div class="__at_var_ai_box__" id="__at_var_ai_box__">
+            <label class="__at_var_field__">
+              <span class="__at_var_label__">智能抽取</span>
+              <input id="__at_var_ai_instruction__" placeholder="例如：只取括号前面的内容" autocomplete="off" spellcheck="false" />
+            </label>
+            <button type="button" class="__at_ai_btn__" id="__at_var_ai_generate__">生成规则</button>
+          </div>
+          <label class="__at_var_field__">
+            <span class="__at_var_label__">正则表达式</span>
+            <input id="__at_var_regex__" placeholder="例如：ORD-\\d+" autocomplete="off" spellcheck="false" />
+          </label>
+          <label class="__at_var_field__">
+            <span class="__at_var_label__">捕获组</span>
+            <input id="__at_var_group__" value="0" inputmode="numeric" autocomplete="off" spellcheck="false" />
+          </label>
+        </div>
+        <div class="__at_var_preview__">
+          <span class="__at_var_label__">变量值预览</span>
+          <code id="__at_var_result__">${escapeHtml(preview || '(empty)')}</code>
+        </div>
+        <div class="__at_var_usage__">后续步骤可使用 <code>{{${escapeHtml(defaultName)}}}</code></div>
+        <div class="__at_var_error__" id="__at_var_error__"></div>
+        <div class="__at_var_actions__">
+          <button type="button" class="__at_secondary_btn__" id="__at_var_cancel__">取消</button>
+          <button type="button" class="__at_primary_btn__" id="__at_var_confirm__">保存变量</button>
+        </div>
+      </div>
+    `;
+    overlay.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.target === overlay) closeVariableDialog();
+    });
+    document.body.appendChild(overlay);
+
+    const input = overlay.querySelector('#__at_var_name__');
+    const modeInput = overlay.querySelector('#__at_var_extract_mode__');
+    const selectRoot = overlay.querySelector('#__at_extract_select__');
+    const selectTrigger = overlay.querySelector('#__at_extract_select_trigger__');
+    const selectLabel = overlay.querySelector('#__at_extract_select_label__');
+    const selectMenu = overlay.querySelector('#__at_extract_select_menu__');
+    const modeButtons = Array.from(overlay.querySelectorAll('[data-extract-mode]'));
+    const regexFields = overlay.querySelector('#__at_var_regex_fields__');
+    const regexInput = overlay.querySelector('#__at_var_regex__');
+    const groupInput = overlay.querySelector('#__at_var_group__');
+    const aiInstructionInput = overlay.querySelector('#__at_var_ai_instruction__');
+    const aiGenerateButton = overlay.querySelector('#__at_var_ai_generate__');
+    const resultPreview = overlay.querySelector('#__at_var_result__');
+    const usage = overlay.querySelector('.__at_var_usage__ code');
+    const error = overlay.querySelector('#__at_var_error__');
+    const currentExtractConfig = () => {
+      const mode = String(modeInput.value || 'full');
+      if (mode === 'regex') {
+        return { mode, pattern: String(regexInput.value || ''), group: Number(groupInput.value || 0) || 0 };
+      }
+      return { mode: 'full' };
+    };
+    const setMode = (mode) => {
+      modeInput.value = mode;
+      const selectedText = mode === 'regex' ? '正则匹配' : '完整值';
+      selectLabel.textContent = selectedText;
+      modeButtons.forEach((btn) => {
+        const selected = btn.dataset.extractMode === mode;
+        btn.classList.toggle('__at_selected__', selected);
+        btn.setAttribute('aria-selected', selected ? 'true' : 'false');
+      });
+      updateUsage();
+    };
+    const closeSelect = () => {
+      selectMenu.hidden = true;
+      selectTrigger.setAttribute('aria-expanded', 'false');
+    };
+    const toggleSelect = () => {
+      const open = selectMenu.hidden;
+      selectMenu.hidden = !open;
+      selectTrigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    };
+    const updateUsage = () => {
+      const raw = String(input.value || '').trim();
+      const normalized = normalizeVariableName(raw) || 'name';
+      usage.textContent = `{{${normalized}}}`;
+      const mode = String(modeInput.value || 'full');
+      regexFields.hidden = mode !== 'regex';
+      const config = currentExtractConfig();
+      const extracted = applyVariableExtraction(rawValue, config);
+      resultPreview.textContent = extracted.ok ? (extracted.value || '(empty)') : '—';
+      error.style.color = '#dc2626';
+      if (raw && !isValidVariableName(raw)) {
+        error.textContent = '变量名只能包含字母、数字、下划线或 $，且不能以数字开头。';
+        return;
+      }
+      if (recordedVariableNames.has(normalized)) {
+        error.textContent = '该变量名已在本次录制中使用，保存后会覆盖运行时变量值。';
+        return;
+      }
+      if (!extracted.ok) {
+        error.textContent = extracted.error;
+        return;
+      }
+      error.textContent = '';
+    };
+    input.addEventListener('input', updateUsage);
+    selectTrigger.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      toggleSelect();
+    });
+    modeButtons.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        setMode(btn.dataset.extractMode || 'full');
+        closeSelect();
+      });
+    });
+    overlay.addEventListener('click', (event) => {
+      if (!selectRoot.contains(event.target)) closeSelect();
+    });
+    regexInput.addEventListener('input', updateUsage);
+    groupInput.addEventListener('input', updateUsage);
+    aiInstructionInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        aiGenerateButton?.click();
+      }
+    });
+    aiGenerateButton.addEventListener('click', async () => {
+      const instruction = String(aiInstructionInput.value || '').trim();
+      if (!instruction) {
+        error.textContent = '请描述你想保存哪一部分。';
+        aiInstructionInput.focus();
+        return;
+      }
+      aiGenerateButton.disabled = true;
+      aiGenerateButton.textContent = '生成中...';
+      error.style.color = '#dc2626';
+      error.textContent = '';
+      try {
+        const response = await requestVariableExtractRule(rawValue, instruction);
+        if (!response?.ok) {
+          error.textContent = response?.error || '智能抽取规则生成失败。';
+          return;
+        }
+        const applied = applyGeneratedVariableRule(response.rule, {
+          regexInput,
+          groupInput,
+        });
+        if (!applied) {
+          error.textContent = '智能抽取返回了不支持的规则。';
+          return;
+        }
+        setMode(response.rule?.mode === 'full' ? 'full' : 'regex');
+        updateUsage();
+        if (response.rule?.reason) {
+          error.style.color = '#15803d';
+          error.textContent = response.rule?.mode === 'full'
+            ? `已生成规则：${response.rule.reason}；将保存完整值。`
+            : `已生成规则：${response.rule.reason}；正则和捕获组已填入下方。`;
+        }
+      } finally {
+        aiGenerateButton.disabled = false;
+        aiGenerateButton.textContent = '生成规则';
+      }
+    });
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        overlay.querySelector('#__at_var_confirm__')?.click();
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        if (!selectMenu.hidden) closeSelect();
+        else closeVariableDialog();
+      }
+    });
+    overlay.querySelector('#__at_var_close__')?.addEventListener('click', closeVariableDialog);
+    overlay.querySelector('#__at_var_cancel__')?.addEventListener('click', closeVariableDialog);
+    overlay.querySelector('#__at_var_confirm__')?.addEventListener('click', () => {
+      const rawName = String(input.value || '').trim();
+      if (!rawName) {
+        error.textContent = '请输入变量名。';
+        input.focus();
+        return;
+      }
+      if (!isValidVariableName(rawName)) {
+        error.textContent = '变量名只能包含字母、数字、下划线或 $，且不能以数字开头。';
+        input.focus();
+        return;
+      }
+      const name = normalizeVariableName(rawName);
+      const extractConfig = currentExtractConfig();
+      const extracted = applyVariableExtraction(rawValue, extractConfig);
+      if (!extracted.ok) {
+        error.textContent = extracted.error;
+        return;
+      }
+      const target = pendingVariableTarget;
+      closeVariableDialog();
+      if (target?.el) createVariableStepFromTarget(target.el, name, target.rawValue, extractConfig);
+    });
+    updateUsage();
+    setTimeout(() => {
+      input.focus();
+      input.select();
+    }, 0);
+  }
+
+  function createVariableStepFromTarget(el, name, value, extractConfig) {
+    const step = buildSetVariableStep(el, name, value, extractConfig);
+    recordedVariableNames.add(name);
+    const visualEl = resolveVisualHighlightForFormControl(el) || el;
+    const crop = getThumbCropRect(visualEl);
+    const r = visualEl.getBoundingClientRect();
+    void (async () => {
+      try {
+        const thumb = await captureStepThumbnail(visualEl, step);
+        if (thumb) {
+          step.screenshot = thumb;
+          if (crop) {
+            step.screenshot_focus = focusInCrop(crop, r.left + r.width / 2, r.top + r.height / 2);
+            const fr = focusRectInCrop(crop, visualEl, 4);
+            if (fr) step.screenshot_focus_rect = fr;
+          }
+        }
+      } catch (e) { /* ignore */ }
+      sendStep(step);
+    })();
+  }
+
+  function showAssertionDialog(el, rawValue) {
+    closeAssertionDialog();
+    pendingAssertionTarget = { el, rawValue };
+    const preview = String(rawValue ?? '').trim().replace(/\s+/g, ' ');
+    const defaultMatch = defaultAssertionMatchFromElement(el);
+    const overlay = document.createElement('div');
+    overlay.id = '__at_assertion_dialog__';
+    overlay.innerHTML = `
+      <div class="__at_var_card__" role="dialog" aria-modal="true" aria-labelledby="__at_assert_title__">
+        <div class="__at_var_head__">
+          <div>
+            <div class="__at_var_kicker__">Assertion</div>
+            <div id="__at_assert_title__" class="__at_var_title__">添加断言</div>
+          </div>
+          <button type="button" class="__at_icon_btn__" id="__at_assert_close__" aria-label="关闭">×</button>
+        </div>
+        <div class="__at_var_preview__ __at_assert_preview__">
+          <span class="__at_var_label__">当前值</span>
+          <code>${escapeHtml(preview || '(empty)')}</code>
+        </div>
+        <div class="__at_var_field__">
+          <span class="__at_var_label__">匹配方式</span>
+          <input id="__at_assert_match__" type="hidden" value="${escapeHtml(defaultMatch)}" />
+          <div class="__at_select__" id="__at_assert_match_select__">
+            <button type="button" class="__at_select_trigger__" id="__at_assert_match_trigger__" aria-haspopup="listbox" aria-expanded="false">
+              <span id="__at_assert_match_label__">${escapeHtml(assertionMatchLabel(defaultMatch))}</span>
+              <span class="__at_select_chevron__">⌄</span>
+            </button>
+            <div class="__at_select_menu__" id="__at_assert_match_menu__" role="listbox" hidden>
+              <button type="button" class="__at_select_option__" data-assert-match="contains" role="option">包含</button>
+              <button type="button" class="__at_select_option__" data-assert-match="equals" role="option">等于</button>
+              <button type="button" class="__at_select_option__" data-assert-match="not_contains" role="option">不包含</button>
+              <button type="button" class="__at_select_option__" data-assert-match="regex" role="option">正则匹配</button>
+              <button type="button" class="__at_select_option__" data-assert-match="visible" role="option">元素可见</button>
+            </div>
+          </div>
+        </div>
+        <label class="__at_var_field__" id="__at_assert_expected_wrap__">
+          <span class="__at_var_label__">期望值</span>
+          <input id="__at_assert_expected__" value="${escapeHtml(preview)}" autocomplete="off" spellcheck="false" />
+        </label>
+        <div class="__at_var_error__" id="__at_assert_error__"></div>
+        <div class="__at_var_actions__">
+          <button type="button" class="__at_secondary_btn__" id="__at_assert_cancel__">取消</button>
+          <button type="button" class="__at_primary_btn__" id="__at_assert_confirm__">保存断言</button>
+        </div>
+      </div>
+    `;
+    overlay.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.target === overlay) closeAssertionDialog();
+    });
+    document.body.appendChild(overlay);
+
+    const matchInput = overlay.querySelector('#__at_assert_match__');
+    const matchSelectRoot = overlay.querySelector('#__at_assert_match_select__');
+    const matchTrigger = overlay.querySelector('#__at_assert_match_trigger__');
+    const matchLabel = overlay.querySelector('#__at_assert_match_label__');
+    const matchMenu = overlay.querySelector('#__at_assert_match_menu__');
+    const matchButtons = Array.from(overlay.querySelectorAll('[data-assert-match]'));
+    const expectedWrap = overlay.querySelector('#__at_assert_expected_wrap__');
+    const expectedInput = overlay.querySelector('#__at_assert_expected__');
+    const error = overlay.querySelector('#__at_assert_error__');
+    const closeMatchSelect = () => {
+      matchMenu.hidden = true;
+      matchTrigger.setAttribute('aria-expanded', 'false');
+    };
+    const updateMatch = (match) => {
+      const normalizedMatch = normalizeAssertionMatch(match, 'element');
+      matchInput.value = normalizedMatch;
+      matchLabel.textContent = assertionMatchLabel(normalizedMatch);
+      matchButtons.forEach((btn) => {
+        const selected = btn.dataset.assertMatch === normalizedMatch;
+        btn.classList.toggle('__at_selected__', selected);
+        btn.setAttribute('aria-selected', selected ? 'true' : 'false');
+      });
+      expectedWrap.hidden = normalizedMatch === 'visible';
+      error.textContent = '';
+    };
+    matchTrigger.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const open = matchMenu.hidden;
+      matchMenu.hidden = !open;
+      matchTrigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+    matchButtons.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        updateMatch(btn.dataset.assertMatch || 'contains');
+        closeMatchSelect();
+      });
+    });
+    overlay.addEventListener('click', (event) => {
+      if (!matchSelectRoot.contains(event.target)) closeMatchSelect();
+    });
+    expectedInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        overlay.querySelector('#__at_assert_confirm__')?.click();
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        if (!matchMenu.hidden) closeMatchSelect();
+        else closeAssertionDialog();
+      }
+    });
+    overlay.querySelector('#__at_assert_close__')?.addEventListener('click', closeAssertionDialog);
+    overlay.querySelector('#__at_assert_cancel__')?.addEventListener('click', closeAssertionDialog);
+    overlay.querySelector('#__at_assert_confirm__')?.addEventListener('click', () => {
+      const targetName = 'element';
+      const match = normalizeAssertionMatch(matchInput.value, targetName);
+      const expected = String(expectedInput.value || '');
+      if (match !== 'visible' && expected.trim() === '') {
+        error.textContent = '请输入期望值，或改用元素可见断言。';
+        expectedInput.focus();
+        return;
+      }
+      const target = pendingAssertionTarget;
+      closeAssertionDialog();
+      if (target?.el) createAssertionStepFromTarget(target.el, targetName, match, expected);
+    });
+    updateMatch(defaultMatch);
+    setTimeout(() => {
+      if (!expectedWrap.hidden) {
+        expectedInput.focus();
+        expectedInput.select();
+      } else {
+        matchTrigger.focus();
+      }
+    }, 0);
+  }
+
+  function createAssertionStepFromTarget(el, target, match, expectedValue) {
+    const step = buildAssertionStep(el, target, match, expectedValue);
+    const visualEl = resolveVisualHighlightForFormControl(el) || el;
+    const crop = getThumbCropRect(visualEl);
+    const r = visualEl.getBoundingClientRect();
+    void (async () => {
+      try {
+        const thumb = await captureStepThumbnail(visualEl, step);
+        if (thumb) {
+          step.screenshot = thumb;
+          if (crop) {
+            step.screenshot_focus = focusInCrop(crop, r.left + r.width / 2, r.top + r.height / 2);
+            const fr = focusRectInCrop(crop, visualEl, 4);
+            if (fr) step.screenshot_focus_rect = fr;
+          }
+        }
+      } catch (e) { /* ignore */ }
+      sendStep(step);
+    })();
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function handleVariableCaptureClick(event) {
+    if (!variableCaptureMode || !isRecording || isPaused) return false;
+    let el = normalizeToElement(event.target);
+    if (!el || el.closest?.('#__at_toolbar__')) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation?.();
+    setVariableCaptureMode(false);
+    el.classList.remove('__at_hover__');
+    const value = getVariableSourceValue(el);
+    showVariableDialog(el, value);
+    return true;
+  }
+
+  function handleAssertionCaptureClick(event) {
+    if (!assertionCaptureMode || !isRecording || isPaused) return false;
+    let el = normalizeToElement(event.target);
+    if (!el || el.closest?.('#__at_toolbar__') || el.closest?.('#__at_assertion_dialog__')) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation?.();
+    setAssertionCaptureMode(false);
+    el.classList.remove('__at_hover__');
+    const value = getAssertionSourceValue(el);
+    showAssertionDialog(el, value);
+    return true;
+  }
+
+  let pendingClickRecord = null;
+
+  function sendPendingClickRecord(awaitScreenshot = false) {
+    if (!pendingClickRecord) return false;
+    if (pendingClickRecordTimer) {
+      clearTimeout(pendingClickRecordTimer);
+      pendingClickRecordTimer = null;
+    }
+    const pending = pendingClickRecord;
+    pendingClickRecord = null;
+    if (awaitScreenshot) {
+      sendPointerStepWithScreenshot(
+        pending.step,
+        pending.visualEl,
+        pending.clientX,
+        pending.clientY,
+        pending.screenshotTask,
+      );
+    } else {
+      sendStep(pending.step);
+    }
+    return true;
+  }
+
   function scheduleClickStep(step, visualEl, clientX, clientY, screenshotTask = null) {
     if (pendingClickRecordTimer) clearTimeout(pendingClickRecordTimer);
+    pendingClickRecord = { step, visualEl, clientX, clientY, screenshotTask };
     pendingClickRecordTimer = setTimeout(() => {
       pendingClickRecordTimer = null;
-      sendPointerStepWithScreenshot(step, visualEl, clientX, clientY, screenshotTask);
+      const pending = pendingClickRecord;
+      pendingClickRecord = null;
+      if (!pending) return;
+      sendPointerStepWithScreenshot(
+        pending.step,
+        pending.visualEl,
+        pending.clientX,
+        pending.clientY,
+        pending.screenshotTask,
+      );
     }, 260);
   }
 
@@ -1555,9 +2569,38 @@
   }
 
   function clearPendingClickStep() {
-    if (!pendingClickRecordTimer) return;
-    clearTimeout(pendingClickRecordTimer);
-    pendingClickRecordTimer = null;
+    if (pendingClickRecordTimer) {
+      clearTimeout(pendingClickRecordTimer);
+      pendingClickRecordTimer = null;
+    }
+    pendingClickRecord = null;
+  }
+
+  function flushPendingClickStepForNavigation() {
+    if (!isRecording || isPaused) return false;
+    return sendPendingClickRecord(false);
+  }
+
+  function handlePossibleNavigationAfterClick() {
+    flushPendingClickStepForNavigation();
+  }
+
+  function installNavigationFlushHooks() {
+    if (window.__AT_NAVIGATION_FLUSH_HOOKED__) return;
+    window.__AT_NAVIGATION_FLUSH_HOOKED__ = true;
+    const wrapHistoryMethod = (name) => {
+      const original = history[name];
+      if (typeof original !== 'function') return;
+      history[name] = function wrappedHistoryMethod(...args) {
+        const ret = original.apply(this, args);
+        try {
+          handlePossibleNavigationAfterClick();
+        } catch (e) { /* ignore */ }
+        return ret;
+      };
+    };
+    wrapHistoryMethod('pushState');
+    wrapHistoryMethod('replaceState');
   }
 
   function clearPendingTreeHover() {
@@ -1596,6 +2639,8 @@
     const stopBtn = document.getElementById('__at_stop_btn__');
     const cancelBtn = document.getElementById('__at_cancel_btn__');
     const pauseBtn = document.getElementById('__at_pause_btn__');
+    const saveVarBtn = document.getElementById('__at_save_var_btn__');
+    const addAssertBtn = document.getElementById('__at_add_assert_btn__');
     if (stopBtn) {
       stopBtn.disabled = false;
       stopBtn.textContent = '停止并保存';
@@ -1604,7 +2649,19 @@
       cancelBtn.disabled = false;
       cancelBtn.textContent = '取消录制';
     }
-    if (pauseBtn) pauseBtn.disabled = false;
+    if (pauseBtn) {
+      pauseBtn.disabled = false;
+      const label = pauseBtn.querySelector('.__at_btn_label__');
+      if (label) label.textContent = isPaused ? '继续' : '暂停';
+    }
+    if (saveVarBtn) {
+      saveVarBtn.disabled = false;
+      setVariableCaptureMode(false);
+    }
+    if (addAssertBtn) {
+      addAssertBtn.disabled = false;
+      setAssertionCaptureMode(false);
+    }
   }
 
   function armToolbarActionTimeout() {
@@ -1619,8 +2676,8 @@
     const raw = normalizeToElement(event.target);
     if (!raw || raw.tagName === 'BODY' || raw.tagName === 'HTML') return null;
 
-    // 忽略录制工具栏自身的点击
-    if (raw.closest && raw.closest('#__at_toolbar__')) return null;
+    // 忽略录制工具栏和录制配置弹窗自身的交互。
+    if (isRecorderUiElement(raw)) return null;
 
     // 生成选择器前先移除高亮 class，避免被录入选择器
     raw.classList.remove('__at_hover__');
@@ -1651,13 +2708,13 @@
       }
     }
 
-    const rawOverlay = !!getOverlayAncestor(raw);
+    const rawOptionOverlay = !!getOptionItemElement(raw);
     const inTooltipPopper = !!(raw.closest && raw.closest('.ivu-tooltip-popper'));
-    let optionText = rawOverlay ? getOptionText(raw) : '';
-    if (rawOverlay && isTextFieldLikeClick(el)) {
+    let optionText = rawOptionOverlay ? getOptionText(raw) : '';
+    if (rawOptionOverlay && isTextFieldLikeClick(el)) {
       optionText = '';
     }
-    const inOverlay = (rawOverlay && String(optionText || '').trim() !== '') || inTooltipPopper;
+    const inOverlay = (rawOptionOverlay && String(optionText || '').trim() !== '') || inTooltipPopper;
     let displayText = '';
     if (el.tagName === 'INPUT' && ['checkbox', 'radio'].includes((el.type || '').toLowerCase())) {
       const aria = el.getAttribute('aria-label');
@@ -1684,6 +2741,7 @@
         : `${actionType === 'double_click' ? '双击' : actionType === 'right_click' ? '右键点击' : '点击'} ${el.tagName.toLowerCase()}${displayText ? ': ' + displayText : ''}`,
       locator_meta: buildSmartLocatorMeta(el, targetSelector, targetXpath, optionText || displayText || ''),
     };
+    attachVirtualScrollContext(step, el, raw, optionText || displayText || '');
     if (inOverlay) {
       const reveal = getRevealDependencyForClick(el, raw, true);
       if (reveal) {
@@ -1711,6 +2769,10 @@
   }
 
   function handleClick(event) {
+    if (!isTrustedRecordingEvent(event)) return;
+    if (isRecorderUiEvent(event)) return;
+    if (handleVariableCaptureClick(event)) return;
+    if (handleAssertionCaptureClick(event)) return;
     if (event.detail && event.detail > 1) return;
     const built = buildPointerStep(event, 'click');
     if (!built) return;
@@ -1727,6 +2789,8 @@
   }
 
   function handleDoubleClick(event) {
+    if (!isTrustedRecordingEvent(event)) return;
+    if (isRecorderUiEvent(event)) return;
     clearPendingClickStep();
     const built = buildPointerStep(event, 'double_click');
     if (!built) return;
@@ -1735,6 +2799,8 @@
   }
 
   function handleContextMenu(event) {
+    if (!isTrustedRecordingEvent(event)) return;
+    if (isRecorderUiEvent(event)) return;
     clearPendingClickStep();
     const built = buildPointerStep(event, 'right_click');
     if (!built) return;
@@ -1980,7 +3046,7 @@
       const crop = getThumbCropRect(visualEl);
       const screenshotTask = (async () => {
         try {
-          const thumb = await captureStepThumbnail(visualEl);
+          const thumb = await captureStepThumbnail(visualEl, step);
           if (thumb) {
             step.screenshot = thumb;
             if (crop) {
@@ -2162,7 +3228,8 @@
     const targetSelector = ensureUniqueSelector(el, getUniqueSelector(el));
     const targetXpath = getXPath(el);
     const sensitive = isSensitivePasswordInput(el);
-    const rawValue = el.value ?? '';
+    const isEditable = !!(el.isContentEditable || (el.closest && el.closest('[contenteditable="true"]')));
+    const rawValue = isEditable ? (el.textContent ?? '') : (el.value ?? '');
     const nameHint = el.name ? `[name=${el.name}]` : (el.id ? `[id=${el.id}]` : '');
     return {
       action_type: 'input',
@@ -2173,7 +3240,7 @@
       url: location.href,
       description: sensitive
         ? `输入密码到 ${el.tagName.toLowerCase()}${nameHint}`
-        : `输入 "${String(el.value || '').slice(0, 50)}" 到 ${el.tagName.toLowerCase()}${nameHint}`,
+        : `输入 "${String(rawValue || '').slice(0, 50)}" 到 ${isEditable ? 'contenteditable' : el.tagName.toLowerCase()}${nameHint}`,
       locator_meta: buildSmartLocatorMeta(el, targetSelector, targetXpath, sensitive ? '' : rawValue),
     };
   }
@@ -2213,7 +3280,7 @@
     const r = root.getBoundingClientRect();
     void (async () => {
       try {
-        const thumb = await captureStepThumbnail(root);
+        const thumb = await captureStepThumbnail(root, step);
         if (thumb) {
           step.screenshot = thumb;
           if (crop) {
@@ -2228,7 +3295,7 @@
   }
 
   function sendInputStep(el, withScreenshot = true) {
-    if (!el || !['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName)) return;
+    if (!el || (!['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) && !el.isContentEditable)) return;
     const step = buildInputStep(el);
     if (!withScreenshot) {
       sendStep(step);
@@ -2239,7 +3306,7 @@
     const r = visualEl.getBoundingClientRect();
     void (async () => {
       try {
-        const thumb = await captureStepThumbnail(visualEl);
+        const thumb = await captureStepThumbnail(visualEl, step);
         if (thumb) {
           step.screenshot = thumb;
           if (crop) {
@@ -2265,9 +3332,16 @@
   }
 
   function handleInput(event) {
+    if (!isTrustedRecordingEvent(event)) return;
     if (!isRecording || isPaused) return;
-    const el = event.target;
-    if (!el || !['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName)) return;
+    if (isRecorderUiEvent(event)) return;
+    let el = event.target;
+    if (el && !['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) && !el.isContentEditable) {
+      el = el.closest?.('[contenteditable="true"]') || el;
+    }
+    if (!el || (!['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) && !el.isContentEditable)) return;
+    // 原生 select 的 input/change 语义不同于文本输入；统一交给 change 录成 select 动作。
+    if (el.tagName === 'SELECT') return;
     // 勾选/单选由 click 记录；勾选后会触发 input，value 常为 "on"，避免多记一步「输入 on」
     if (el.tagName === 'INPUT') {
       const t = (el.type || '').toLowerCase();
@@ -2293,16 +3367,19 @@
   }
 
   function handleChange(event) {
+    if (!isTrustedRecordingEvent(event)) return;
     if (!isRecording || isPaused) return;
+    if (isRecorderUiEvent(event)) return;
     const el = event.target;
     if (!el || el.tagName !== 'SELECT') return;
     const targetSelector = ensureUniqueSelector(el, getUniqueSelector(el));
     const targetXpath = getXPath(el);
     const step = {
-      action_type: 'input',
+      action_type: 'select',
       target_selector: targetSelector,
       target_xpath: targetXpath,
       value: el.value,
+      value_text: el.options[el.selectedIndex]?.text || '',
       url: location.href,
       description: `选择 "${el.options[el.selectedIndex]?.text}" 从 select`,
       locator_meta: buildSmartLocatorMeta(el, targetSelector, targetXpath, el.value),
@@ -2312,7 +3389,7 @@
     const r = visualEl.getBoundingClientRect();
     void (async () => {
       try {
-        const thumb = await captureStepThumbnail(visualEl);
+        const thumb = await captureStepThumbnail(visualEl, step);
         if (thumb) {
           step.screenshot = thumb;
           if (crop) {
@@ -2327,7 +3404,9 @@
   }
 
   function handleKeyDown(event) {
+    if (!isTrustedRecordingEvent(event)) return;
     if (!isRecording || isPaused) return;
+    if (isRecorderUiEvent(event)) return;
     if (event.isComposing) return;
     const el = event.target;
     const monacoRoot = getMonacoEditorRoot(el);
@@ -2373,7 +3452,7 @@
     const r = visualEl.getBoundingClientRect();
     void (async () => {
       try {
-        const thumb = await captureStepThumbnail(visualEl);
+        const thumb = await captureStepThumbnail(visualEl, step);
         if (thumb) {
           step.screenshot = thumb;
           if (crop) {
@@ -2394,7 +3473,9 @@
   highlightStyle.textContent = `.__at_hover__ { outline: 2px solid #ff5722 !important; outline-offset: 2px !important; }`;
 
   function handleMouseOver(event) {
+    if (!isTrustedRecordingEvent(event)) return;
     if (!isRecording || isPaused) return;
+    if (isRecorderUiEvent(event)) return;
     let t = event.target;
     if (t.nodeType === Node.TEXT_NODE) t = t.parentElement;
     if (highlightEl) highlightEl.classList.remove('__at_hover__');
@@ -2505,51 +3586,164 @@
     document.head.appendChild(highlightStyle);
 
     const blinkStyle = document.createElement('style');
-    blinkStyle.textContent = '@keyframes at-blink { 0%,100%{opacity:1} 50%{opacity:0.3} }';
+    blinkStyle.textContent = `
+      @keyframes at-pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.45;transform:scale(.78)} }
+      #__at_toolbar__, #__at_toolbar__ * { box-sizing:border-box; letter-spacing:0 !important; }
+      #__at_toolbar__ {
+        position:fixed; z-index:2147483647; width:260px; color:#f8fafc;
+        border:1px solid rgba(148,163,184,.26); border-radius:12px;
+        background:rgba(15,23,42,.94); box-shadow:0 18px 48px rgba(15,23,42,.32);
+        font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+        pointer-events:none; overflow:hidden; backdrop-filter:blur(14px);
+      }
+      #__at_toolbar_drag__ {
+        display:flex; align-items:center; gap:10px; padding:12px 12px 10px;
+        cursor:grab; user-select:none; -webkit-user-select:none; touch-action:none; pointer-events:auto;
+        border-bottom:1px solid rgba(148,163,184,.16);
+      }
+      .__at_status_dot__ {
+        width:9px; height:9px; border-radius:999px; background:#22c55e;
+        box-shadow:0 0 0 4px rgba(34,197,94,.16); animation:at-pulse 1.2s infinite;
+        flex:none;
+      }
+      .__at_title_stack__ { min-width:0; flex:1; display:grid; gap:2px; }
+      .__at_title_stack__ strong { font-size:13px; line-height:1.2; color:#fff; font-weight:750; }
+      .__at_drag_mark__ { color:#64748b; font-size:14px; line-height:1; }
+      .__at_toolbar_body__ { padding:12px; display:grid; gap:10px; }
+      #__at_step_count__ {
+        min-height:38px; display:flex; align-items:center; justify-content:space-between; gap:10px;
+        border:1px solid rgba(148,163,184,.16); border-radius:10px; background:rgba(15,23,42,.58);
+        padding:8px 10px; color:#cbd5e1; font-size:12px; line-height:1.2;
+      }
+      #__at_step_count__ b { color:#fff; font-size:18px; line-height:1; font-weight:780; }
+      .__at_btn_grid__ { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+      .__at_btn_row__ { display:grid; grid-template-columns:1fr; gap:8px; }
+      .__at_btn__ {
+        min-height:36px; border:1px solid rgba(148,163,184,.24); border-radius:9px;
+        background:rgba(30,41,59,.82); color:#f8fafc; cursor:pointer; pointer-events:auto;
+        display:flex; align-items:center; justify-content:center; gap:6px;
+        font-size:12px; line-height:1; font-weight:720; padding:0 6px;
+        white-space:nowrap; overflow:hidden;
+      }
+      .__at_btn__ span { white-space:nowrap; flex:none; }
+      .__at_btn__:hover { background:rgba(51,65,85,.92); border-color:rgba(203,213,225,.34); }
+      .__at_btn__:disabled { cursor:not-allowed; opacity:.58; }
+      .__at_btn__.__at_active__ { background:#1d4ed8; border-color:#60a5fa; color:#fff; }
+      .__at_btn_primary__ { width:100%; background:#f97316; border-color:#fb923c; color:#fff; }
+      .__at_btn_primary__:hover { background:#ea580c; border-color:#fdba74; }
+      .__at_btn_danger__ { width:100%; background:transparent; color:#cbd5e1; border-color:rgba(148,163,184,.22); }
+      #__at_variable_dialog__, #__at_variable_dialog__ *,
+      #__at_assertion_dialog__, #__at_assertion_dialog__ * { box-sizing:border-box; letter-spacing:0 !important; }
+      #__at_variable_dialog__, #__at_assertion_dialog__ {
+        position:fixed; inset:0; z-index:2147483647; display:flex; align-items:center; justify-content:center;
+        background:rgba(15,23,42,.26); pointer-events:auto; font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      }
+      .__at_var_card__ {
+        width:min(420px, calc(100vw - 32px)); border:1px solid rgba(229,231,235,.95); border-radius:12px;
+        background:#ffffff; color:#111827; box-shadow:0 24px 72px rgba(15,23,42,.20); padding:18px;
+      }
+      .__at_var_head__ { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:16px; }
+      .__at_var_kicker__ { color:#111827; font-size:11px; font-weight:820; text-transform:uppercase; line-height:1.2; }
+      .__at_var_title__ { color:#111827; font-size:17px; font-weight:820; line-height:1.3; margin-top:3px; }
+      .__at_icon_btn__ {
+        width:30px; height:30px; border:1px solid #e5e7eb; border-radius:8px; background:#f9fafb; color:#6b7280;
+        cursor:pointer; font-size:18px; line-height:1;
+      }
+      .__at_icon_btn__:hover { color:#111827; border-color:#111827; background:#f4f4f5; }
+      .__at_var_field__ { display:grid; gap:7px; margin-top:14px; color:#374151; font-size:13px; font-weight:760; }
+      .__at_var_field__[hidden] { display:none; }
+      .__at_var_head__ + .__at_var_field__ { margin-top:0; }
+      .__at_var_label__ { color:#374151; font-size:13px; line-height:1.25; font-weight:760; }
+      .__at_var_field__ input,
+      .__at_var_field__ select {
+        width:100%; height:40px; border:1px solid #d1d5db; border-radius:9px; color:#111827; background:#fff;
+        padding:0 11px; outline:none; font:600 14px/1.2 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+      }
+      .__at_var_field__ input[type="hidden"] { display:none; }
+      .__at_var_field__ select { font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; appearance:auto; }
+      .__at_var_field__ input:focus,
+      .__at_var_field__ select:focus { border-color:#111827; box-shadow:0 0 0 3px rgba(250,255,105,.55); }
+      .__at_select__ { position:relative; width:100%; }
+      .__at_select_trigger__ {
+        width:100%; height:40px; display:flex; align-items:center; justify-content:space-between; gap:10px;
+        border:1px solid #d1d5db; border-radius:9px; background:#fff; color:#111827;
+        padding:0 11px; font-size:14px; line-height:1.2; font-weight:760; cursor:pointer;
+      }
+      .__at_select_trigger:hover { border-color:#9ca3af; background:#f9fafb; }
+      .__at_select_trigger[aria-expanded="true"] { border-color:#111827; box-shadow:0 0 0 3px rgba(250,255,105,.55); }
+      .__at_select_chevron__ { color:#6b7280; font-size:14px; line-height:1; transform:translateY(-1px); }
+      .__at_select_menu__ {
+        position:absolute; left:0; right:0; top:calc(100% + 6px); z-index:1;
+        display:grid; gap:3px; border:1px solid #d1d5db; border-radius:10px; background:#fff;
+        padding:5px; box-shadow:0 14px 34px rgba(15,23,42,.16);
+      }
+      .__at_select_menu__[hidden] { display:none; }
+      .__at_select_option__ {
+        height:34px; border:0; border-radius:7px; background:transparent; color:#374151; cursor:pointer;
+        padding:0 9px; text-align:left; font-size:13px; font-weight:760;
+      }
+      .__at_select_option__:hover { background:#f3f4f6; color:#111827; }
+      .__at_select_option__.__at_selected__ { background:#111827; color:#fff; }
+      .__at_var_ai_box__ {
+        display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:end; margin-top:12px;
+        border:1px solid #e5e7eb; border-radius:10px; background:#f9fafb; padding:10px;
+      }
+      .__at_var_ai_box__ .__at_var_field__ { margin-top:0; }
+      .__at_ai_btn__ {
+        height:40px; min-width:86px; border:1px solid #111827; border-radius:9px; background:#111827; color:#fff;
+        padding:0 12px; font-size:13px; font-weight:820; cursor:pointer; white-space:nowrap;
+      }
+      .__at_ai_btn__:disabled { opacity:.58; cursor:wait; }
+      .__at_ai_btn__:not(:disabled):hover { background:#27272a; border-color:#27272a; }
+      .__at_var_extract_fields__ { display:grid; gap:10px; margin-top:0; }
+      .__at_var_extract_fields__[hidden] { display:none; }
+      .__at_var_preview__ { display:grid; gap:7px; margin-top:14px; color:#6b7280; font-size:12px; font-weight:720; }
+      .__at_assert_preview__ { margin-top:0; }
+      .__at_var_preview__ code {
+        display:block; max-height:92px; overflow:auto; white-space:pre-wrap; word-break:break-word;
+        border:1px solid #e5e7eb; border-radius:9px; background:#f9fafb; color:#111827; padding:10px;
+        font:700 13px/1.45 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+      }
+      .__at_var_usage__ { margin-top:10px; color:#6b7280; font-size:12px; line-height:1.5; }
+      .__at_var_usage__ code { color:#111827; background:#faff69; border-radius:5px; padding:1px 4px; font-weight:800; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }
+      .__at_var_error__ { min-height:18px; margin-top:8px; color:#dc2626; font-size:12px; line-height:1.4; }
+      .__at_var_actions__ { display:flex; justify-content:flex-end; gap:8px; margin-top:8px; }
+      .__at_secondary_btn__, .__at_primary_btn__ {
+        height:36px; border-radius:9px; padding:0 14px; cursor:pointer; font-size:13px; font-weight:760;
+      }
+      .__at_secondary_btn__ { border:1px solid #d1d5db; background:#fff; color:#374151; }
+      .__at_secondary_btn__:hover { border-color:#111827; color:#111827; background:#f4f4f5; }
+      .__at_primary_btn__ { border:1px solid #111827; background:#111827; color:#fff; }
+      .__at_primary_btn__:hover { background:#000; border-color:#000; box-shadow:0 0 0 3px rgba(250,255,105,.55); }
+    `;
     document.head.appendChild(blinkStyle);
 
     const toolbar = document.createElement('div');
     toolbar._atBlinkStyleEl = blinkStyle;
     toolbar.id = '__at_toolbar__';
     toolbar.innerHTML = `
-        <div id="__at_toolbar_drag__" title="拖动移动" style="
-          display:flex;align-items:center;gap:8px;margin-bottom:10px;
-          cursor:grab;user-select:none;-webkit-user-select:none;touch-action:none;
-          pointer-events:auto
-        ">
-          <span style="width:8px;height:8px;background:#ff5722;border-radius:50%;animation:at-blink 1s infinite;display:inline-block;flex-shrink:0"></span>
-          <strong style="font-size:13px;flex:1">录制中…</strong>
-          <span style="font-size:10px;color:#888;letter-spacing:0.02em">⠿</span>
+        <div id="__at_toolbar_drag__" title="拖动移动">
+          <span class="__at_status_dot__"></span>
+          <div class="__at_title_stack__">
+            <strong>录制中</strong>
+          </div>
+          <span class="__at_drag_mark__">⠿</span>
         </div>
-        <div id="__at_step_count__" style="font-size:12px;color:#aaa;margin-bottom:10px">已捕获: 0 步</div>
-        <button id="__at_pause_btn__" type="button" style="
-          width:100%;background:#303047;color:#fff;border:1px solid #5a5a7a;
-          border-radius:6px;padding:6px 0;cursor:pointer;font-size:12px;font-weight:600;
-          pointer-events:auto;margin-bottom:8px
-        ">暂停录制</button>
-        <button id="__at_stop_btn__" type="button" style="
-          width:100%;background:#ff5722;color:#fff;border:none;
-          border-radius:6px;padding:6px 0;cursor:pointer;font-size:13px;font-weight:600;
-          pointer-events:auto
-        ">停止并保存</button>
-        <button id="__at_cancel_btn__" type="button" style="
-          width:100%;margin-top:8px;background:transparent;color:#aaa;border:1px solid #444;
-          border-radius:6px;padding:6px 0;cursor:pointer;font-size:12px;
-          pointer-events:auto
-        ">取消录制</button>
+        <div class="__at_toolbar_body__">
+          <div id="__at_step_count__"><span>已捕获步骤</span><b>0</b></div>
+          <div class="__at_btn_row__">
+            <button id="__at_pause_btn__" class="__at_btn__" type="button"><span class="__at_btn_label__">暂停</span></button>
+          </div>
+          <div class="__at_btn_grid__">
+            <button id="__at_save_var_btn__" class="__at_btn__" type="button"><span class="__at_btn_label__">保存变量</span></button>
+            <button id="__at_add_assert_btn__" class="__at_btn__" type="button"><span class="__at_btn_label__">添加断言</span></button>
+          </div>
+          <button id="__at_stop_btn__" class="__at_btn__ __at_btn_primary__" type="button">停止并保存</button>
+          <button id="__at_cancel_btn__" class="__at_btn__ __at_btn_danger__" type="button">取消录制</button>
+        </div>
     `;
 
     toolbar.style.cssText = [
-      'position:fixed',
-      'z-index:2147483647',
-      'background:#1a1a2e',
-      'color:#fff',
-      'border-radius:10px',
-      'padding:12px 16px',
-      'font-family:system-ui,sans-serif',
-      'box-shadow:0 4px 20px rgba(0,0,0,0.4)',
-      'min-width:200px',
-      'border:1px solid #ff5722',
       'pointer-events:none',
     ].join(';');
 
@@ -2565,13 +3759,29 @@
     const stopBtn = document.getElementById('__at_stop_btn__');
     const cancelBtn = document.getElementById('__at_cancel_btn__');
     const pauseBtn = document.getElementById('__at_pause_btn__');
+    const saveVarBtn = document.getElementById('__at_save_var_btn__');
+    const addAssertBtn = document.getElementById('__at_add_assert_btn__');
     pauseBtn.addEventListener('click', () => {
       setPaused(!isPaused);
+    });
+    saveVarBtn.addEventListener('click', () => {
+      if (isPaused) return;
+      flushPendingInputFor();
+      clearPendingClickStep();
+      setVariableCaptureMode(!variableCaptureMode);
+    });
+    addAssertBtn.addEventListener('click', () => {
+      if (isPaused) return;
+      flushPendingInputFor();
+      clearPendingClickStep();
+      setAssertionCaptureMode(!assertionCaptureMode);
     });
     stopBtn.addEventListener('click', () => {
       stopBtn.disabled = true;
       if (cancelBtn) cancelBtn.disabled = true;
       if (pauseBtn) pauseBtn.disabled = true;
+      if (saveVarBtn) saveVarBtn.disabled = true;
+      if (addAssertBtn) addAssertBtn.disabled = true;
       armToolbarActionTimeout();
       const sendStop = (retried = false) => {
         chrome.runtime.sendMessage({ type: 'AT_STOP_RECORDING' }, (response) => {
@@ -2586,6 +3796,8 @@
       stopBtn.disabled = true;
       cancelBtn.disabled = true;
       if (pauseBtn) pauseBtn.disabled = true;
+      if (saveVarBtn) saveVarBtn.disabled = true;
+      if (addAssertBtn) addAssertBtn.disabled = true;
       armToolbarActionTimeout();
       const sendCancel = (retried = false) => {
         chrome.runtime.sendMessage({ type: 'AT_CANCEL_RECORDING' }, (response) => {
@@ -2599,6 +3811,8 @@
   }
 
   function removeToolbar() {
+    closeVariableDialog();
+    closeAssertionDialog();
     const el = document.getElementById('__at_toolbar__');
     if (el?._atBlinkStyleEl?.parentNode) {
       el._atBlinkStyleEl.remove();
@@ -2611,7 +3825,9 @@
 
   function updateStepCount(count) {
     const el = document.getElementById('__at_step_count__');
-    if (el) el.textContent = `已捕获: ${count} 步`;
+    const num = el?.querySelector?.('b');
+    if (num) num.textContent = String(count);
+    else if (el) el.textContent = `已捕获: ${count} 步`;
   }
 
   function setPaused(paused) {
@@ -2622,6 +3838,8 @@
       // ignore
     }
     if (isPaused) {
+      setVariableCaptureMode(false);
+      setAssertionCaptureMode(false);
       flushPendingInputFor();
       clearPendingClickStep();
       clearPendingTreeHover();
@@ -2634,13 +3852,12 @@
     const pauseBtn = document.getElementById('__at_pause_btn__');
     const dragTitle = document.querySelector('#__at_toolbar_drag__ strong');
     if (pauseBtn) {
-      pauseBtn.textContent = isPaused ? '继续录制' : '暂停录制';
-      pauseBtn.style.background = isPaused ? '#1f4d2b' : '#303047';
-      pauseBtn.style.borderColor = isPaused ? '#2d8a47' : '#5a5a7a';
-      pauseBtn.style.color = '#fff';
+      const label = pauseBtn.querySelector('.__at_btn_label__');
+      if (label) label.textContent = isPaused ? '继续' : '暂停';
+      pauseBtn.classList.toggle('__at_active__', isPaused);
     }
     if (dragTitle) {
-      dragTitle.textContent = isPaused ? '录制已暂停' : '录制中…';
+      dragTitle.textContent = isPaused ? '录制已暂停' : '录制中';
     }
   }
 
@@ -2650,6 +3867,11 @@
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'AT_START_RECORDING') {
       isRecording = true;
+      recordedVariableNames.clear();
+      closeVariableDialog();
+      closeAssertionDialog();
+      setVariableCaptureMode(false);
+      setAssertionCaptureMode(false);
       screenshotMode = String(message.screenshotMode || '').trim().toLowerCase() === 'full_hd' ? 'full_hd' : 'standard';
       lastToggleDedupeAt = 0;
       lastToggleDedupeKey = '';
@@ -2658,6 +3880,7 @@
       createToolbar();
       setPaused(message.paused === true);
       startHeartbeat();
+      installNavigationFlushHooks();
       document.addEventListener('click', handleClick, true);
       document.addEventListener('dblclick', handleDoubleClick, true);
       document.addEventListener('contextmenu', handleContextMenu, true);
@@ -2665,6 +3888,10 @@
       document.addEventListener('change', handleChange, true);
       document.addEventListener('keydown', handleKeyDown, true);
       document.addEventListener('mouseover', handleMouseOver, true);
+      window.addEventListener('pagehide', handlePossibleNavigationAfterClick, true);
+      window.addEventListener('beforeunload', handlePossibleNavigationAfterClick, true);
+      window.addEventListener('hashchange', handlePossibleNavigationAfterClick, true);
+      window.addEventListener('popstate', handlePossibleNavigationAfterClick, true);
       sendResponse({ ok: true });
     }
 
@@ -2673,6 +3900,11 @@
       stopHeartbeat();
       isRecording = false;
       isPaused = false;
+      recordedVariableNames.clear();
+      closeVariableDialog();
+      closeAssertionDialog();
+      setVariableCaptureMode(false);
+      setAssertionCaptureMode(false);
       flushPendingInputFor();
       clearPendingClickStep();
       clearPendingTreeHover();
@@ -2684,6 +3916,10 @@
       document.removeEventListener('change', handleChange, true);
       document.removeEventListener('keydown', handleKeyDown, true);
       document.removeEventListener('mouseover', handleMouseOver, true);
+      window.removeEventListener('pagehide', handlePossibleNavigationAfterClick, true);
+      window.removeEventListener('beforeunload', handlePossibleNavigationAfterClick, true);
+      window.removeEventListener('hashchange', handlePossibleNavigationAfterClick, true);
+      window.removeEventListener('popstate', handlePossibleNavigationAfterClick, true);
       const stopBtn = document.getElementById('__at_stop_btn__');
       const cancelBtn = document.getElementById('__at_cancel_btn__');
       const pauseBtn = document.getElementById('__at_pause_btn__');
@@ -2704,6 +3940,11 @@
       stopHeartbeat();
       isRecording = false;
       isPaused = false;
+      recordedVariableNames.clear();
+      closeVariableDialog();
+      closeAssertionDialog();
+      setVariableCaptureMode(false);
+      setAssertionCaptureMode(false);
       clearTimeout(inputTimer);
       inputTimer = null;
       pendingInputEl = null;
@@ -2717,6 +3958,10 @@
       document.removeEventListener('change', handleChange, true);
       document.removeEventListener('keydown', handleKeyDown, true);
       document.removeEventListener('mouseover', handleMouseOver, true);
+      window.removeEventListener('pagehide', handlePossibleNavigationAfterClick, true);
+      window.removeEventListener('beforeunload', handlePossibleNavigationAfterClick, true);
+      window.removeEventListener('hashchange', handlePossibleNavigationAfterClick, true);
+      window.removeEventListener('popstate', handlePossibleNavigationAfterClick, true);
       const stopBtn2 = document.getElementById('__at_stop_btn__');
       const cancelBtn2 = document.getElementById('__at_cancel_btn__');
       const pauseBtn2 = document.getElementById('__at_pause_btn__');

@@ -1,16 +1,52 @@
 (function () { 'use strict'; if (window.__AT_SELECTOR_CORE__) return;
-  /** React/Ant Design/rc 组件等运行时自增 id，重渲染后会变，不能用于稳定定位 */
-  function isVolatileAutoId(id) {
-    if (!id || typeof id !== 'string') return true;
-    if (/^\d+$/.test(id)) return true;
-    if (/[a-f0-9]{8,}/i.test(id)) return true;
-    // ant-design / rc-select / rc-input 等：rc_xxx_数字
-    if (/^rc_[a-z0-9_]+_\d+$/i.test(id)) return true;
-    // React useId 常见形式
-    if (/^:r[a-z0-9]*:$/i.test(id)) return true;
-    if (/^radix-/i.test(id)) return true;
-    if (/^headlessui/i.test(id)) return true;
+  function normalizeAttrValue(value) {
+    return String(value || '').trim();
+  }
+
+  function hasLongRandomSegment(value) {
+    const v = normalizeAttrValue(value);
+    if (!v) return false;
+    if (/[a-f0-9]{8,}/i.test(v)) return true;
+    if (/[a-z0-9]{10,}/i.test(v) && /\d/.test(v) && /[a-z]/i.test(v)) return true;
     return false;
+  }
+
+  /** React/Vue/组件库等运行时自增 id，重渲染后会变，不能用于稳定定位 */
+  function isVolatileAutoId(id) {
+    const v = normalizeAttrValue(id);
+    if (!v) return true;
+    if (/^\d+$/.test(v)) return true;
+    if (/^[0-9]{10,}$/.test(v)) return true;
+    if (/^[a-f0-9]{8,}$/i.test(v)) return true;
+    if (/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(v)) return true;
+    if (/^(?:id|input|select|dropdown|listbox|menu|tooltip|popover|dialog|panel|option|item|field|label|form)[-_]?\d+$/i.test(v)) return true;
+    if (/^(?:input|select|dropdown|listbox|menu|tooltip|popover|dialog|panel|option|item|field|label|form)[-_][a-z0-9]{6,}$/i.test(v)) return true;
+    if (/^(?:el-id|el-popper|el-tooltip|el-popover|el-select|el-cascader|el-date-picker)-\d+(?:-\d+)*$/i.test(v)) return true;
+    // ant-design / rc-select / rc-input 等：rc_xxx_数字
+    if (/^rc_[a-z0-9_]+_\d+$/i.test(v)) return true;
+    if (/^rc_[a-z0-9_]+_\d+(?:_[a-z0-9]+)*$/i.test(v)) return true;
+    // React useId 常见形式
+    if (/^:r[a-z0-9]*:$/i.test(v)) return true;
+    if (/^radix-/i.test(v)) return true;
+    if (/^headlessui/i.test(v)) return true;
+    if (/^(?:mui|mantine|chakra|react-select|downshift|reach|floating-ui|tippy)-/i.test(v) && hasLongRandomSegment(v)) return true;
+    return false;
+  }
+
+  function isVolatileAttributeValue(attr, value) {
+    const name = String(attr || '').toLowerCase();
+    const v = normalizeAttrValue(value);
+    if (!v) return true;
+    if (name === 'role') return false;
+    if (['aria-controls', 'aria-describedby', 'aria-labelledby', 'aria-owns', 'aria-activedescendant', 'for'].includes(name)) {
+      return v.split(/\s+/).some((token) => isVolatileAutoId(token));
+    }
+    if (['id', 'data-id'].includes(name)) return isVolatileAutoId(v);
+    if (name.startsWith('data-v-')) return true;
+    if (['data-testid', 'data-test', 'data-qa', 'data-cy', 'name', 'aria-label', 'placeholder', 'title'].includes(name)) {
+      return false;
+    }
+    return isVolatileAutoId(v);
   }
 
   function isVolatileStateClass(cls) {
@@ -28,12 +64,24 @@
     ].some((re) => re.test(cls));
   }
 
+  function isVolatileClass(cls) {
+    const c = String(cls || '').trim();
+    if (!c) return true;
+    if (c.startsWith('__at_')) return true;
+    if (isVolatileStateClass(c)) return true;
+    if (/^[a-f0-9]{6,}$/i.test(c)) return true;
+    if (/^css-[a-z0-9]{5,}$/i.test(c)) return true;
+    if (/^sc-[a-z0-9]{5,}$/i.test(c)) return true;
+    if (/^[a-z0-9]+-[a-z0-9]{8,}$/i.test(c) && /\d/.test(c)) return true;
+    if (/^[A-Za-z0-9_-]+__[A-Za-z0-9_-]{5,}$/i.test(c) && /\d/.test(c)) return true;
+    if (/^(?:ivu-table-column|el-table_\d+_column|ant-table-cell-[a-z0-9]+|v-\d+)-/i.test(c)) return true;
+    return false;
+  }
+
   // 过滤掉录制工具临时注入的 class、纯随机 hash class，以及 focus/hover 等瞬时状态 class
   function cleanClasses(el) {
     if (!el.className || typeof el.className !== 'string') return [];
-    return el.className.trim().split(/\s+/).filter(c =>
-      c && !c.startsWith('__at_') && !/^[a-f0-9]{6,}$/.test(c) && !isVolatileStateClass(c)
-    );
+    return el.className.trim().split(/\s+/).filter(c => !isVolatileClass(c));
   }
 
   /** 若选择器匹配多个节点，改用结构路径，避免 querySelector 总点到第一个 */
@@ -84,9 +132,9 @@
     }
 
     // 2. 语义化属性
-    for (const attr of ['data-testid', 'data-test', 'data-id', 'name', 'aria-label', 'role']) {
+    for (const attr of ['data-testid', 'data-test', 'data-qa', 'data-cy', 'data-id', 'name', 'aria-label', 'role']) {
       const val = el.getAttribute(attr);
-      if (val) {
+      if (val && !isVolatileAttributeValue(attr, val)) {
         const sel = `${el.tagName.toLowerCase()}[${attr}="${CSS.escape(val)}"]`;
         if (document.querySelectorAll(sel).length === 1) return sel;
       }
@@ -104,7 +152,7 @@
           if (rowIdx >= 0) {
             const tag = section.tagName.toLowerCase();
             let prefix = '';
-            if (table && table.id && !/^\d+$/.test(table.id) && !/[a-f0-9]{8,}/i.test(table.id)) {
+            if (table && table.id && !isVolatileAutoId(table.id)) {
               const tid = '#' + CSS.escape(table.id);
               try {
                 if (document.querySelectorAll(tid).length === 1) prefix = tid + ' ';
@@ -135,7 +183,7 @@
     // 4. 按钮/链接：用文本内容 + tag 辅助定位
     if (['BUTTON', 'A'].includes(el.tagName)) {
       const title = el.getAttribute('title');
-      if (title) {
+      if (title && !isVolatileAttributeValue('title', title)) {
         const sel = `${el.tagName.toLowerCase()}[title="${CSS.escape(title)}"]`;
         if (document.querySelectorAll(sel).length === 1) return sel;
       }
@@ -417,6 +465,9 @@ window.__AT_SELECTOR_CORE__ = {
   getUniqueSelector,
   getXPath,
   cleanClasses,
+  isVolatileAutoId,
+  isVolatileAttributeValue,
+  isVolatileClass,
   isVolatileStateClass,
 };
 })();

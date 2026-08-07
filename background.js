@@ -17,9 +17,15 @@ const state = {
   /** 本次录制是否由扩展新开标签页（停止录制后自动关闭） */
   recordingOpenedNewTab: false,
   recordingWindowId: null,
+  recordingTabs: [],
+  currentRecordingTabIndex: 0,
   recordingScreenshotMode: 'standard',
   recordingPaused: false,
   recordingStartedAt: 0,
+  recordingSessionId: '',
+  recordingSessionEnabled: false,
+  recordingSessionHealthy: false,
+  pendingQuotaSave: null,
   activePlayCount: 0,
 };
 
@@ -92,6 +98,144 @@ async function resolveWindowPreference(message, sourceWindowId) {
     if (bounds) return { mode, ...bounds };
   }
   return { mode: 'maximized' };
+}
+
+function waitForTabComplete(tabId, timeoutMs = 30000) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    const onUpdated = (updatedTabId, changeInfo) => {
+      if (Number(updatedTabId) === Number(tabId) && changeInfo.status === 'complete') {
+        finish(true);
+      }
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.get(tabId)
+      .then((tab) => {
+        if (tab.status === 'complete') finish(true);
+      })
+      .catch(() => finish(false));
+  });
+}
+
+async function checkSelectorInTab({ tabId, url, selector, timeoutMs = 12000 }) {
+  const tid = Number(tabId);
+  const css = String(selector || '').trim();
+  if (!tid) return { ok: false, found: false, error: 'tabId is required' };
+  if (url && String(url).trim()) {
+    await chrome.tabs.update(tid, { url: String(url).trim(), active: true });
+    await waitForTabComplete(tid, 30000);
+  }
+  const deadline = Date.now() + Math.max(1000, Number(timeoutMs) || 12000);
+  let lastError = '';
+  let autoLoggedInSince = 0;
+  let autoLoggedInHref = '';
+  let autoLoggedOutSince = 0;
+  const AUTO_LOGGED_IN_STABLE_MS = 2500;
+  const AUTO_LOGGED_OUT_STABLE_MS = 800;
+  while (Date.now() < deadline) {
+    try {
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId: tid },
+        func: (s) => {
+          try {
+            if (!s) {
+              var href = String(location.href || '').toLowerCase();
+              var bodyText = String(document.body ? document.body.innerText || '' : '').trim();
+              var loweredText = bodyText.toLowerCase();
+              var hasContent = bodyText.length > 0 || Boolean(document.querySelector('#app,#root,main,[role="main"]'));
+              if (!hasContent) return { found: false, mode: 'auto', waitingForContent: true };
+              var hasPassword = Boolean(document.querySelector('input[type="password"]'));
+              var loginUrlHit = /(^|[/?#&])(login|signin|sign-in|auth|sso)([/?#&=]|$)/i.test(href);
+              var loginButtonHit = false;
+              var buttons = document.querySelectorAll('button,input[type="submit"],a,[role="button"]');
+              for (var i = 0; i < Math.min(buttons.length, 80); i++) {
+                var text = String(buttons[i].innerText || buttons[i].value || buttons[i].getAttribute('aria-label') || '').trim().toLowerCase();
+                if (/^(登录|登陆|log in|login|sign in|signin)$/.test(text)) {
+                  loginButtonHit = true;
+                  break;
+                }
+              }
+              var titleText = String(document.title || '').trim();
+              var headingText = '';
+              var headings = document.querySelectorAll('h1,h2,h3,[role="heading"],form legend,form [class*="title"],form [class*="header"]');
+              for (var j = 0; j < Math.min(headings.length, 20); j++) {
+                headingText += ' ' + String(headings[j].innerText || headings[j].textContent || '').trim();
+              }
+              var loginPageTextHit = /(登录|登陆|用户登录|账号登录|密码登录|sign in|log in|login)/i.test(titleText + ' ' + headingText);
+              var unauthorizedHit = /(unauthorized|forbidden|session expired|please sign in|please log in|登录已失效|请先登录|未登录|无权限|会话过期)/i.test(loweredText);
+              var passwordLoginFormHit = hasPassword && (loginButtonHit || loginPageTextHit);
+              var loggedOut = loginUrlHit || unauthorizedHit || passwordLoginFormHit;
+              return {
+                found: !loggedOut,
+                visible: true,
+                mode: 'auto',
+                loggedOut,
+                href,
+                signals: { hasPassword, loginUrlHit, loginButtonHit, loginPageTextHit, unauthorizedHit },
+              };
+            }
+            const el = document.querySelector(s);
+            if (!el) return { found: false };
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            const visible = rect.width > 0
+              && rect.height > 0
+              && style.visibility !== 'hidden'
+              && style.display !== 'none'
+              && Number(style.opacity || 1) > 0.05;
+            return {
+              found: true,
+              visible,
+              text: String(el.textContent || el.value || '').trim().slice(0, 120),
+            };
+          } catch (e) {
+            return { found: false, error: e?.message || String(e) };
+          }
+        },
+        args: [css],
+      });
+      if (result?.error) lastError = result.error;
+      if (result?.mode === 'auto') {
+        const now = Date.now();
+        if (result.waitingForContent) {
+          autoLoggedInSince = 0;
+          autoLoggedOutSince = 0;
+        } else if (result.loggedOut) {
+          autoLoggedInSince = 0;
+          if (!autoLoggedOutSince) autoLoggedOutSince = now;
+          if (now - autoLoggedOutSince >= AUTO_LOGGED_OUT_STABLE_MS) {
+            return { ok: true, found: false, mode: 'auto', signals: result.signals || null };
+          }
+        } else if (result.found) {
+          autoLoggedOutSince = 0;
+          if (!autoLoggedInSince || autoLoggedInHref !== result.href) {
+            autoLoggedInSince = now;
+            autoLoggedInHref = result.href || '';
+          }
+          if (now - autoLoggedInSince >= AUTO_LOGGED_IN_STABLE_MS) {
+            return { ok: true, found: true, mode: 'auto', signals: result.signals || null };
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        continue;
+      }
+      if (result?.found && result?.visible !== false) {
+        return { ok: true, found: true, text: result.text || '' };
+      }
+    } catch (e) {
+      lastError = e?.message || String(e);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  return { ok: true, found: false, error: lastError };
 }
 
 function buildWindowCreateData(url, focused, preference) {
@@ -212,6 +356,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         .start(message.testCaseId, message.startUrl, tabId, {
           insertAfterStepIndex: message.insertAfterStepIndex,
           screenshotMode: message.screenshotMode,
+          reuseTabId: message.reuseTabId,
+          closeReusedTabAfterStop: message.closeReusedTabAfterStop === true,
         })
         .then((response) => {
           if (response?.ok) {
@@ -234,6 +380,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       recorder.setPausedState(message.paused === true).then(sendResponse);
       return true;
 
+    case 'AT_AI_VARIABLE_EXTRACT_RULE':
+      api.aiVariableExtractRule({
+        raw_value: message.rawValue,
+        instruction: message.instruction,
+      })
+        .then((res) => sendResponse({ ok: true, rule: res.data }))
+        .catch((e) => sendResponse({ ok: false, error: e.message || String(e) }));
+      return true;
+
     // 来自中台或弹窗：开始回放（必须在短时间内 sendResponse，否则 MV3 消息通道会关闭，表现为点击无反应）
     case 'AT_PLATFORM_PLAY':
       state.apiBase = message.apiBase || state.apiBase;
@@ -242,6 +397,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         backgroundTab: message.backgroundTab === true,
         reuseTabId: message.reuseTabId ?? null,
         startStepIndex: message.startStepIndex,
+        stopAfterStepIndex: message.stopAfterStepIndex,
+        keepTabOpenAfterPlayback: message.keepTabOpenAfterPlayback === true,
+        suppressResultSave: message.suppressResultSave === true,
+        purpose: message.purpose,
         locale: message.locale || 'zh',
         viewportMode: message.viewportMode,
         viewportWidth: message.viewportWidth,
@@ -264,6 +423,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       chrome.tabs.remove(message.tabId).catch(() => {});
       sendResponse({ ok: true });
       return false;
+
+    case 'AT_PLATFORM_CHECK_SELECTOR':
+      checkSelectorInTab({
+        tabId: message.tabId,
+        url: message.url,
+        selector: message.selector,
+        timeoutMs: message.timeoutMs,
+      })
+        .then(sendResponse)
+        .catch((e) => sendResponse({ ok: false, found: false, error: e.message || String(e) }));
+      return true;
 
     // 来自弹窗：直接回放（同上，不可等整段回放结束再响应）
     case 'AT_POPUP_PLAY':
@@ -295,12 +465,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         try {
           const dataUrl = await chrome.tabs.captureVisibleTab(winId, { format: 'png' });
           let thumb = '';
+          let fullDataUrl = '';
+          try {
+            fullDataUrl = await captureVisibleFullHd(dataUrl);
+          } catch (e) {
+            fullDataUrl = '';
+          }
           if (screenshotMode === SCREENSHOT_MODE_FULL_HD) {
-            thumb = await captureVisibleFullHd(dataUrl);
+            thumb = fullDataUrl;
           } else if (rect) {
             thumb = await cropVisibleToThumb(dataUrl, rect);
           }
-          sendResponse({ ok: !!thumb, dataUrl: thumb });
+          sendResponse({ ok: !!thumb || !!fullDataUrl, dataUrl: thumb, fullDataUrl });
         } catch (e) {
           console.warn('[AT_CAPTURE_STEP_THUMB]', e);
           sendResponse({ ok: false, dataUrl: '' });
@@ -337,6 +513,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       state.authToken = message.authToken || state.authToken;
       recorder.cancel(tabId).then((response) => {
         clearRecordingKeepalive();
+        sendResponse(response);
+      });
+      return true;
+
+    // 来自中台：步骤数超额后，仅保留套餐允许的前 N 步并保存
+    case 'AT_PLATFORM_SAVE_RECORDING_TRIMMED':
+      state.apiBase = message.apiBase || state.apiBase;
+      state.authToken = message.authToken || state.authToken;
+      recorder.savePendingQuotaSteps(message.pendingSaveId, message.limit).then((response) => {
+        sendResponse(response);
+      });
+      return true;
+
+    // 来自中台：步骤数超额后，放弃保存本次录制
+    case 'AT_PLATFORM_DISCARD_RECORDING_SAVE':
+      recorder.discardPendingQuotaSteps(message.pendingSaveId).then((response) => {
         sendResponse(response);
       });
       return true;
@@ -464,6 +656,10 @@ chrome.tabs.onActivated.addListener(({ tabId }) => {
   scheduleInjectActiveTab(tabId);
 });
 
+chrome.tabs.onCreated.addListener((tab) => {
+  void recorder.handleRecordingTabCreated(tab).catch(() => {});
+});
+
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === 'complete' && isInjectablePlatformUrl(tab?.url)) {
     scheduleInjectActiveTab(tabId);
@@ -497,10 +693,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // 标签页关闭时清理状态
 // =========================================================
 chrome.tabs.onRemoved.addListener((tabId) => {
-  if (tabId === state.currentTabId && state.mode === 'recording') {
+  if (state.mode === 'recording') {
     recorder.handleRecordingTabClosed(tabId).catch(() => {});
     return;
   }
   void recorder.handleRecordingTabClosed(tabId).catch(() => {});
-  player.handlePlayTabClosed(tabId);
+  void player.handlePlayTabClosed(tabId).catch(() => {});
 });

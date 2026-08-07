@@ -80,14 +80,17 @@
       || data.type === 'AT_PLATFORM_STOP'
       || data.type === 'AT_PLATFORM_STOP_PLAYBACK'
       || data.type === 'AT_PLATFORM_CANCEL_RECORD'
+      || data.type === 'AT_PLATFORM_SAVE_RECORDING_TRIMMED'
+      || data.type === 'AT_PLATFORM_DISCARD_RECORDING_SAVE'
       || data.type === 'AT_PLATFORM_OPEN_PLAY_TAB'
       || data.type === 'AT_PLATFORM_CLOSE_PLAY_TAB'
+      || data.type === 'AT_PLATFORM_CHECK_SELECTOR'
     ) {
       // 统一在此注入 auth token，前端和 background 均无需感知 token 来源
       const authToken = localStorage.getItem('cc_auth_token') || '';
       safeSend({ ...data, authToken }, (response) => {
         window.postMessage(
-          { type: 'AT_PLATFORM_ACK', original: data.type, response, testCaseId: data.testCaseId },
+          { type: 'AT_PLATFORM_ACK', original: data.type, response, testCaseId: data.testCaseId, purpose: data.purpose || '' },
           '*',
         );
       });

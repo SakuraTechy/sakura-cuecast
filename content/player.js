@@ -11,6 +11,7 @@
   window.__AT_PLAYER_ACTIVE__ = true;
   let currentLocale = 'zh';
   let pageErrorCheckEnabled = false;
+  const runtimeVariables = Object.create(null);
 
   function normalizeLocale(locale) {
     const raw = String(locale || '').trim().toLowerCase();
@@ -19,6 +20,46 @@
 
   function tr(zh, en) {
     return currentLocale === 'en' ? (en || zh) : zh;
+  }
+
+  function replaceRuntimeVariables(value) {
+    if (typeof value !== 'string' || !value.includes('{{')) return value;
+    return value.replace(/\{\{\s*([A-Za-z_$][\w$]*)\s*\}\}/g, (all, name) => (
+      Object.prototype.hasOwnProperty.call(runtimeVariables, name) ? String(runtimeVariables[name]) : all
+    ));
+  }
+
+  function replaceRuntimeVariablesDeep(value) {
+    if (typeof value === 'string') return replaceRuntimeVariables(value);
+    if (Array.isArray(value)) return value.map((item) => replaceRuntimeVariablesDeep(item));
+    if (!value || typeof value !== 'object') return value;
+    const out = {};
+    for (const [key, item] of Object.entries(value)) {
+      out[key] = replaceRuntimeVariablesDeep(item);
+    }
+    return out;
+  }
+
+  function resolveStepRuntimeVariables(step) {
+    if (!step || typeof step !== 'object') return step;
+    return {
+      ...step,
+      value: replaceRuntimeVariables(step.value),
+      value_text: replaceRuntimeVariables(step.value_text),
+      url: replaceRuntimeVariables(step.url),
+      target_selector: replaceRuntimeVariables(step.target_selector),
+      target_xpath: replaceRuntimeVariables(step.target_xpath),
+      locator_meta: replaceRuntimeVariablesDeep(step.locator_meta),
+      nl_instruction: replaceRuntimeVariables(step.nl_instruction),
+    };
+  }
+
+  function normalizeVariableName(input) {
+    const raw = String(input || '').trim();
+    if (!raw) return '';
+    const normalized = raw.replace(/[^\w$]+/g, '_').replace(/^_+|_+$/g, '');
+    if (!normalized) return '';
+    return /^[A-Za-z_$]/.test(normalized) ? normalized : `v_${normalized}`;
   }
 
   // 等待指定时间
@@ -58,6 +99,154 @@
     return t != null ? String(t) : '';
   }
 
+  function getElementValueForVariable(el) {
+    if (!el) return '';
+    const tag = el.tagName && String(el.tagName).toLowerCase();
+    if (tag === 'textarea' || tag === 'input' || tag === 'select') {
+      return el.value != null ? String(el.value) : '';
+    }
+    if (el.isContentEditable || el.closest?.('[contenteditable="true"]')) {
+      const editable = el.isContentEditable ? el : el.closest('[contenteditable="true"]');
+      return editable?.textContent != null ? String(editable.textContent) : '';
+    }
+    const text = el.innerText != null ? el.innerText : el.textContent;
+    return text != null ? String(text) : '';
+  }
+
+  function getVariableMeta(step) {
+    const raw = step?.locator_meta;
+    let meta = null;
+    if (raw && typeof raw === 'object') {
+      meta = raw;
+    } else if (typeof raw === 'string' && raw.trim()) {
+      try { meta = JSON.parse(raw); } catch { meta = null; }
+    }
+    const variable = meta?.context?.variable;
+    return variable && typeof variable === 'object' ? variable : {};
+  }
+
+  function applyVariableExtraction(rawValue, step) {
+    const raw = String(rawValue ?? '');
+    const meta = getVariableMeta(step);
+    const extract = meta.extract && typeof meta.extract === 'object' ? meta.extract : { mode: 'full' };
+    const mode = String(extract.mode || 'full');
+    if (mode === 'regex') {
+      const pattern = String(extract.pattern || '');
+      const name = normalizeVariableName(step.value || step.variable_name || step.name);
+      if (!pattern) {
+        throw variableExtractionError({ name, raw, pattern, group: extract.group, status: 'empty_pattern', message: tr('保存变量失败：正则表达式为空', 'Set variable failed: regex pattern is empty'), suggestion: tr('请填写正则表达式，或把抽取方式改为完整值。', 'Enter a regex pattern or switch extraction to full value.') });
+      }
+      try {
+        validateRegexSafety(pattern);
+      } catch (err) {
+        throw variableExtractionError({ name, raw, pattern, group: extract.group, status: 'unsafe_regex', message: err?.message || tr('保存变量失败：正则不安全', 'Set variable failed: unsafe regex'), suggestion: tr('请增加固定上下文并避免嵌套重复，例如使用 ^订单已提交：(.+)$。', 'Add fixed context and avoid nested repetition.') });
+      }
+      let re;
+      try {
+        re = new RegExp(pattern);
+      } catch (err) {
+        throw variableExtractionError({ name, raw, pattern, group: extract.group, status: 'invalid_regex', message: tr(`保存变量失败：正则表达式无效（${err?.message || err}）`, `Set variable failed: invalid regex (${err?.message || err})`), suggestion: tr('请检查括号、转义字符和量词写法。', 'Check parentheses, escapes, and quantifiers.') });
+      }
+      const match = raw.match(re);
+      if (!match) {
+        throw variableExtractionError({ name, raw, pattern, group: extract.group, status: 'not_matched', message: tr(`保存变量失败：原始值未匹配正则 ${pattern}，原始值：${raw}`, `Set variable failed: raw value did not match regex ${pattern}. Raw value: ${raw}`), suggestion: suggestVariableRegexFix(raw) });
+      }
+      const group = Number.isInteger(Number(extract.group)) ? Number(extract.group) : (match.length > 1 ? 1 : 0);
+      if (match[group] == null) {
+        throw variableExtractionError({ name, raw, pattern, group, status: 'group_missing', match, message: tr(`保存变量失败：正则捕获组 ${group} 不存在，原始值：${raw}`, `Set variable failed: regex group ${group} does not exist. Raw value: ${raw}`), suggestion: tr(`当前匹配只有 ${Math.max(0, match.length - 1)} 个捕获组，请把捕获组改为 ${match.length > 1 ? 1 : 0}。`, `Current match has ${Math.max(0, match.length - 1)} capture groups. Set group to ${match.length > 1 ? 1 : 0}.`) });
+      }
+      return { value: String(match[group]), raw, extract: { mode: 'regex', pattern, group } };
+    }
+    if (mode === 'after_delimiter') {
+      const delimiter = String(extract.delimiter || '');
+      if (!delimiter) {
+        throw new Error(tr('保存变量失败：分隔符为空', 'Set variable failed: delimiter is empty'));
+      }
+      const index = raw.indexOf(delimiter);
+      if (index < 0) {
+        throw new Error(tr(`保存变量失败：原始值中未找到分隔符 ${delimiter}，原始值：${raw}`, `Set variable failed: delimiter ${delimiter} was not found. Raw value: ${raw}`));
+      }
+      let value = raw.slice(index + delimiter.length);
+      if (extract.trim !== false) value = value.trim();
+      return { value, raw, extract: { mode: 'after_delimiter', delimiter, trim: extract.trim !== false } };
+    }
+    return { value: raw, raw, extract: { mode: 'full' } };
+  }
+
+  function previewValue(value, max = 1000) {
+    const s = String(value ?? '');
+    return s.length > max ? `${s.slice(0, max)}…` : s;
+  }
+
+  function variableExtractionError({ name = '', raw = '', pattern = '', group = '', status = '', match = null, message = '', suggestion = '' }) {
+    const err = new Error(message || tr('保存变量失败：变量抽取失败', 'Set variable failed: variable extraction failed'));
+    const groups = Array.isArray(match) ? match.slice(0, 8).map((item) => String(item ?? '')) : [];
+    err.variableExtraction = {
+      variable_name: name,
+      raw_value: previewValue(raw),
+      pattern,
+      group: Number.isInteger(Number(group)) ? Number(group) : group,
+      match_status: status,
+      matched_text: Array.isArray(match) && match[0] != null ? previewValue(match[0], 500) : '',
+      capture_groups: groups,
+      suggestion,
+    };
+    return err;
+  }
+
+  function suggestVariableRegexFix(rawValue) {
+    const raw = String(rawValue || '');
+    if (raw.includes('：')) {
+      const [prefix] = raw.split('：');
+      return tr(`当前原始值包含“${prefix}：”，可尝试使用 ^${prefix}：(.+)$ 并选择捕获组 1。`, `Raw value contains "${prefix}:". Try a regex anchored to that prefix and use capture group 1.`);
+    }
+    if (raw.includes(':')) {
+      const [prefix] = raw.split(':');
+      return tr(`当前原始值包含“${prefix}:”，可尝试使用 ^${prefix}:(.+)$ 并选择捕获组 1。`, `Raw value contains "${prefix}:". Try a regex anchored to that prefix and use capture group 1.`);
+    }
+    return tr('请根据原始值调整正则，确保正则能匹配并把目标片段放在捕获组中。', 'Adjust the regex so it matches the raw value and places the target segment in a capture group.');
+  }
+
+  function hasNestedRegexQuantifier(pattern) {
+    const source = String(pattern || '');
+    for (let i = 0; i < source.length; i++) {
+      if (source[i] !== '(' || source[i + 1] === '?') continue;
+      let escaped = false;
+      let depth = 0;
+      let innerHasQuantifier = false;
+      for (let j = i; j < source.length; j++) {
+        const ch = source[j];
+        if (escaped) { escaped = false; continue; }
+        if (ch === '\\') { escaped = true; continue; }
+        if (ch === '(') depth += 1;
+        if (depth > 0 && ['*', '+'].includes(ch)) innerHasQuantifier = true;
+        if (ch === ')') {
+          depth -= 1;
+          if (depth === 0) {
+            const next = source[j + 1] || '';
+            if (innerHasQuantifier && ['*', '+'].includes(next)) return true;
+            if (innerHasQuantifier && next === '{') return true;
+            break;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  function validateRegexSafety(pattern) {
+    const source = String(pattern || '');
+    if (source.length > 300) {
+      throw new Error(tr('保存变量失败：正则表达式过长，请缩短后再回放', 'Set variable failed: regex pattern is too long'));
+    }
+    if (hasNestedRegexQuantifier(source)) {
+      throw new Error(tr('保存变量失败：正则存在嵌套重复结构，可能导致回放卡顿', 'Set variable failed: regex contains nested repetition and may hang playback'));
+    }
+    if (/(?:\.\*){2,}|(?:\.\+){2,}|\[[^\]]*\\s\\S[^\]]*\][*+][*+]?/.test(source)) {
+      throw new Error(tr('保存变量失败：正则过宽，可能误匹配大段文本', 'Set variable failed: regex is too broad'));
+    }
+  }
+
   function dispatchMouseLike(el, actionType) {
     const r = el.getBoundingClientRect();
     const cx = Math.round(r.left + r.width / 2);
@@ -89,7 +278,7 @@
    * 仅靠目标上的 stopPropagation 挡不住捕获监听，易误触行选、取消其它行勾选。
    */
   function activateFieldWithoutBubble(el) {
-    if (isTextLikeField(el)) {
+    if (isTextLikeField(el) || el?.isContentEditable) {
       try { el.focus({ preventScroll: true }); } catch (e) { /* ignore */ }
       return;
     }
@@ -386,8 +575,9 @@
   function resolveAssertionConfig(step, hasLocator = false) {
     const meta = parseLocatorMeta(step?.locator_meta);
     const raw = meta?.assertion && typeof meta.assertion === 'object' ? meta.assertion : {};
-    const target = ['page', 'element', 'error'].includes(String(raw.target || '')) ? String(raw.target) : (hasLocator ? 'element' : 'page');
-    const match = ['contains', 'equals', 'not_contains', 'regex'].includes(String(raw.match || '')) ? String(raw.match) : (hasLocator ? 'equals' : 'contains');
+    const target = ['page', 'element', 'error', 'url'].includes(String(raw.target || '')) ? String(raw.target) : (hasLocator ? 'element' : 'page');
+    const rawMatch = ['contains', 'equals', 'not_contains', 'regex', 'visible'].includes(String(raw.match || '')) ? String(raw.match) : (hasLocator ? 'equals' : 'contains');
+    const match = rawMatch === 'visible' && target !== 'element' ? 'contains' : rawMatch;
     return { target, match };
   }
 
@@ -404,6 +594,39 @@
       }
     }
     return a.includes(e);
+  }
+
+  function assertionMatchLabel(mode = 'contains') {
+    if (mode === 'equals') return tr('等于', 'equals');
+    if (mode === 'not_contains') return tr('不包含', 'does not contain');
+    if (mode === 'regex') return tr('匹配正则', 'matches regex');
+    if (mode === 'visible') return tr('可见', 'is visible');
+    return tr('包含', 'contains');
+  }
+
+  function assertionTargetLabel(target = 'page') {
+    if (target === 'element') return tr('指定元素', 'element');
+    if (target === 'error') return tr('错误提示', 'error message');
+    if (target === 'url') return 'URL';
+    return tr('整页文本', 'page text');
+  }
+
+  function previewAssertionValue(value, max = 500) {
+    const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+    if (!text) return tr('（空）', '(empty)');
+    return text.length > max ? `${text.slice(0, max)}…` : text;
+  }
+
+  function formatAssertionFailure({ target, match, expected, actual, css, xpath }) {
+    return [
+      tr('断言失败：实际值不满足预期', 'Assertion failed: actual value does not match expectation'),
+      `${tr('断言目标', 'Target')}: ${assertionTargetLabel(target)}`,
+      `${tr('匹配方式', 'Match')}: ${assertionMatchLabel(match)}`,
+      `${tr('期望值', 'Expected')}: ${previewAssertionValue(expected)}`,
+      `${tr('实际值', 'Actual')}: ${previewAssertionValue(actual)}`,
+      `CSS: ${css || '—'}`,
+      `XPath: ${xpath || '—'}`,
+    ].join('\n  ');
   }
 
   async function waitForPageErrorText(timeout = 10000) {
@@ -1330,7 +1553,120 @@
     return candidates[0]?.item || null;
   }
 
-  /** 与 modules/player-manager.js 中 PAGE_LOADING_UI_CHECK 语义一致 */
+  function findVirtualScrollTarget(step, options = {}) {
+    const meta = parseLocatorMeta(step?.locator_meta);
+    const vs = meta?.context?.virtual_scroll;
+    if (!vs || !['maybe', 'true'].includes(String(vs.hint || ''))) return null;
+    const needle = String(step?.value || vs.item_text || vs.option_text || '').replace(/\s+/g, ' ').trim();
+    if (!needle) return null;
+    const overlayOnly = options.overlayOnly === true;
+    const itemSelector = [
+      'li',
+      '[role="option"]',
+      '[role="row"]',
+      '[role="treeitem"]',
+      '[role="menuitem"]',
+      'tr',
+      '[data-index]',
+      '[aria-rowindex]',
+      '.ant-select-item',
+      '.ant-select-item-option',
+      '.ant-select-item-option-content',
+      '.el-select-dropdown__item',
+      '.el-option',
+      '.ivu-select-item',
+      '[class*="virtual"]',
+      '[class*="row"]',
+      '[class*="item"]',
+    ].join(',');
+    const visible = (el) => {
+      if (!el || !el.getBoundingClientRect) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return false;
+      const st = window.getComputedStyle(el);
+      return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity || 1) > 0.02;
+    };
+    const isScrollable = (el) => {
+      if (!visible(el)) return false;
+      const st = window.getComputedStyle(el);
+      const overflow = [st.overflow, st.overflowY, st.overflowX].join(' ');
+      return /(auto|scroll|overlay)/i.test(overflow)
+        && ((el.scrollHeight - el.clientHeight > 2) || (el.scrollWidth - el.clientWidth > 2));
+    };
+    const itemText = (el) => {
+      const title = el.querySelector?.('.truncate, [class*="font-medium"]');
+      const titleText = String(title?.innerText || title?.textContent || '').replace(/\s+/g, ' ').trim();
+      return titleText || String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+    };
+    const looksVirtual = (container) => {
+      if (String(vs.hint || '') === 'true') return true;
+      const cls = String([
+        container.className,
+        container.parentElement?.className,
+        container.firstElementChild?.className,
+      ].join(' ')).replace(/\s+/g, ' ').trim().toLowerCase();
+      if (/virtual|virtual-list|virtual-scroll|rc-virtual-list|cdk-virtual|v-virtual/.test(cls)) return true;
+      const rows = Array.from(container.querySelectorAll(itemSelector)).filter(visible);
+      const ratio = container.clientHeight > 0 ? container.scrollHeight / container.clientHeight : 1;
+      return ratio > 2.2 && rows.length > 0 && rows.length <= 80;
+    };
+    const findIn = (container) => {
+      const rows = Array.from(container.querySelectorAll(itemSelector)).filter(visible);
+      const row = rows.find((node) => itemText(node) === needle)
+        || rows.find((node) => {
+          const text = itemText(node);
+          return needle.length >= 1 && text.includes(needle);
+        });
+      if (!row) return null;
+      return row.matches?.('button,a,[role="button"],input[type="button"],input[type="submit"],li,[role="option"],[role="menuitem"],.ant-select-item,.el-select-dropdown__item,.el-option,.ivu-select-item')
+        ? row
+        : row.querySelector?.('button,a,[role="button"],input[type="button"],input[type="submit"]') || row;
+    };
+    const candidates = [];
+    const add = (el) => {
+      if (el && isScrollable(el) && !candidates.includes(el)) candidates.push(el);
+    };
+    if (vs.container_selector) {
+      try { add(document.querySelector(vs.container_selector)); } catch (e) { /* ignore */ }
+    }
+    if (vs.container_xpath) {
+      try { add(findXPathMatches(vs.container_xpath)[0]); } catch (e) { /* ignore */ }
+    }
+    if (overlayOnly) {
+      const overlays = Array.from(document.querySelectorAll(OVERLAY_CONTAINER_SEL)).filter(visible);
+      for (const overlay of overlays) {
+        add(overlay);
+        Array.from(overlay.querySelectorAll('*')).forEach(add);
+      }
+    } else {
+      Array.from(document.querySelectorAll('*')).forEach(add);
+    }
+    const targets = candidates.filter(looksVirtual);
+    for (const container of (targets.length ? targets : candidates).slice(0, 8)) {
+      const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+      const stepSize = Math.max(40, Math.floor((container.clientHeight || 160) * 0.82));
+      const positions = [];
+      const push = (v) => {
+        if (!Number.isFinite(Number(v))) return;
+        const n = Math.max(0, Math.min(maxTop, Math.round(Number(v))));
+        if (!positions.includes(n)) positions.push(n);
+      };
+      push(vs.scroll_top);
+      push(container.scrollTop);
+      push(0);
+      for (let p = 0; p <= maxTop && positions.length < 16; p += stepSize) push(p);
+      push(maxTop);
+      for (const pos of positions) {
+        container.scrollTop = pos;
+        try { container.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (e) { /* ignore */ }
+        const found = findIn(container);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  /** 与 extension/modules/player-manager.js 中 PAGE_LOADING_UI_CHECK 语义一致 */
   const LOADING_WAIT_WALL_MS = 180000;
 
   function isPageLoadingUi() {
@@ -1430,6 +1766,14 @@
   function isDisabled(el) {
     if (!el) return false;
     const disabledClassRe = /(?:^|\s)(?:[a-z]+-)?disabled(?:\s|$)/i;
+    const loadingClassRe = /(?:^|\s)(?:is-)?(?:loading|spinning|pending|btn-loading|button-loading|ant-btn-loading|ivu-btn-loading|el-button--loading|arco-btn-loading)(?:\s|$)/i;
+    const loadingIndicatorSel = [
+      '.el-icon-loading', '.el-loading-spinner', '.is-loading',
+      '.ivu-load-loop', '.ivu-icon-ios-loading', '.ivu-spin',
+      '.ant-btn-loading-icon', '.anticon-loading', '.ant-spin-spinning',
+      '.arco-icon-loading', '.arco-spin', '.n-spin',
+      '[data-loading="true"]', '[aria-busy="true"]',
+    ].join(',');
     const formControlSel = 'button,input,select,textarea,option,optgroup';
     const componentRootSel = [
       '.el-select', '.ivu-select', '.ant-select', '.v-select', '.vs__dropdown-toggle', '[role="combobox"]',
@@ -1448,13 +1792,31 @@
       '.n-select', '.n-button', '.n-radio', '.n-checkbox', '.n-switch',
       '.MuiButton-root', '.MuiSelect-root', '.MuiInputBase-root', '.MuiSwitch-root',
     ].join(',');
+    const hasVisibleLoadingIndicator = (root) => {
+      if (!root?.querySelectorAll) return false;
+      const list = root.querySelectorAll(loadingIndicatorSel);
+      for (const item of list) {
+        if (!item || item === root) continue;
+        if (item.getAttribute?.('aria-hidden') === 'true') continue;
+        const st = window.getComputedStyle ? window.getComputedStyle(item) : null;
+        if (st && (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || 1) === 0)) continue;
+        const r = item.getBoundingClientRect?.();
+        if (r && (r.width > 0 || r.height > 0)) return true;
+      }
+      return false;
+    };
 
     if (el.disabled || el.getAttribute?.('disabled') !== null) return true;
     if (el.getAttribute?.('aria-disabled') === 'true') return true;
+    if (el.getAttribute?.('aria-busy') === 'true' || el.getAttribute?.('data-loading') === 'true') return true;
+    if (loadingClassRe.test(String(el.className || ''))) return true;
     const ownerControl = el.closest?.(formControlSel);
     if (ownerControl) {
       if (ownerControl.disabled || ownerControl.getAttribute?.('disabled') !== null) return true;
       if (ownerControl.getAttribute?.('aria-disabled') === 'true') return true;
+      if (ownerControl.getAttribute?.('aria-busy') === 'true' || ownerControl.getAttribute?.('data-loading') === 'true') return true;
+      if (loadingClassRe.test(String(ownerControl.className || ''))) return true;
+      if (hasVisibleLoadingIndicator(ownerControl)) return true;
       const fieldset = ownerControl.closest?.('fieldset[disabled]');
       if (fieldset) return true;
     }
@@ -1465,6 +1827,9 @@
         if (cur.disabled || cur.getAttribute?.('disabled') !== null) return true;
         if (cur.getAttribute?.('aria-disabled') === 'true') return true;
         if (disabledClassRe.test(String(cur.className || ''))) return true;
+        if (cur.getAttribute?.('aria-busy') === 'true' || cur.getAttribute?.('data-loading') === 'true') return true;
+        if (loadingClassRe.test(String(cur.className || ''))) return true;
+        if (hasVisibleLoadingIndicator(cur)) return true;
       }
       cur = cur.parentElement;
     }
@@ -1623,6 +1988,22 @@
 
   // 触发 React/Vue 兼容的 input 事件
   function triggerInputEvent(el, value) {
+    if (el?.isContentEditable || (el?.closest && el.closest('[contenteditable="true"]'))) {
+      const target = el.isContentEditable ? el : el.closest('[contenteditable="true"]');
+      target.textContent = String(value ?? '');
+      try {
+        target.dispatchEvent(new InputEvent('input', {
+          bubbles: true,
+          cancelable: true,
+          inputType: 'insertText',
+          data: String(value ?? ''),
+        }));
+      } catch (e) {
+        target.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      target.dispatchEvent(new Event('change', { bubbles: true }));
+      return;
+    }
     const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
       || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
 
@@ -1633,6 +2014,31 @@
     }
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function triggerSelectEvent(el, value, valueText = '') {
+    if (!el || el.tagName !== 'SELECT') return false;
+    const rawValue = String(value ?? '');
+    let matched = false;
+    for (const option of Array.from(el.options || [])) {
+      if (String(option.value) === rawValue) {
+        el.value = option.value;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched && valueText) {
+      const expectedText = String(valueText).trim();
+      const option = Array.from(el.options || []).find((item) => String(item.text || '').trim() === expectedText);
+      if (option) {
+        el.value = option.value;
+        matched = true;
+      }
+    }
+    if (!matched) return false;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
   }
 
   function dispatchKeyboardKey(el, key, options = {}) {
@@ -1667,6 +2073,8 @@
 
   // 执行单步操作
   async function executeStep(step, nextStep = null) {
+    step = resolveStepRuntimeVariables(step);
+    nextStep = resolveStepRuntimeVariables(nextStep);
     if (step.wait_before && step.wait_before > 0) {
       await sleep(step.wait_before);
     }
@@ -1693,15 +2101,19 @@
         }
         // 自动识别浮层选项步骤（兼容旧版录制数据）
         // is_overlay 且 value 为空时勿走「按文案点下拉项」（Poptip 内 textarea 等易被误判为浮层）
+        const locatorContext = parseLocatorMeta(step.locator_meta)?.context || {};
         const looksLikeOverlay = (step.is_overlay && String(step.value || '').trim() !== '')
-          || (!step.target_selector && step.value)
-          || (step.target_xpath && step.target_xpath.includes('normalize-space()'));
+          || (locatorContext.overlay === true && String(step.value || '').trim() !== '')
+          || (!step.target_selector && step.value);
 
         let el = null;
+        const virtualMeta = parseLocatorMeta(step.locator_meta)?.context?.virtual_scroll;
+        const hasVirtualContext = virtualMeta && ['maybe', 'true'].includes(String(virtualMeta.hint || ''));
         if (looksLikeOverlay && step.value) {
           el = await waitForOverlayOption(step.value, 6000);
+          if (!el) el = findVirtualScrollTarget(step, { overlayOnly: true });
         }
-        if (!el) {
+        if (!el && !(looksLikeOverlay && hasVirtualContext)) {
           el = await waitForElement(
             step.target_selector,
             step.target_xpath,
@@ -1712,6 +2124,10 @@
           );
         }
         if (!el) throw new Error(formatElementNotFound(step, true));
+        if (!looksLikeOverlay) {
+          const virtualTarget = findVirtualScrollTarget(step, { overlayOnly: false });
+          if (virtualTarget) el = virtualTarget;
+        }
         scrollIntoView(el);
         await sleep(200);
         dispatchMouseLike(el, actionType);
@@ -1724,6 +2140,13 @@
         if (!el) throw new Error(formatElementNotFound(step));
         el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
         await sleep(40);
+        if (el.tagName === 'SELECT') {
+          if (!triggerSelectEvent(el, step.value || '', step.value_text || '')) {
+            throw new Error(tr(`无法选择下拉项: ${step.value || step.value_text || ''}`, `Cannot select option: ${step.value || step.value_text || ''}`));
+          }
+          await sleep(80);
+          break;
+        }
         if (stepLooksLikeMonacoEditor(step)) {
           triggerMonacoInput(el, step.value || '');
           await sleep(120);
@@ -1739,6 +2162,21 @@
         if (isAntSelectSearchInput(el) && !nextStepIsSameTargetEnter(step, nextStep)) {
           await sleep(100);
           dispatchEnterConfirm(el);
+        }
+        await sleep(80);
+        break;
+      }
+
+      case 'select': {
+        const el = await waitForElement(step.target_selector, step.target_xpath, '', 6000, false, step.locator_meta);
+        if (!el) throw new Error(formatElementNotFound(step));
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        await sleep(40);
+        if (el.tagName !== 'SELECT') {
+          throw new Error(tr(`目标不是原生 select 元素\n  CSS: ${step.target_selector}\n  XPath: ${step.target_xpath}`, `Target is not a native select element\n  CSS: ${step.target_selector}\n  XPath: ${step.target_xpath}`));
+        }
+        if (!triggerSelectEvent(el, step.value || '', step.value_text || '')) {
+          throw new Error(tr(`无法选择下拉项: ${step.value || step.value_text || ''}`, `Cannot select option: ${step.value || step.value_text || ''}`));
         }
         await sleep(80);
         break;
@@ -1786,6 +2224,15 @@
         break;
       }
 
+      case 'set_variable': {
+        const name = normalizeVariableName(step.value || step.variable_name || step.name);
+        if (!name) throw new Error(tr('保存变量失败：变量名为空', 'Set variable failed: variable name is empty'));
+        const el = await waitForElement(step.target_selector, step.target_xpath, '', 6000, false, step.locator_meta, true);
+        if (!el) throw new Error(formatElementNotFound(step));
+        runtimeVariables[name] = applyVariableExtraction(getElementValueForVariable(el), step).value;
+        break;
+      }
+
       case 'hover': {
         const el = await waitForElement(step.target_selector, step.target_xpath, '', 5000, false, step.locator_meta);
         if (!el) throw new Error(formatElementNotFound(step));
@@ -1807,13 +2254,12 @@
 
       case 'assert_text': {
         const expected = step.value != null ? String(step.value) : '';
-        if (expected.trim() === '') {
-          throw new Error(tr('断言失败：未配置断言文本（「输入值」不能为空或仅空白）', 'Assertion failed: expected text is not configured (input value cannot be empty or whitespace only)'));
-        }
-
         const hasLocator = String(step.target_selector || '').trim() !== '' || String(step.target_xpath || '').trim() !== '';
         const PREVIEW_MAX = 8000;
         const assertion = resolveAssertionConfig(step, hasLocator);
+        if (assertion.match !== 'visible' && expected.trim() === '') {
+          throw new Error(tr('断言失败：未配置断言文本（「输入值」不能为空或仅空白）', 'Assertion failed: expected text is not configured (input value cannot be empty or whitespace only)'));
+        }
 
         if (assertion.target === 'error') {
           const actual = await waitForPageErrorText(10000);
@@ -1837,7 +2283,30 @@
             /* ignore */
           }
           if (!hit) {
-            throw new Error(tr(`断言失败：错误提示未满足预期 "${expected.slice(0, 200)}"`, `Assertion failed: error message did not match "${expected.slice(0, 200)}"`));
+            throw new Error(formatAssertionFailure({
+              target: assertion.target,
+              match: assertion.match,
+              expected,
+              actual,
+              css: '',
+              xpath: '',
+            }));
+          }
+          break;
+        }
+
+        if (assertion.target === 'url') {
+          const actual = String(window.location.href || '');
+          const hit = matchAssertionText(actual, expected, assertion.match);
+          if (!hit) {
+            throw new Error(formatAssertionFailure({
+              target: assertion.target,
+              match: assertion.match,
+              expected,
+              actual,
+              css: '',
+              xpath: '',
+            }));
           }
           break;
         }
@@ -1849,6 +2318,9 @@
               `断言失败：找不到目标元素${formatTreeWaitDiagnostic(step.locator_meta)}\n  CSS: ${step.target_selector || '—'}\n  XPath: ${step.target_xpath || '—'}`,
               `Assertion failed: target element not found\n  CSS: ${step.target_selector || '—'}\n  XPath: ${step.target_xpath || '—'}`,
             ));
+          }
+          if (assertion.match === 'visible') {
+            break;
           }
           const actual = getElementRawTextForAssert(el);
           const hit = matchAssertionText(actual, expected, assertion.match);
@@ -1882,7 +2354,14 @@
           }
 
           if (!hit) {
-            throw new Error(tr('断言失败：元素内容与「输入值」不一致', 'Assertion failed: element content does not match input value'));
+            throw new Error(formatAssertionFailure({
+              target: assertion.target,
+              match: assertion.match,
+              expected,
+              actual,
+              css: step.target_selector || '',
+              xpath: step.target_xpath || '',
+            }));
           }
           break;
         }
@@ -1924,8 +2403,14 @@
         }
 
         if (!finalHit) {
-          const preview = expected.length > 200 ? `${expected.slice(0, 200)}…` : expected;
-          throw new Error(tr(`断言失败：页面中未找到文本 "${preview}"`, `Assertion failed: text not found on page "${preview}"`));
+          throw new Error(formatAssertionFailure({
+            target: assertion.target,
+            match: assertion.match,
+            expected,
+            actual: pageText,
+            css: '',
+            xpath: '',
+          }));
         }
         break;
       }
@@ -1990,14 +2475,34 @@
           done({ ok: true });
         } catch (err) {
           const msg = err && err.message != null ? String(err.message) : String(err);
-          done({ ok: false, error: msg });
+          done({ ok: false, error: msg, variable_extraction_error: err?.variableExtraction || null });
         }
       })();
       return true; // 异步响应
     }
 
+    if (message.type === 'AT_EXTRACT_VARIABLE') {
+      currentLocale = normalizeLocale(message.locale);
+      const step = resolveStepRuntimeVariables(message.step);
+      (async () => {
+        try {
+          const name = normalizeVariableName(step.value || step.variable_name || step.name);
+          if (!name) throw new Error(tr('保存变量失败：变量名为空', 'Set variable failed: variable name is empty'));
+          const el = await waitForElement(step.target_selector, step.target_xpath, '', 6000, false, step.locator_meta, true);
+          if (!el) throw new Error(formatElementNotFound(step));
+          const extracted = applyVariableExtraction(getElementValueForVariable(el), step);
+          runtimeVariables[name] = extracted.value;
+          sendResponse({ ok: true, name, value: extracted.value, raw_value: extracted.raw, extract: extracted.extract });
+        } catch (err) {
+          sendResponse({ ok: false, error: err && err.message ? String(err.message) : String(err), variable_extraction_error: err?.variableExtraction || null });
+        }
+      })();
+      return true;
+    }
+
     if (message.type === 'AT_PLAYER_CLEANUP') {
       document.querySelectorAll('.__at_playing__').forEach(el => el.classList.remove('__at_playing__'));
+      for (const key of Object.keys(runtimeVariables)) delete runtimeVariables[key];
       window.__AT_PLAYER_ACTIVE__ = false;
       sendResponse({ ok: true });
     }

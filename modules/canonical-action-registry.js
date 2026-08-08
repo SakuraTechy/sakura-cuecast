@@ -12,7 +12,7 @@
  */
 
 // 与 Admin automation-operation-catalog.json 保持一致；版本不匹配时 Admin 会拒绝更新能力快照。
-export const OPERATION_CATALOG_VERSION = '2026-07-30.1';
+export const OPERATION_CATALOG_VERSION = '2026-08-07.1';
 
 export const CUECAST_ACTION_REGISTRY = Object.freeze([
   { actionType: 'navigate', route: 'content_player' },
@@ -48,6 +48,7 @@ export const CUECAST_ACTION_REGISTRY = Object.freeze([
   { actionType: 'assert_attribute', route: 'cdp' },
   { actionType: 'assert_script', route: 'cdp' },
   { actionType: 'assert_text_regex', route: 'cdp' },
+  { actionType: 'assert_element_match', route: 'cdp' },
   { actionType: 'wait', route: 'content_player' },
   { actionType: 'implicit_wait', route: 'cdp' },
   { actionType: 'global_variable_set', route: 'runner_local' },

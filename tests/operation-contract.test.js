@@ -8,10 +8,11 @@ import {
   getCuecastActionRoute,
 } from '../modules/canonical-action-registry.js';
 import { attachOperationDiagnostic } from '../modules/operation-diagnostics.js';
+import { PlayerManager } from '../modules/player-manager.js';
 import { CuecastVariableContext } from '../modules/variable-context.js';
 
 const fixturePath = new URL(
-  '../../sakura-admin/continew-automation/src/test/resources/automation/automation-operation-62-fixture.json',
+  '../../sakura-admin/continew-automation/src/test/resources/automation/automation-operation-63-fixture.json',
   import.meta.url,
 );
 const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
@@ -22,9 +23,9 @@ const catalog = JSON.parse(fs.readFileSync(new URL(
 const profileByMethod = Object.fromEntries(Object.entries(catalog.diagnostic_profiles)
   .flatMap(([profile, methods]) => methods.map((methodCode) => [methodCode, profile])));
 
-test('CueCast registry covers every canonical action in the 62-method fixture', () => {
+test('CueCast registry covers every canonical action in the 63-method fixture', () => {
   assert.equal(fixture.catalog_version, OPERATION_CATALOG_VERSION);
-  assert.equal(fixture.methods.length, 62);
+  assert.equal(fixture.methods.length, 63);
 
   const fixtureActions = [...new Set(fixture.methods.map((method) => method.action_type))];
   const missing = fixtureActions.filter((actionType) => !CUECAST_ACTION_TYPES.has(actionType));
@@ -82,8 +83,8 @@ test('CueCast 目录参数完整进入变量执行详情', () => {
   });
 });
 
-test('全部 62 个目录方法在 CueCast 中保持方法身份和 profile 契约', () => {
-  assert.equal(fixture.methods.length, 62);
+test('全部 63 个目录方法在 CueCast 中保持方法身份和 profile 契约', () => {
+  assert.equal(fixture.methods.length, 63);
   for (const method of fixture.methods) {
     const result = attachOperationDiagnostic(
       { action_type: method.action_type, status: 'passed' },
@@ -128,7 +129,7 @@ test('所有目录 form_schema 字段都进入 CueCast 执行详情', () => {
       fieldCount += method.form_schema.length;
     }
   }
-  assert.equal(fieldCount, 113);
+  assert.equal(fieldCount, 117);
 });
 
 test('CueCast 变量引用详情只输出脱敏预览并保留来源', () => {
@@ -153,4 +154,68 @@ test('CueCast 变量引用详情只输出脱敏预览并保留来源', () => {
       source: 'step',
     },
   ]);
+});
+
+test('CueCast 变量上下文兼容双花括号并忽略步骤描述', () => {
+  const context = new CuecastVariableContext({ order: { id: 42 }, token: 'abc' });
+
+  assert.equal(context.resolveText('{{order.id}} / ${token}'), '42 / abc');
+  assert.deepEqual(context.referencesInStep({
+    action_type: 'assert_element_match',
+    description: '断言元素包含 {{token}}',
+    expect: '{{order.id}}-${token}',
+  }), ['order.id', 'token']);
+});
+
+test('CueCast 录制动作只在运行副本中转换为 canonical action', () => {
+  const variable = PlayerManager._adaptRecordedStep({
+    action_type: 'set_variable',
+    value: 'test',
+    locator_meta: { context: { variable: { name: 'test', source: 'text', extract: { mode: 'full' } } } },
+  });
+  assert.equal(variable.action_type, 'global_variable_set');
+  assert.equal(variable.original_action_type, 'set_variable');
+  assert.equal(variable.variable_name, 'test');
+  const variableDiagnostic = attachOperationDiagnostic(
+    { action_type: variable.action_type, status: 'passed' },
+    { ...variable, method_code: 'global.variable.set', method_version: 1 },
+    variable,
+    { executor: 'extension-cdp' },
+  );
+  assert.equal(variableDiagnostic.details.operation.method.action_type, 'global_variable_set');
+
+  const assertion = PlayerManager._adaptRecordedStep({
+    action_type: 'assert_text',
+    value: '{{test}}',
+    locator_meta: { context: { assertion: { target: 'element', match: 'contains', source: 'text' } } },
+  });
+  assert.equal(assertion.action_type, 'assert_element_match');
+  assert.equal(assertion.original_action_type, 'assert_text');
+  assert.equal(assertion.expect, '{{test}}');
+});
+
+test('CueCast CDP 定位诊断可以从真实 via 生成定位摘要', () => {
+  assert.deepEqual(PlayerManager._actualLocatorFromVia({ target_selector: '#login' }, 'css'), {
+    source: 'cdp:css',
+    type: 'css',
+    value: '#login',
+    matchedCount: 1,
+  });
+});
+
+test('CueCast 元素断言比较会忽略展示文本中的不可见差异', () => {
+  assert.equal(PlayerManager._matchAssertionText(' 防统方系统\u00a0-\n系统管理平台 ', '防统方系统 - 系统管理平台', 'contains'), true);
+  assert.equal(PlayerManager._matchAssertionText('防统方系统 - 系统管理平台', '防统方系统 - 系统管理平台', 'equals'), true);
+  assert.equal(PlayerManager._matchAssertionText('防统方系统\u2013系统管理平台', '防统方系统 - 系统管理平台', 'contains'), false);
+});
+
+test('CueCast 变量生产步骤不会提前解析下一步引用', () => {
+  assert.equal(PlayerManager._shouldResolveNextStepBeforeCurrent({ action_type: 'global_variable_set' }), false);
+  assert.equal(PlayerManager._shouldResolveNextStepBeforeCurrent({ action_type: 'global_variable_date' }), false);
+  assert.equal(PlayerManager._shouldResolveNextStepBeforeCurrent({ action_type: 'click' }), true);
+
+  const context = new CuecastVariableContext();
+  assert.throws(() => context.resolveStep({ expect: '{{test}}' }), /变量不存在：test/);
+  context.set('test', '已登录');
+  assert.equal(context.resolveStep({ expect: '{{test}}' }).expect, '已登录');
 });

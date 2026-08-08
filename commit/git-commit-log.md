@@ -1,3 +1,614 @@
+# 2026-08-08 修复录制动作运行适配、变量解析与 Admin 回传重试
+
+## 涉及文件
+
+- modules/player-manager.js
+- modules/recorder-manager.js
+- modules/variable-context.js
+- modules/api-client.js
+- modules/operation-diagnostics.js
+- tests/operation-contract.test.js
+- tests/v1_2_merge_contract.test.js
+- ../sakura-playwright/src/runner/step-runner.js
+- ../sakura-playwright/tests/unit/operation-diagnostics.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+v1.2.0 录制数据仍保留 `set_variable`、`assert_text` 等原始 action，但 CDP 回放和 Admin 结果契约使用 canonical action。旧运行路径直接执行原始动作，导致定位适配方法缺失、变量步骤无法执行、`{{name}}` 被误判为变量名，以及结构化结果缺步被错误显示为跳过。变量生产步骤还会在写入上下文前预解析下一步引用，导致旧录制在保存变量后仍报变量不存在。
+
+## 变更内容
+
+1. `PlayerManager` 在运行副本中将录制变量和元素断言转换为 `global_variable_set`、`assert_element_match`，保留原始步骤和来源标记。
+2. 恢复 CDP `via` 定位摘要生成，并让运行态变量解析同时兼容 `${name}` 和 `{{name}}`。
+3. 变量上下文忽略诊断描述等步骤身份字段，避免把说明文本中的占位符当成运行引用。
+4. 执行详情来源识别同时支持 `${name}` 和 `{{name}}`，避免双花括号引用显示为普通字面量。
+5. Admin Playwright 结果回传仅对网络/超时故障重试，业务错误保持立即失败。
+6. 变量、基础设施和验证码步骤不再提前解析下一步，确保当前步骤完成后再解析后置变量引用。
+7. CDP 与 Playwright 元素文本断言统一忽略不可见字符、非断行空格和连续展示空白；正则仍使用原始文本。
+8. 录制结束事件增加唯一 `eventId`，中台多实例只处理一次成功/失败提示。
+9. CDP 导航开始日志显示实际起始 URL。
+10. 增加录制动作适配、双格式变量、后置引用和文本断言契约测试。
+
+## 验证
+
+- `node --check modules/player-manager.js && node --check modules/variable-context.js && node --check modules/api-client.js`：通过。
+- `node --test tests/*.test.js`：30/30 通过；保存变量后置引用、文本规范化和结束事件去重回归测试通过。
+- `node --test`（sakura-playwright 变量与诊断单元测试）：25/25 通过。
+- `node --test tests/v1_2_merge_contract.test.js`：8/8 通过；结束事件 `eventId` 契约通过。
+- Admin `AutomationPlaywrightCaseServiceImplTest`：24/24 通过；结构化结果缺步会标记失败而非跳过。
+- admin-ui `pnpm typecheck`：通过；目标组件 ESLint 仍报告文件原有模板缩进/风格问题，本轮新增逻辑无类型错误。
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+@@
+-        const runtimeVariableReferences = variableContext.describeReferencesForStep(step);
+-        const localResolvedStep = variableContext.resolveStep(PlayerManager._resolveDynamicStepValue(step));
++        const executableDefinitionStep = PlayerManager._adaptRecordedStep(step);
++        const runtimeVariableReferences = variableContext.describeReferencesForStep(executableDefinitionStep);
++        const localResolvedStep = variableContext.resolveStep(PlayerManager._resolveDynamicStepValue(executableDefinitionStep));
+@@
++  static _adaptRecordedStep(step) {
++    if (!step || typeof step !== 'object' || Array.isArray(step)) return step;
++    const action = String(step.action_type || '').trim().toLowerCase();
++    const meta = PlayerManager._parseLocatorMetaObject(step.locator_meta);
++    if (action === 'set_variable') {
++      const variable = meta?.context?.variable;
++      if (!variable || typeof variable !== 'object' || Array.isArray(variable)) return { ...step };
++      return {
++        ...step,
++        action_type: 'global_variable_set',
++        original_action_type: 'set_variable',
++        recording_source: 'cuecast-v1.2',
++        variable_name: String(variable.name ?? step.value ?? '').trim(),
++      };
++    }
+```
+
+```diff
+@@
+-        const runtimeNextStep = steps[i + 1]
++        const runtimeNextStep = steps[i + 1] && PlayerManager._shouldResolveNextStepBeforeCurrent(executableDefinitionStep)
+           ? PlayerManager._resolveRuntimeVariablesWithTrace(
+```
+
+```diff
+@@
+-    const a = String(actual ?? '');
+-    const e = String(expected ?? '');
++    const a = PlayerManager._normalizeAssertionText(rawActual);
++    const e = PlayerManager._normalizeAssertionText(rawExpected);
+@@
++      `原始长度: 期望 ${String(expected ?? '').length}，实际 ${String(actual ?? '').length}`,
+```
+
+### `modules/recorder-manager.js`
+
+```diff
+@@
+     this._broadcastToContentScripts({
+       type: 'AT_RECORDING_END',
++      eventId: payload?.eventId || `recording_end_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+       ...payload,
+     });
+```
+
+### `tests/v1_2_merge_contract.test.js`
+
+```diff
+@@
++test('录制结束事件携带唯一 eventId，便于中台多实例去重', () => {
++  const manager = new RecorderManager({}, {});
++  let message = null;
++  manager._broadcastToContentScripts = (payload) => { message = payload; };
++  manager._broadcastRecordingEnd({ testCaseId: 'CASE-1', saved: true });
++  assert.match(message.eventId, /^recording_end_/);
++});
+```
+
+### `modules/variable-context.js`
+
+```diff
+@@
+   'step_index',
+   'action_type',
++  'original_action_type',
++  'recording_source',
++  'description',
+@@
+-    if (typeof value !== 'string' || !value.includes('${')) return value;
+-    const whole = value.match(/^\$\{([^{}]+)}$/);
++    if (typeof value !== 'string' || (!value.includes('${') && !value.includes('{{'))) return value;
++    const whole = value.match(/^\$\{([^{}]+)}$/) || value.match(/^\{\{([^{}]+)}}$/);
+```
+
+### `modules/api-client.js`
+
+```diff
+@@
+-  saveAdminPlaywrightResult(caseKey, result, executionCapability = '') {
+-    return this.request(
++  async saveAdminPlaywrightResult(caseKey, result, executionCapability = '') {
++    const maxAttempts = 2;
++    let lastError;
++    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
++      try {
++        return await this.request(
+@@
+-    );
++      } catch (error) {
++        lastError = error;
++        const message = String(error?.message || '');
++        const retryable = message.includes('超时')
++          || message.includes('fetch')
++          || message.includes('Network')
++          || message.includes('abort');
++        if (!retryable || attempt >= maxAttempts) throw error;
++        await new Promise((resolve) => setTimeout(resolve, 500));
++      }
++    }
++    throw lastError;
+```
+
+### `modules/operation-diagnostics.js`
+
+```diff
+@@
+-  if (typeof configured === 'string' && /\$\{[^{}]+}/.test(configured)) {
+-    const reference = configured.match(/\$\{([^{}]+)}/)?.[1];
++  if (typeof configured === 'string' && (/\$\{[^{}]+}/.test(configured) || /\{\{[^{}]+}}/.test(configured))) {
++    const reference = configured.match(/\$\{([^{}]+)}/)?.[1]
++      || configured.match(/\{\{([^{}]+)}}/)?.[1];
+     return sourceObject('variable_reference', reference ? `引用变量：${reference}` : null);
+```
+
+### `tests/operation-contract.test.js`
+
+```diff
+@@
++test('CueCast 变量上下文兼容双花括号并忽略步骤描述', () => {
++  const context = new CuecastVariableContext({ order: { id: 42 }, token: 'abc' });
++
++  assert.equal(context.resolveText('{{order.id}} / ${token}'), '42 / abc');
++  assert.deepEqual(context.referencesInStep({
++    action_type: 'assert_element_match',
++    description: '断言元素包含 {{token}}',
++    expect: '{{order.id}}-${token}',
++  }), ['order.id', 'token']);
++});
+```
+
+# 2026-08-07 统一录制变量与元素断言的 CueCast CDP 执行契约
+
+## 涉及文件
+
+- modules/player-manager.js
+- modules/canonical-action-registry.js
+- modules/operation-diagnostics.js
+- tests/operation-contract.test.js
+- tests/cuecast-recording-compatibility.test.js
+- test-lab/mock-data/cases.json
+- commit/git-commit-log.md
+
+## 变更原因
+
+录制插件的新版本会生成 `set_variable` 和带 `locator_meta.context.assertion` 的 `assert_text`。后端将它们投影为统一动作后，CueCast 需要继续以 CDP 作为默认执行方式，并与 Playwright Runner 共用 `global_variable_set`、`assert_element_match` 契约。旧代码只允许少量交互动作进入 CDP，元素断言也没有统一处理真实可见性、输入控件 value 和非法正则，导致同一录制步骤在不同执行器中的结果不一致。
+
+## 变更内容
+
+1. CueCast 动作注册表升级到 `2026-08-07.1`，注册 `assert_element_match` 并声明 CDP 路由。
+2. `PlayerManager` 改为依据统一动作注册表判断 CDP 能力，元素定位、变量读取和断言复用同一 CSS/XPath 回退链。
+3. 元素断言支持 `contains`、`equals`、`not_contains`、`regex`、`visible`，支持 `auto/text/value` 读取模式，并检查元素及祖先的实际可见性。
+4. 兼容录制原始 `locator_meta.context.assertion` 和标准化后的 `match_mode/read_mode/expect`，非法正则在执行前返回明确错误。
+5. 契约测试同步 63 操作目录，并新增 CueCast 录制变量与断言兼容测试。
+6. 新增 test-lab case 298，使用录制原始步骤验证 Runner 变量输入和五种元素断言。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --check modules/canonical-action-registry.js`：通过。
+- `node --check modules/operation-diagnostics.js`：通过。
+- `node --test tests/operation-contract.test.js tests/cuecast-recording-compatibility.test.js tests/v1_2_merge_contract.test.js tests/effective-execution-config.test.js`：24/24 通过。
+- `node --test tests/integration/cuecast-recording-mock-case.test.js`（在 `sakura-playwright` 执行）：通过；真实 Chromium 从 CueCast `cases.json` 读取 case 298，变量保存、变量引用和五种元素断言共 8 个步骤全部成功，结果仅回传内存 mock 服务，未改写测试数据。
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+@@
+   _canUseCDP(step) {
+-    return [
+-      'click',
+-      'double_click',
+-      'right_click',
+-      'input',
+-      'select',
+-      'key',
+-      'scroll',
+-      'hover',
+-    ].includes(step.action_type);
++    return isCuecastCdpAction(step?.action_type);
+   }
+@@
++  static _buildElementAssertionExpr(selector, xpath, readMode = 'auto') {
++    const chain = PlayerManager._buildDomTargetChain(selector, xpath);
++    const normalizedReadMode = ['auto', 'text', 'value'].includes(String(readMode)) ? String(readMode) : 'auto';
++    return `(function(){
++      try {
++        var el = ${chain};
++        if (!el) return { ok: false, err: 'not_found' };
++        var visible = true;
++        var current = el;
++        while (current && current.nodeType === 1) {
++          var style = window.getComputedStyle(current);
++          if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || Number(style.opacity) <= 0) {
++            visible = false;
++            break;
++          }
++          current = current.parentElement;
++        }
++        var rect = el.getBoundingClientRect();
++        if (el.hidden || !rect || rect.width <= 0 || rect.height <= 0 || el.getClientRects().length === 0) visible = false;
++        var tag = el.tagName && String(el.tagName).toLowerCase() || '';
++        var mode = ${JSON.stringify(normalizedReadMode)};
++        if (mode === 'auto') mode = (tag === 'input' || tag === 'textarea' || tag === 'select') ? 'value' : 'text';
++        var value = '';
++        if (mode === 'value') {
++          value = 'value' in el && el.value != null ? String(el.value) : '';
++        } else {
++          var text = el.innerText != null ? el.innerText : el.textContent;
++          value = text != null ? String(text) : '';
++        }
++        return { ok: true, visible: visible, value: value };
++      } catch (e) {
++        return { ok: false, err: e && e.message ? String(e.message) : 'error' };
++      }
++    })()`;
++  }
+@@
++      case 'assert_element_match': {
++        await this._executeAssertTextStepCDP(tabId, step);
++        break;
++      }
+```
+
+### `modules/canonical-action-registry.js`
+
+```diff
+@@
+-export const OPERATION_CATALOG_VERSION = '2026-07-30.1';
++export const OPERATION_CATALOG_VERSION = '2026-08-07.1';
+@@
+   { actionType: 'assert_text_regex', route: 'cdp' },
++  { actionType: 'assert_element_match', route: 'cdp' },
+   { actionType: 'wait', route: 'content_player' },
+```
+
+### `modules/operation-diagnostics.js`
+
+```diff
+@@
+   assert_text_regex: 'assertion',
++  assert_element_match: 'assertion',
+   wait: 'wait',
+```
+
+### `tests/operation-contract.test.js`
+
+```diff
+@@
+-  '../../sakura-admin/continew-automation/src/test/resources/automation/automation-operation-62-fixture.json',
++  '../../sakura-admin/continew-automation/src/test/resources/automation/automation-operation-63-fixture.json',
+@@
+-test('CueCast registry covers every canonical action in the 62-method fixture', () => {
++test('CueCast registry covers every canonical action in the 63-method fixture', () => {
+   assert.equal(fixture.catalog_version, OPERATION_CATALOG_VERSION);
+-  assert.equal(fixture.methods.length, 62);
++  assert.equal(fixture.methods.length, 63);
+@@
+-  assert.equal(fieldCount, 113);
++  assert.equal(fieldCount, 117);
+```
+
+### `tests/cuecast-recording-compatibility.test.js`
+
+```diff
+@@
++test('统一元素断言注册为 CDP action 并由 PlayerManager 使用同一注册表路由', () => {
++  const manager = createManager();
++
++  assert.equal(getCuecastActionRoute('assert_element_match'), 'cdp');
++  assert.equal(isCuecastCdpAction('assert_element_match'), true);
++  assert.equal(manager._canUseCDP({ action_type: 'assert_element_match' }), true);
++});
++
++test('隐藏元素不能通过 CueCast CDP 可见性断言', async () => {
++  const manager = createManager();
++  manager._waitForElementAssertionCDP = async () => ({ ok: true, visible: false, value: 'secret' });
++
++  await assert.rejects(() => manager._executeAssertTextStepCDP(1, {
++    action_type: 'assert_element_match',
++    target_selector: '#hidden',
++    read_mode: 'auto',
++    match_mode: 'visible',
++  }), /实际值: hidden/);
++});
+```
+
+### `test-lab/mock-data/cases.json`
+
+```diff
+@@
++    "298": {
++      "id": 298,
++      "name": "CueCast recording variable and assertion mock",
++      "status": "not_run",
++      "start_url": "http://127.0.0.1:4173/test-lab/target.html",
++      "description": "Raw CueCast v1.2 recording steps for Runner variable and five-mode assertion compatibility.",
++      "steps": [
++        {
++          "id": 1,
++          "action_type": "set_variable",
++          "target_selector": "#statusText",
++          "locator_meta": {
++            "context": {
++              "variable": {
++                "name": "recorded_status",
++                "source": "text",
++                "extract": { "mode": "regex", "pattern": "^(Ready)$", "group": 1 }
++              }
++            }
++          },
++          "value": "recorded_status",
++          "value_text": "Ready"
++        },
++        {
++          "id": 3,
++          "action_type": "assert_text",
++          "target_selector": "#username",
++          "locator_meta": {
++            "context": {
++              "assertion": { "target": "element", "source": "value", "match": "equals" }
++            }
++          },
++          "value": "${recorded_status}"
++        }
++      ]
++    },
+@@
+-    "297": []
++    "297": [],
++    "298": []
+```
+
+# 2026-08-07 合并官方 v1.2.0 并修复扩展检测、录制与回放回归
+
+## 涉及文件
+
+- README.md
+- background.js
+- content/bridge.js
+- content/player.js
+- content/recorder.js
+- content/selector-core.js
+- manifest.json
+- modules/api-client.js
+- modules/player-manager.js
+- modules/recorder-manager.js
+- tests/v1_2_merge_contract.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+合并官方 `v1.2.0` 时，`PlayerManager.start()` 的两套浏览器初始化和状态模型被错误拼接，产生 ESM 语法错误，导致 Manifest V3 Service Worker 无法加载，`AT_PLATFORM_PING` 监听器未注册，Admin 因而显示“未检测到”。同时合并结果还丢失了 Admin 录制导入、草稿重试、失败结果回传等既有链路，并出现重复响应、未定义保存上下文、预检失败不广播结束事件等回归。
+
+## 变更内容
+
+1. 修复 Service Worker 依赖模块语法错误和重复录制响应，恢复 `recordingImport`、窗口配置、草稿状态、失败重试及插件检测协议。
+2. 合并官方 v1.2.0 的多标签录制、录制会话、运行时变量、AI/验证码、选择器稳定性和回放标签页管理能力。
+3. 保留 Admin 专用录制导入和执行结果接口；Admin 录制不再访问官方 `/testcases/{id}`，失败草稿也不会降级写入错误数据源。
+4. 统一 Player 预检失败的异常收尾，确保已接受的回放始终广播包含真实错误的 `AT_PLAYBACK_END`。
+5. 扩展更新时强制替换已打开页面中的失效 bridge，后续重试保持幂等注入，减少必须手动刷新页面的情况。
+6. 增加 v1.2 合并契约测试，覆盖后台真实加载/PING、bridge 协议、Admin/普通录制分流、Admin 录制完整保存和回放预检失败收尾。
+
+## 验证
+
+- `node --experimental-default-type=module --check` 检查 5 个 ESM 文件：通过。
+- `node --check` 检查 8 个传统脚本文件：通过。
+- `node --experimental-default-type=module --test tests/*.test.js`：19/19 通过。
+- `git diff --check`、`git diff --cached --check`：通过，仅有工作区 LF/CRLF 转换提示。
+- `rg -n "^(<<<<<<<|=======|>>>>>>>)"`：未发现冲突标记。
+
+## 具体代码改动
+
+### `README.md`
+
+```diff
+@@
+-./
++sakura-cuecast/
+ ├── manifest.json          - 插件配置（Manifest V3）
+```
+
+### `background.js`
+
+```diff
+@@
+-async function injectBridgeIntoOpenTabs() {
++async function injectBridgeIntoOpenTabs({ force = false } = {}) {
+@@
+-  await Promise.all(tabs.map((tab) => injectBridgeIntoTab(tab.id)));
++  await Promise.all(tabs.map((tab) => injectBridgeIntoTab(tab.id, { force })));
+@@
+-  void injectBridgeIntoOpenTabs();
++  // 扩展升级后页面中的旧 bridge 已失效，首次回填必须清除旧版本留下的安装标记。
++  void injectBridgeIntoOpenTabs({ force: true });
+```
+
+### `content/bridge.js`
+
+```diff
+@@
+       || data.type === 'AT_PLATFORM_CANCEL_RECORD'
++      || data.type === 'AT_PLATFORM_SAVE_RECORDING_TRIMMED'
++      || data.type === 'AT_PLATFORM_DISCARD_RECORDING_SAVE'
+       || data.type === 'AT_PLATFORM_OPEN_PLAY_TAB'
+       || data.type === 'AT_PLATFORM_CLOSE_PLAY_TAB'
++      || data.type === 'AT_PLATFORM_CHECK_SELECTOR'
+@@
+-          { type: 'AT_PLATFORM_ACK', original: data.type, response, testCaseId: data.testCaseId },
++          { type: 'AT_PLATFORM_ACK', original: data.type, response, testCaseId: data.testCaseId, purpose: data.purpose || '' },
+```
+
+### `content/player.js`
+
+```diff
+@@
+-    if (isTextLikeField(el)) {
++    if (isTextLikeField(el) || el?.isContentEditable) {
+@@
+-    const target = ['page', 'element', 'error'].includes(String(raw.target || '')) ? String(raw.target) : (hasLocator ? 'element' : 'page');
+-    const match = ['contains', 'equals', 'not_contains', 'regex'].includes(String(raw.match || '')) ? String(raw.match) : (hasLocator ? 'equals' : 'contains');
++    const target = ['page', 'element', 'error', 'url'].includes(String(raw.target || '')) ? String(raw.target) : (hasLocator ? 'element' : 'page');
++    const rawMatch = ['contains', 'equals', 'not_contains', 'regex', 'visible'].includes(String(raw.match || '')) ? String(raw.match) : (hasLocator ? 'equals' : 'contains');
++    const match = rawMatch === 'visible' && target !== 'element' ? 'contains' : rawMatch;
+```
+
+### `content/recorder.js`
+
+```diff
+@@
+-  /** React/Ant Design/rc 组件等运行时自增 id，重渲染后会变，不能用于稳定定位 */
++  /** React/Vue/组件库等运行时自增 id，重渲染后会变，不能用于稳定定位 */
+   function isVolatileAutoId(id) {
+-    if (!id || typeof id !== 'string') return true;
+-    if (/^\d+$/.test(id)) return true;
+-    if (/[a-f0-9]{8,}/i.test(id)) return true;
++    const v = normalizeAttrValue(id);
++    if (!v) return true;
++    if (/^\d+$/.test(v)) return true;
++    if (/^[0-9]{10,}$/.test(v)) return true;
++    if (/^[a-f0-9]{8,}$/i.test(v)) return true;
+@@
+-    if (getOverlayAncestor(el)) return '';
++    if (getOptionItemElement(el)) return '';
+```
+
+### `content/selector-core.js`
+
+```diff
+@@
+-    for (const attr of ['data-testid', 'data-test', 'data-id', 'name', 'aria-label', 'role']) {
++    for (const attr of ['data-testid', 'data-test', 'data-qa', 'data-cy', 'data-id', 'name', 'aria-label', 'role']) {
+       const val = el.getAttribute(attr);
+-      if (val) {
++      if (val && !isVolatileAttributeValue(attr, val)) {
+@@
+-            if (table && table.id && !/^\d+$/.test(table.id) && !/[a-f0-9]{8,}/i.test(table.id)) {
++            if (table && table.id && !isVolatileAutoId(table.id)) {
+```
+
+### `manifest.json`
+
+```diff
+@@
+-  "version": "1.1.0",
++  "version": "1.2.0",
+```
+
+### `modules/api-client.js`
+
+```diff
+@@
+-        throw new Error(`HTTP ${res.status} ${method} ${url}: ${message}`);
++        const err = new Error(`HTTP ${res.status} ${method} ${url}: ${message}`);
++        err.response = { status: res.status, data };
++        err.apiData = data;
++        if (data?.data && typeof data.data === 'object' && data.data.resource) {
++          err.quotaDetails = data.data;
++        }
++        throw err;
+@@
++  createRecordingSession(id, body) { return this.request('POST', `/testcases/${id}/recording-sessions`, body || {}); }
++  saveRecordingSessionStep(id, sessionId, body) {
++    return this.request('POST', `/testcases/${id}/recording-sessions/${encodeURIComponent(sessionId)}/steps`, body || {});
++  }
+```
+
+### `modules/player-manager.js`
+
+```diff
+@@
+       if (!steps.length) {
+-        playbackOutcome = { ok: false, error: trByLocale(runLocale, '用例没有步骤', 'Case has no steps') };
+-        return playbackOutcome;
++        throw new Error(trByLocale(runLocale, '用例没有步骤', 'Case has no steps'));
+       }
+@@
+-        playbackOutcome = { ok: false, error: trByLocale(runLocale, '正在录制，无法回放', 'Recording in progress, playback is unavailable') };
+-        return playbackOutcome;
++        throw new Error(trByLocale(runLocale, '正在录制，无法回放', 'Recording in progress, playback is unavailable'));
+```
+
+### `modules/recorder-manager.js`
+
+```diff
+@@
+-    } else if (resolvedScreenshotMode === 'standard') {
++    } else if (resolvedScreenshotMode === 'standard' && !this._getRecordingImportOptions()) {
+       // 未显式传入模式时，回退读取用例配置，兼容弹窗/旧调用链。
+@@
+-        await this._saveRecordedSteps(testCaseId, toSave, saveOptions);
++        if (importOptions) {
++          await this._saveRecordedSteps(testCaseId, toSave, saveOptions);
++        } else if (this.state.recordingSessionEnabled && this.state.recordingSessionId && this.state.recordingSessionHealthy !== false) {
++          await this._commitRecordingSession(testCaseId);
++        } else {
++          await this._discardRecordingSession(testCaseId);
++          await this._saveRecordedSteps(testCaseId, toSave, null);
++        }
+```
+
+### `tests/v1_2_merge_contract.test.js`
+
+```diff
+--- /dev/null
++++ b/tests/v1_2_merge_contract.test.js
+@@
++test('background service worker 可启动并响应插件检测 PING', async () => {
++  const originalChrome = globalThis.chrome;
++  const stub = createChromeStub();
++  globalThis.chrome = stub.chrome;
++  try {
++    await import(`${projectFile('background.js').href}?ping-contract-test`);
++    const listener = stub.runtimeOnMessage.listeners.at(-1);
++    assert.equal(typeof listener, 'function');
++  } finally {
++    globalThis.chrome = originalChrome;
++  }
++});
++
++test('Admin 录制启动和停止不会访问官方 testcase 接口', async () => {
++  const originalChrome = globalThis.chrome;
++  const stub = createChromeStub();
++  globalThis.chrome = stub.chrome;
++  try {
++    let getTestCaseCalls = 0;
++    let importedPayload = null;
++    const api = {
++      base: 'http://admin.local/api',
++      async getTestCase() {
++        getTestCaseCalls += 1;
++        throw new Error('Admin 录制不应读取官方 testcase');
++      },
++      async importRecording(payload) { importedPayload = payload; },
++    };
+```
+
 # 2026-08-06 CueCast 执行详情统一来源对象与目录字段
 
 ## 涉及文件

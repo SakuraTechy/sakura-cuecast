@@ -1984,6 +1984,223 @@
       "viewport_width": 0,
       "viewport_height": 0
     },
+    "298": {
+      "id": 298,
+      "name": "CueCast recording variable and assertion mock",
+      "status": "not_run",
+      "start_url": "http://127.0.0.1:4173/test-lab/target.html",
+      "description": "Raw CueCast v1.2 recording steps for Runner variable and five-mode assertion compatibility.",
+      "screenshot_mode": "standard",
+      "page_error_check_enabled": 0,
+      "created_at": "2026-08-07T14:30:00.000Z",
+      "updated_at": "2026-08-07T14:30:00.000Z",
+      "steps": [
+        {
+          "id": 1,
+          "action_type": "set_variable",
+          "target_selector": "#statusText",
+          "target_xpath": "",
+          "locator_meta": {
+            "version": 1,
+            "context": {
+              "variable": {
+                "name": "recorded_status",
+                "source": "text",
+                "extract": {
+                  "mode": "regex",
+                  "pattern": "^(Ready)$",
+                  "group": 1
+                }
+              }
+            }
+          },
+          "value": "recorded_status",
+          "value_text": "Ready",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4173/test-lab/target.html",
+          "description": "Save status text from the selected element",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 2,
+          "action_type": "input",
+          "target_selector": "#username",
+          "target_xpath": "",
+          "locator_meta": null,
+          "value": "{{recorded_status}}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4173/test-lab/target.html",
+          "description": "Use the recorded variable in a later input",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 3,
+          "action_type": "assert_text",
+          "target_selector": "#username",
+          "target_xpath": "",
+          "locator_meta": {
+            "version": 1,
+            "context": {
+              "assertion": {
+                "target": "element",
+                "source": "value",
+                "match": "equals"
+              }
+            }
+          },
+          "value": "${recorded_status}",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4173/test-lab/target.html",
+          "description": "Assert the input value through the canonical variable syntax",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 4,
+          "action_type": "assert_text",
+          "target_selector": "#statusText",
+          "target_xpath": "",
+          "locator_meta": {
+            "version": 1,
+            "context": {
+              "assertion": {
+                "target": "element",
+                "source": "text",
+                "match": "contains"
+              }
+            }
+          },
+          "value": "Rea",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4173/test-lab/target.html",
+          "description": "Assert status contains text",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 5,
+          "action_type": "assert_text",
+          "target_selector": "#statusText",
+          "target_xpath": "",
+          "locator_meta": {
+            "version": 1,
+            "context": {
+              "assertion": {
+                "target": "element",
+                "source": "text",
+                "match": "equals"
+              }
+            }
+          },
+          "value": "Ready",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4173/test-lab/target.html",
+          "description": "Assert status equals text",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 6,
+          "action_type": "assert_text",
+          "target_selector": "#statusText",
+          "target_xpath": "",
+          "locator_meta": {
+            "version": 1,
+            "context": {
+              "assertion": {
+                "target": "element",
+                "source": "text",
+                "match": "not_contains"
+              }
+            }
+          },
+          "value": "Failed",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4173/test-lab/target.html",
+          "description": "Assert status does not contain text",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 7,
+          "action_type": "assert_text",
+          "target_selector": "#statusText",
+          "target_xpath": "",
+          "locator_meta": {
+            "version": 1,
+            "context": {
+              "assertion": {
+                "target": "element",
+                "source": "text",
+                "match": "regex"
+              }
+            }
+          },
+          "value": "^Rea.*$",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4173/test-lab/target.html",
+          "description": "Assert status with a regular expression",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        },
+        {
+          "id": 8,
+          "action_type": "assert_text",
+          "target_selector": "#statusText",
+          "target_xpath": "",
+          "locator_meta": {
+            "version": 1,
+            "context": {
+              "assertion": {
+                "target": "element",
+                "source": "auto",
+                "match": "visible"
+              }
+            }
+          },
+          "value": "",
+          "value_masked": 0,
+          "url": "http://127.0.0.1:4173/test-lab/target.html",
+          "description": "Assert status is visible",
+          "wait_before": 0,
+          "nl_instruction": "",
+          "screenshot": "",
+          "screenshot_focus": "",
+          "screenshot_focus_rect": "",
+          "is_overlay": 0
+        }
+      ]
+    },
     "999": {
       "id": 999,
       "name": "测试",
@@ -5974,6 +6191,7 @@
       }
     ],
     "296": [],
-    "297": []
+    "297": [],
+    "298": []
   }
 }

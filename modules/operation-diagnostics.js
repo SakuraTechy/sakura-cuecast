@@ -33,6 +33,7 @@ const ACTION_PROFILES = Object.freeze({
   assert_variable_list: 'assertion',
   assert_variable_list_not: 'assertion',
   assert_text_regex: 'assertion',
+  assert_element_match: 'assertion',
   wait: 'wait',
   implicit_wait: 'wait',
   captcha_ocr: 'variable',
@@ -162,8 +163,9 @@ function collectInputs(definitionStep, runtimeStep) {
 }
 
 function inputSource(key, configured, effective, field = null) {
-  if (typeof configured === 'string' && /\$\{[^{}]+}/.test(configured)) {
-    const reference = configured.match(/\$\{([^{}]+)}/)?.[1];
+  if (typeof configured === 'string' && (/\$\{[^{}]+}/.test(configured) || /\{\{[^{}]+}}/.test(configured))) {
+    const reference = configured.match(/\$\{([^{}]+)}/)?.[1]
+      || configured.match(/\{\{([^{}]+)}}/)?.[1];
     return sourceObject('variable_reference', reference ? `引用变量：${reference}` : null);
   }
   if (configured !== undefined && effective !== undefined) {

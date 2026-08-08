@@ -12,7 +12,7 @@ Manifest V3 Chrome 扩展，实现录制与回放功能。
 ## 目录结构
 
 ```
-./
+sakura-cuecast/
 ├── manifest.json          - 插件配置（Manifest V3）
 ├── background.js          - Service Worker 核心调度器
 ├── modules/

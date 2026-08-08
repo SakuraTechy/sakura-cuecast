@@ -50,7 +50,13 @@ export class ApiClient {
       const acceptedByEnvelope = (hasCode && okByCode) || (hasSuccessFlag && data.success === true);
       if (!res.ok || (!acceptedByEnvelope && !acceptedByHttp) || explicitFailure) {
         const message = data.message || data.msg || data.error || text || '请求失败';
-        throw new Error(`HTTP ${res.status} ${method} ${url}: ${message}`);
+        const err = new Error(`HTTP ${res.status} ${method} ${url}: ${message}`);
+        err.response = { status: res.status, data };
+        err.apiData = data;
+        if (data?.data && typeof data.data === 'object' && data.data.resource) {
+          err.quotaDetails = data.data;
+        }
+        throw err;
       }
       return data;
     } catch (e) {
@@ -79,6 +85,16 @@ export class ApiClient {
   saveSteps(id, steps) { return this.request('POST', `/testcases/${id}/steps`, { steps }); }
   importRecording(payload) {
     return this.request('POST', '/automation/automationUiScene/recordings/import', payload, { timeoutMs: 60000 });
+  }
+  createRecordingSession(id, body) { return this.request('POST', `/testcases/${id}/recording-sessions`, body || {}); }
+  saveRecordingSessionStep(id, sessionId, body) {
+    return this.request('POST', `/testcases/${id}/recording-sessions/${encodeURIComponent(sessionId)}/steps`, body || {});
+  }
+  commitRecordingSession(id, sessionId, body) {
+    return this.request('POST', `/testcases/${id}/recording-sessions/${encodeURIComponent(sessionId)}/commit`, body || {});
+  }
+  discardRecordingSession(id, sessionId) {
+    return this.request('POST', `/testcases/${id}/recording-sessions/${encodeURIComponent(sessionId)}/discard`, {});
   }
   /**
    * 保存执行结果（30s 超时 + 1 次重试），避免大 payload 间歇性失败导致结果丢失。
@@ -115,6 +131,16 @@ export class ApiClient {
     return this.request('POST', `/ai/step-plan${q}`, body, { timeoutMs });
   }
 
+  aiVariableExtractRule(body, opts = {}) {
+    const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 60000;
+    return this.request('POST', '/ai/variable-extract-rule', body, { timeoutMs });
+  }
+
+  aiVisionRecognize(body, opts = {}) {
+    const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 60000;
+    return this.request('POST', '/ai/vision-recognize', body, { timeoutMs });
+  }
+
   /**
    * JSON 断言：页面采集的 actual 与步骤中预存 value 在后端原样比对（大 JSON 可设长超时）
    */
@@ -124,13 +150,30 @@ export class ApiClient {
   }
 
   // admin 结果接口与旧 CueCast mock 结果接口分开，保留两条协议的兼容性。
-  saveAdminPlaywrightResult(caseKey, result, executionCapability = '') {
-    return this.request(
-      'POST',
-      `/automation/playwright/testcases/${encodeURIComponent(caseKey)}/results`,
-      result,
-      { timeoutMs: 30000, executionCapability },
-    );
+  async saveAdminPlaywrightResult(caseKey, result, executionCapability = '') {
+    const maxAttempts = 2;
+    let lastError;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.request(
+          'POST',
+          `/automation/playwright/testcases/${encodeURIComponent(caseKey)}/results`,
+          result,
+          { timeoutMs: 30000, executionCapability },
+        );
+      } catch (error) {
+        lastError = error;
+        const message = String(error?.message || '');
+        const retryable = message.includes('超时')
+          || message.includes('fetch')
+          || message.includes('Network')
+          || message.includes('abort');
+        if (!retryable || attempt >= maxAttempts) throw error;
+        console.warn('[api-client] saveAdminPlaywrightResult 第 %d 次失败，500 ms 后重试：%s', attempt, message.slice(0, 120));
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
+    throw lastError;
   }
 
   /**

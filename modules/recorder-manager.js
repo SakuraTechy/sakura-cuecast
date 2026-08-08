@@ -31,6 +31,10 @@ export class RecorderManager {
       currentTabId: this.state.currentTabId ?? null,
       recordingOpenedNewTab: this.state.recordingOpenedNewTab === true,
       recordingWindowId: this.state.recordingWindowId ?? null,
+      recordingTabs: Array.isArray(this.state.recordingTabs) ? [...this.state.recordingTabs] : [],
+      currentRecordingTabIndex: Number.isInteger(Number(this.state.currentRecordingTabIndex))
+        ? Number(this.state.currentRecordingTabIndex)
+        : 0,
       recordingScreenshotMode: this.state.recordingScreenshotMode || 'standard',
       recordingImport: this.state.recordingImport || null,
       recordingEndUrl: this.state.recordingEndUrl || '',
@@ -38,6 +42,9 @@ export class RecorderManager {
       recordedSteps: Array.isArray(this.state.recordedSteps) ? [...this.state.recordedSteps] : [],
       insertAfterIndex: this._insertAfterIndex,
       existingStepsSnapshot: Array.isArray(this._existingStepsSnapshot) ? [...this._existingStepsSnapshot] : null,
+      recordingSessionId: this.state.recordingSessionId || '',
+      recordingSessionEnabled: this.state.recordingSessionEnabled === true,
+      recordingSessionHealthy: this.state.recordingSessionHealthy !== false,
       savedAt: Date.now(),
     };
   }
@@ -164,6 +171,19 @@ export class RecorderManager {
       this.state.recordingWindowId = Number.isInteger(Number(session.recordingWindowId))
         ? Number(session.recordingWindowId)
         : null;
+      this.state.recordingTabs = Array.isArray(session.recordingTabs) ? [...session.recordingTabs] : [];
+      this.state.currentRecordingTabIndex = Number.isInteger(Number(session.currentRecordingTabIndex))
+        ? Number(session.currentRecordingTabIndex)
+        : 0;
+      if (!this.state.recordingTabs.length && restoredTabId != null) {
+        this.state.recordingTabs = [{
+          tabId: restoredTabId,
+          index: 0,
+          openerTabId: null,
+          openerIndex: null,
+          url: '',
+        }];
+      }
       this.state.recordingScreenshotMode = String(session.recordingScreenshotMode || 'standard').trim().toLowerCase() === 'full_hd'
         ? 'full_hd'
         : 'standard';
@@ -174,6 +194,9 @@ export class RecorderManager {
       this.state.recordingPaused = session.recordingPaused === true;
       this.state.recordingStartedAt = Number(session.savedAt || Date.now()) || Date.now();
       this.state.recordedSteps = Array.isArray(session.recordedSteps) ? [...session.recordedSteps] : [];
+      this.state.recordingSessionId = session.recordingSessionId || '';
+      this.state.recordingSessionEnabled = session.recordingSessionEnabled === true;
+      this.state.recordingSessionHealthy = session.recordingSessionHealthy !== false;
       this._insertAfterIndex = session.insertAfterIndex ?? null;
       this._existingStepsSnapshot = Array.isArray(session.existingStepsSnapshot)
         ? [...session.existingStepsSnapshot]
@@ -214,7 +237,7 @@ export class RecorderManager {
   }
 
   _stepToSaveShape(s) {
-    return {
+    const payload = {
       action_type: s.action_type || 'click',
       target_selector: s.target_selector ?? '',
       target_xpath: s.target_xpath ?? '',
@@ -229,6 +252,173 @@ export class RecorderManager {
       screenshot_focus: s.screenshot_focus ?? '',
       screenshot_focus_rect: s.screenshot_focus_rect ?? '',
     };
+    if (s.screenshot_full !== undefined) {
+      payload.screenshot_full = s.screenshot_full ?? '';
+    }
+    return payload;
+  }
+
+  _ensureClientStepId(step) {
+    if (!step || typeof step !== 'object') return '';
+    if (!step.client_step_id) {
+      step.client_step_id = `step_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    }
+    return step.client_step_id;
+  }
+
+  async _createRecordingSession(testCaseId, mode, insertAfterStepIndex) {
+    try {
+      const res = await this.api.createRecordingSession(testCaseId, {
+        mode,
+        insert_after_step_index: insertAfterStepIndex,
+      });
+      const sessionId = res?.data?.session_id;
+      if (!sessionId) throw new Error('录制会话创建失败');
+      this.state.recordingSessionId = sessionId;
+      this.state.recordingSessionEnabled = true;
+      this.state.recordingSessionHealthy = true;
+      return true;
+    } catch (e) {
+      console.warn('[Recorder] 创建录制会话失败，将回退旧保存方式:', e?.message || e);
+      this.state.recordingSessionId = '';
+      this.state.recordingSessionEnabled = false;
+      this.state.recordingSessionHealthy = false;
+      return false;
+    }
+  }
+
+  async _syncRecordingSessionStep(index, step) {
+    if (!this.state.recordingSessionEnabled || !this.state.recordingSessionId || this.state.recordingSessionHealthy === false) return;
+    try {
+      const payload = this._stepToSaveShape(step);
+      await this.api.saveRecordingSessionStep(this.state.testCaseId, this.state.recordingSessionId, {
+        step_index: index,
+        client_step_id: this._ensureClientStepId(step),
+        step: payload,
+      });
+    } catch (e) {
+      console.warn('[Recorder] 同步录制步骤失败，将回退旧保存方式:', e?.message || e);
+      this.state.recordingSessionHealthy = false;
+    }
+  }
+
+  async _commitRecordingSession(testCaseId, options = {}) {
+    if (!this.state.recordingSessionEnabled || !this.state.recordingSessionId || this.state.recordingSessionHealthy === false) return null;
+    return this.api.commitRecordingSession(testCaseId, this.state.recordingSessionId, options);
+  }
+
+  async _discardRecordingSession(testCaseId = null) {
+    if (!this.state.recordingSessionEnabled || !this.state.recordingSessionId) return;
+    try {
+      await this.api.discardRecordingSession(testCaseId || this.state.testCaseId, this.state.recordingSessionId);
+    } catch {
+      // 临时会话会由后端过期清理兜底。
+    }
+  }
+
+  _isInjectableUrl(url) {
+    return typeof url === 'string' && (url.startsWith('http://') || url.startsWith('https://'));
+  }
+
+  _normalizeTabId(tabId) {
+    const n = Number(tabId);
+    return Number.isInteger(n) && n > 0 ? n : null;
+  }
+
+  _getRecordingTabs() {
+    if (!Array.isArray(this.state.recordingTabs)) this.state.recordingTabs = [];
+    return this.state.recordingTabs;
+  }
+
+  _findRecordingTabById(tabId) {
+    const tid = this._normalizeTabId(tabId);
+    if (tid == null) return null;
+    return this._getRecordingTabs().find((t) => Number(t.tabId) === tid) || null;
+  }
+
+  _registerRecordingTab(tab, { openerTabId = null } = {}) {
+    const tabId = this._normalizeTabId(tab?.id ?? tab);
+    if (tabId == null) return null;
+    const tabs = this._getRecordingTabs();
+    let existing = tabs.find((t) => Number(t.tabId) === tabId);
+    const normalizedOpenerId = this._normalizeTabId(openerTabId ?? tab?.openerTabId);
+    const opener = normalizedOpenerId != null ? this._findRecordingTabById(normalizedOpenerId) : null;
+    const url = typeof tab?.url === 'string' ? tab.url : (existing?.url || '');
+    if (existing) {
+      existing.url = url || existing.url || '';
+      if (normalizedOpenerId != null) existing.openerTabId = normalizedOpenerId;
+      if (opener) existing.openerIndex = opener.index;
+      return existing;
+    }
+    const index = tabs.reduce((max, item) => Math.max(max, Number(item.index) || 0), -1) + 1;
+    existing = {
+      tabId,
+      index,
+      openerTabId: normalizedOpenerId,
+      openerIndex: opener ? opener.index : null,
+      url: url || '',
+    };
+    tabs.push(existing);
+    return existing;
+  }
+
+  _buildSwitchContextStep(tabInfo, reason = 'tab_change') {
+    const index = Number(tabInfo?.index) || 0;
+    const url = tabInfo?.url || '';
+    return {
+      action_type: 'switch_context',
+      target_selector: '',
+      target_xpath: '',
+      locator_meta: {
+        version: 1,
+        candidates: [],
+        context: {
+          tab: {
+            index,
+            url,
+            opener_index: tabInfo?.openerIndex ?? null,
+            reason,
+          },
+        },
+      },
+      value: String(index),
+      url,
+      description: `切换到标签页 #${index}${url ? ` · ${url}` : ''}`,
+      wait_before: 0,
+    };
+  }
+
+  _attachTabContext(step, tabInfo) {
+    if (!step || !tabInfo) return step;
+    if (!step.locator_meta || typeof step.locator_meta !== 'object') {
+      step.locator_meta = { version: 1, candidates: [], context: {} };
+    }
+    if (!step.locator_meta.context || typeof step.locator_meta.context !== 'object') {
+      step.locator_meta.context = {};
+    }
+    step.locator_meta.context.tab = {
+      index: Number(tabInfo.index) || 0,
+      url: tabInfo.url || step.url || '',
+      opener_index: tabInfo.openerIndex ?? null,
+    };
+    return step;
+  }
+
+  _ensureStepTabContext(tabId, step) {
+    const tid = this._normalizeTabId(tabId);
+    if (tid == null) return null;
+    let tabInfo = this._findRecordingTabById(tid);
+    if (!tabInfo) tabInfo = this._registerRecordingTab({ id: tid, url: step?.url || '' });
+    if (step?.url) tabInfo.url = step.url;
+    this._attachTabContext(step, tabInfo);
+    const currentIndex = Number(this.state.currentRecordingTabIndex || 0);
+    if (Number(tabInfo.index) !== currentIndex) {
+      this.state.currentRecordingTabIndex = Number(tabInfo.index) || 0;
+      this.state.currentTabId = tid;
+      return this._buildSwitchContextStep(tabInfo);
+    }
+    this.state.currentTabId = tid;
+    return null;
   }
 
   _sameInputTarget(a, b) {
@@ -274,11 +464,10 @@ export class RecorderManager {
 
   _buildRecordingImportPayload(testCaseId, steps, options) {
     const scene = options.scene;
-    const normalizedSteps = this._withSequentialStepIds(steps);
     return {
       mode: options.mode || 'createScene',
       targetSceneDbId: options.targetSceneDbId,
-      // 替换和追加必须透传启动录制时读取的定义版本，避免绕过并发修改校验。
+      // 替换和追加必须透传录制开始时的定义版本，避免覆盖并发修改。
       expectedDefinitionVersion: options.expectedDefinitionVersion,
       targetCaseId: options.targetCaseId,
       targetStepId: options.targetStepId,
@@ -297,7 +486,7 @@ export class RecorderManager {
         viewport_width: options.viewportWidth,
         viewport_height: options.viewportHeight,
         end_url: options.recordingEndUrl || '',
-        steps: normalizedSteps,
+        steps: this._withSequentialStepIds(steps),
       },
       persistScreenshots: options.persistScreenshots === true,
       keepRawScreenshotInStep: options.keepRawScreenshotInStep === true,
@@ -307,20 +496,20 @@ export class RecorderManager {
   async _saveRecordedSteps(testCaseId, steps, recordingImport = this.state.recordingImport) {
     const importOptions = this._getRecordingImportOptions(recordingImport);
     if (importOptions) {
+      // Admin 是录制主数据源，原始 locator_meta 和 Playwright step 由后端转换并完整保存。
       return this.api.importRecording(this._buildRecordingImportPayload(testCaseId, steps, importOptions));
     }
     return this.api.saveSteps(testCaseId, this._withSequentialStepIds(steps));
   }
 
   /**
-   * 使用保存失败时保留的 session draft 重试导入；失败时不清理草稿，便于再次点击重试。
+   * 使用失败草稿重试原保存目标；Admin 导入失败时不能降级写入官方 testcases 接口。
    */
   async retrySaveDraft() {
     const session = await this._readNewestSessionDraft();
     if (!session) {
       return { ok: false, saved: false, retryable: false, error: '没有可重试的录制草稿' };
     }
-
     const recorded = Array.isArray(session.recordedSteps) ? [...session.recordedSteps] : [];
     const testCaseId = session.testCaseId;
     const toSave = this._mergeRecordedWithSnapshot(
@@ -331,26 +520,10 @@ export class RecorderManager {
     if (!testCaseId || !toSave || toSave.length === 0) {
       return { ok: false, saved: false, retryable: false, error: '录制草稿没有可上传的步骤' };
     }
-
     const recordingImport = session.recordingImport || null;
     const recordingEndUrl = session.recordingEndUrl || await this._getRecordingTabUrl(session.currentTabId);
-    const saveOptions = recordingImport
-      ? { ...recordingImport, recordingEndUrl }
-      : recordingImport;
-    const saveContext = {
-      mode: recordingImport?.mode || (recordingImport ? 'recordingImport' : 'legacySaveSteps'),
-      apiBase: this.api.base,
-      appendPosition: recordingImport?.appendPosition,
-      appendAfterCaseId: recordingImport?.appendAfterCaseId,
-      targetStepId: recordingImport?.targetStepId,
-      stepAppendPosition: recordingImport?.stepAppendPosition,
-      appendAfterStepId: recordingImport?.appendAfterStepId,
-      recordingEndUrl,
-      replaceOldStepCount: recordingImport?.replaceOldStepCount,
-      stepCount: toSave.length,
-      recordedStepCount: recorded.length,
-    };
-
+    const saveOptions = recordingImport ? { ...recordingImport, recordingEndUrl } : null;
+    const saveContext = this._buildSaveContext(recordingImport, recordingEndUrl, toSave, recorded);
     try {
       await this._saveRecordedSteps(testCaseId, toSave, saveOptions);
       await this._clearSessionDraft();
@@ -385,6 +558,22 @@ export class RecorderManager {
     }
   }
 
+  _buildSaveContext(recordingImport, recordingEndUrl, steps, recorded) {
+    return {
+      mode: recordingImport?.mode || (recordingImport ? 'recordingImport' : 'legacySaveSteps'),
+      apiBase: this.api.base,
+      appendPosition: recordingImport?.appendPosition,
+      appendAfterCaseId: recordingImport?.appendAfterCaseId,
+      targetStepId: recordingImport?.targetStepId,
+      stepAppendPosition: recordingImport?.stepAppendPosition,
+      appendAfterStepId: recordingImport?.appendAfterStepId,
+      recordingEndUrl,
+      replaceOldStepCount: recordingImport?.replaceOldStepCount,
+      stepCount: Array.isArray(steps) ? steps.length : 0,
+      recordedStepCount: Array.isArray(recorded) ? recorded.length : 0,
+    };
+  }
+
   _broadcastToContentScripts(message) {
     chrome.tabs.query({}, (tabs) => {
       for (const tab of tabs) {
@@ -414,8 +603,79 @@ export class RecorderManager {
   _broadcastRecordingEnd(payload) {
     this._broadcastToContentScripts({
       type: 'AT_RECORDING_END',
+      eventId: payload?.eventId || `recording_end_${Date.now()}_${Math.random().toString(16).slice(2)}`,
       ...payload,
     });
+  }
+
+  _createPendingQuotaSave(testCaseId, toSave, recordedCount) {
+    const id = `rq_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    this.state.pendingQuotaSave = {
+      id,
+      testCaseId,
+      steps: Array.isArray(toSave) ? [...toSave] : [],
+      recordedCount: Number(recordedCount || 0),
+      recordingSessionId: this.state.recordingSessionId || '',
+      recordingSessionEnabled: this.state.recordingSessionEnabled === true,
+      recordingSessionHealthy: this.state.recordingSessionHealthy !== false,
+      createdAt: Date.now(),
+    };
+    return id;
+  }
+
+  async savePendingQuotaSteps(pendingSaveId, limit) {
+    const pending = this.state.pendingQuotaSave;
+    if (!pending || pending.id !== pendingSaveId) {
+      return { ok: false, error: '待保存的录制步骤已失效，请重新录制' };
+    }
+    const max = Math.max(0, Math.floor(Number(limit || 0)));
+    if (!max) return { ok: false, error: '保留步数无效' };
+    const steps = pending.steps.slice(0, max);
+    try {
+      if (pending.recordingSessionEnabled && pending.recordingSessionId && pending.recordingSessionHealthy) {
+        this.state.recordingSessionId = pending.recordingSessionId;
+        this.state.recordingSessionEnabled = true;
+        this.state.recordingSessionHealthy = true;
+        await this.api.commitRecordingSession(pending.testCaseId, pending.recordingSessionId, { limit: max });
+      } else {
+        await this.api.saveSteps(pending.testCaseId, steps);
+      }
+      await this._clearSessionDraft();
+      this.state.pendingQuotaSave = null;
+      this._showNotification('录制完成', `已保留前 ${steps.length} 步并保存`);
+      this._broadcastRecordingEnd({
+        testCaseId: pending.testCaseId,
+        reason: 'completed',
+        stepCount: steps.length,
+        saved: true,
+        trimmed: true,
+      });
+      this._notifyPopup();
+      return { ok: true, testCaseId: pending.testCaseId, stepCount: steps.length };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err?.message || '保存失败',
+        quotaDetails: err?.quotaDetails || err?.apiData?.data || null,
+      };
+    }
+  }
+
+  async discardPendingQuotaSteps(pendingSaveId) {
+    const pending = this.state.pendingQuotaSave;
+    if (pending && pending.id === pendingSaveId) {
+      if (pending.recordingSessionEnabled && pending.recordingSessionId) {
+        try {
+          await this.api.discardRecordingSession(pending.testCaseId, pending.recordingSessionId);
+        } catch {
+          // 后端会由过期清理兜底。
+        }
+      }
+      this.state.pendingQuotaSave = null;
+      await this._clearSessionDraft();
+      this._notifyPopup();
+    }
+    return { ok: true };
   }
 
   _broadcastStopAck() {
@@ -434,6 +694,20 @@ export class RecorderManager {
     if (recordingTabId) {
       chrome.tabs.remove(recordingTabId).catch(() => {});
     }
+  }
+
+  _buildRecordingWindowCreateData(url, preference) {
+    const data = { url, focused: true };
+    if (preference?.mode === 'custom' || preference?.mode === 'current') {
+      data.state = 'normal';
+      data.width = preference.width;
+      data.height = preference.height;
+      if (preference.left != null) data.left = preference.left;
+      if (preference.top != null) data.top = preference.top;
+      return data;
+    }
+    data.state = 'maximized';
+    return data;
   }
 
   _buildRecordingWindowCreateData(url, preference) {
@@ -489,6 +763,8 @@ export class RecorderManager {
     this.state.recordedSteps = [];
     this.state.recordingOpenedNewTab = false;
     this.state.recordingWindowId = null;
+    this.state.recordingTabs = [];
+    this.state.currentRecordingTabIndex = 0;
     this.state.recordingScreenshotMode = 'standard';
     this.state.recordingImport = options.recordingImport || null;
     this.state.recordingEndUrl = '';
@@ -497,6 +773,10 @@ export class RecorderManager {
     this.state.recordingPaused = false;
     this.state.recordingStartedAt = Date.now();
     this.state.currentTabId = null;
+    this.state.pendingQuotaSave = null;
+    this.state.recordingSessionId = '';
+    this.state.recordingSessionEnabled = false;
+    this.state.recordingSessionHealthy = false;
 
     this._clearMergeContext();
     let resolvedScreenshotMode = 'standard';
@@ -505,9 +785,13 @@ export class RecorderManager {
       resolvedScreenshotMode = 'full_hd';
     }
     const rawInsert = options.insertAfterStepIndex;
+    let sessionMode = 'replace';
+    let sessionInsertAfter = null;
     if (rawInsert != null && rawInsert !== '') {
       const n = Number(rawInsert);
       if (Number.isFinite(n)) {
+        sessionMode = 'insert';
+        sessionInsertAfter = Math.max(0, Math.floor(n));
         try {
           const res = await this.api.getTestCase(testCaseId);
           const modeFromCase = String(res?.data?.screenshot_mode || '').trim().toLowerCase();
@@ -518,6 +802,7 @@ export class RecorderManager {
           } else {
             this._existingStepsSnapshot = list.map((s) => this._stepToSaveShape(s));
             this._insertAfterIndex = Math.max(0, Math.min(Math.floor(n), this._existingStepsSnapshot.length - 1));
+            sessionInsertAfter = this._insertAfterIndex;
           }
         } catch (e) {
           this.state.mode = 'idle';
@@ -525,7 +810,7 @@ export class RecorderManager {
           return { ok: false, error: e.message || '拉取已有步骤失败，无法从该位置插入录制' };
         }
       }
-    } else if (resolvedScreenshotMode === 'standard') {
+    } else if (resolvedScreenshotMode === 'standard' && !this._getRecordingImportOptions()) {
       // 未显式传入模式时，回退读取用例配置，兼容弹窗/旧调用链。
       try {
         const res = await this.api.getTestCase(testCaseId);
@@ -535,10 +820,21 @@ export class RecorderManager {
         // ignore
       }
     }
+    // Admin 导入使用专用 DTO，不为 synthetic case ID 创建官方 recording session。
+    if (!this._getRecordingImportOptions()) {
+      await this._createRecordingSession(testCaseId, sessionMode, sessionInsertAfter);
+    }
 
     try {
       let tab;
-      if (startUrl) {
+      const reuseTabId = Number(options.reuseTabId);
+      if (Number.isInteger(reuseTabId) && reuseTabId > 0) {
+        tab = await chrome.tabs.get(reuseTabId);
+        await chrome.tabs.update(reuseTabId, { active: true }).catch(() => {});
+        if (tab.windowId != null) await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+        this.state.recordingOpenedNewTab = options.closeReusedTabAfterStop === true;
+        this.state.recordingWindowId = tab.windowId ?? null;
+      } else if (startUrl) {
         const win = await chrome.windows.create(this._buildRecordingWindowCreateData(startUrl, options.windowPreference));
         tab = win.tabs[0];
         this.state.recordingOpenedNewTab = true;
@@ -549,6 +845,9 @@ export class RecorderManager {
         this.state.recordingWindowId = null;
       }
       this.state.currentTabId = tab.id;
+      this.state.recordingTabs = [];
+      this.state.currentRecordingTabIndex = 0;
+      this._registerRecordingTab(tab);
       this.state.recordingScreenshotMode = resolvedScreenshotMode;
 
       await this._waitForTabLoad(tab.id);
@@ -559,9 +858,12 @@ export class RecorderManager {
       this._notifyPopup();
       return { ok: true, tabId: tab.id };
     } catch (err) {
+      await this._discardRecordingSession(testCaseId);
       this.state.mode = 'idle';
       this.state.recordingOpenedNewTab = false;
       this.state.recordingWindowId = null;
+      this.state.recordingTabs = [];
+      this.state.currentRecordingTabIndex = 0;
       this.state.recordingScreenshotMode = 'standard';
       this.state.recordingImport = null;
       this.state.recordingEndUrl = '';
@@ -582,6 +884,13 @@ export class RecorderManager {
     }
     step.timestamp = Date.now();
     const list = this.state.recordedSteps;
+    const switchStep = this._ensureStepTabContext(tabId, step);
+    if (switchStep) {
+      switchStep.timestamp = Date.now();
+      this._ensureClientStepId(switchStep);
+      list.push(switchStep);
+      await this._syncRecordingSessionStep(list.length - 1, switchStep);
+    }
     const last = list[list.length - 1];
 
     // 输入框连续编辑时，只保留同一目标的最后一条 input 步骤。
@@ -591,9 +900,13 @@ export class RecorderManager {
       && last.action_type === 'input'
       && this._sameInputTarget(step, last)
     ) {
+      step.client_step_id = last.client_step_id || this._ensureClientStepId(last);
       list[list.length - 1] = step;
+      await this._syncRecordingSessionStep(list.length - 1, step);
     } else {
+      this._ensureClientStepId(step);
       list.push(step);
+      await this._syncRecordingSessionStep(list.length - 1, step);
     }
 
     if (this.state.currentTabId) {
@@ -619,7 +932,10 @@ export class RecorderManager {
       if (!restored) return { ok: false, active: false };
     }
     if (Number.isInteger(Number(tabIdHint))) {
-      this.state.currentTabId = Number(tabIdHint);
+      const tabId = Number(tabIdHint);
+      this.state.currentTabId = tabId;
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (tab) this._registerRecordingTab(tab);
     }
     await this._saveSessionDraft();
     return {
@@ -702,30 +1018,19 @@ export class RecorderManager {
     const recorded = [...this.state.recordedSteps];
     const testCaseId = this.state.testCaseId;
     const recordingImport = this.state.recordingImport;
+    const importOptions = this._getRecordingImportOptions(recordingImport);
     const recordingEndUrl = await this._getRecordingTabUrl(recordingTabId);
-    const saveOptions = recordingImport
-      ? { ...recordingImport, recordingEndUrl }
-      : recordingImport;
+    const saveOptions = recordingImport ? { ...recordingImport, recordingEndUrl } : null;
     const toSave = this._mergeRecordedWithSnapshot(recorded);
-    const saveContext = {
-      mode: recordingImport?.mode || (recordingImport ? 'recordingImport' : 'legacySaveSteps'),
-      apiBase: this.api.base,
-      appendPosition: recordingImport?.appendPosition,
-      appendAfterCaseId: recordingImport?.appendAfterCaseId,
-      targetStepId: recordingImport?.targetStepId,
-      stepAppendPosition: recordingImport?.stepAppendPosition,
-      appendAfterStepId: recordingImport?.appendAfterStepId,
-      recordingEndUrl,
-      replaceOldStepCount: recordingImport?.replaceOldStepCount,
-      stepCount: Array.isArray(toSave) ? toSave.length : 0,
-      recordedStepCount: recorded.length,
-    };
-    // 停止录制前把最终地址写入草稿，上传失败后重试仍能复用完整导入上下文。
+    const saveContext = this._buildSaveContext(recordingImport, recordingEndUrl, toSave, recorded);
+    // 先持久化最终 URL 和导入上下文，保存失败后仍可按原目标重试。
     this.state.recordingEndUrl = recordingEndUrl;
     await this._saveSessionDraft();
     this._clearMergeContext();
     this.state.mode = 'idle';
     this.state.currentTabId = null;
+    this.state.recordingTabs = [];
+    this.state.currentRecordingTabIndex = 0;
     this.state.recordingOpenedNewTab = false;
     this.state.recordingWindowId = null;
     this.state.recordingScreenshotMode = 'standard';
@@ -739,7 +1044,14 @@ export class RecorderManager {
     let saved = false;
     if (testCaseId && toSave && toSave.length > 0) {
       try {
-        await this._saveRecordedSteps(testCaseId, toSave, saveOptions);
+        if (importOptions) {
+          await this._saveRecordedSteps(testCaseId, toSave, saveOptions);
+        } else if (this.state.recordingSessionEnabled && this.state.recordingSessionId && this.state.recordingSessionHealthy !== false) {
+          await this._commitRecordingSession(testCaseId);
+        } else {
+          await this._discardRecordingSession(testCaseId);
+          await this._saveRecordedSteps(testCaseId, toSave, null);
+        }
         saved = true;
         await this._clearSessionDraft();
         const msg =
@@ -749,26 +1061,45 @@ export class RecorderManager {
         this._showNotification('录制完成', msg);
       } catch (err) {
         const error = err?.message || String(err);
-        await this._markSessionDraftSaveFailed(error);
         this._showNotification('保存失败', error);
+        const quotaDetails = err?.quotaDetails || err?.apiData?.data || null;
+        const pendingSaveId = !importOptions && quotaDetails?.resource === 'steps_per_case'
+          ? this._createPendingQuotaSave(testCaseId, toSave, recorded.length)
+          : '';
+        const retryable = !pendingSaveId && recorded.length > 0;
+        if (retryable) {
+          await this._markSessionDraftSaveFailed(error);
+        } else {
+          await this._clearSessionDraft();
+        }
+        this.state.recordingSessionId = '';
+        this.state.recordingSessionEnabled = false;
+        this.state.recordingSessionHealthy = false;
         this.state.recordedSteps = [];
         this._broadcastRecordingEnd({
           testCaseId,
           reason: 'completed',
           stepCount: recorded.length,
           saved: false,
-          retryable: true,
+          retryable,
           error,
+          quotaDetails,
+          pendingSaveId,
           saveContext,
         });
         this._notifyPopup();
         if (closeTabAfterStop) {
           this._closeRecordingTarget(recordingWindowId, recordingTabId);
         }
-        return { ok: false, error: err.message };
+        return { ok: false, error, retryable, quotaDetails, pendingSaveId, testCaseId, saveContext };
       }
+    } else {
+      await this._discardRecordingSession(testCaseId);
     }
     await this._clearSessionDraft();
+    this.state.recordingSessionId = '';
+    this.state.recordingSessionEnabled = false;
+    this.state.recordingSessionHealthy = false;
 
     if (closeTabAfterStop) {
       this._closeRecordingTarget(recordingWindowId, recordingTabId);
@@ -807,11 +1138,14 @@ export class RecorderManager {
       await chrome.tabs.sendMessage(recordingTabId, { type: 'AT_CANCEL_RECORDING_ACK' }).catch(() => {});
     }
     this._broadcastCancelAck();
+    await this._discardRecordingSession(testCaseId);
 
     this._clearMergeContext();
     this.state.mode = 'idle';
     this.state.currentTabId = null;
     this.state.recordedSteps = [];
+    this.state.recordingTabs = [];
+    this.state.currentRecordingTabIndex = 0;
     this.state.recordingOpenedNewTab = false;
     this.state.recordingWindowId = null;
     this.state.recordingScreenshotMode = 'standard';
@@ -821,6 +1155,10 @@ export class RecorderManager {
     this.state.recordingSaveError = '';
     this.state.recordingPaused = false;
     this.state.recordingStartedAt = 0;
+    this.state.recordingSessionId = '';
+    this.state.recordingSessionEnabled = false;
+    this.state.recordingSessionHealthy = false;
+    this.state.pendingQuotaSave = null;
     await this._clearSessionDraft();
 
     this._broadcastRecordingEnd({
@@ -846,36 +1184,36 @@ export class RecorderManager {
       const restored = await this._restoreSessionDraft(tabIdHint);
       if (!restored) return;
     }
-    if (tabIdHint != null && Number(this.state.currentTabId) !== Number(tabIdHint)) return;
+    const closedTabInfo = tabIdHint != null ? this._findRecordingTabById(tabIdHint) : null;
+    if (tabIdHint != null && !closedTabInfo) return;
+    if (closedTabInfo && Number(closedTabInfo.index) !== 0) {
+      this.state.recordingTabs = this._getRecordingTabs().filter((t) => Number(t.tabId) !== Number(tabIdHint));
+      await this._saveSessionDraft();
+      this._notifyPopup();
+      return;
+    }
 
     const recorded = [...this.state.recordedSteps];
     const testCaseId = this.state.testCaseId;
     const recordingImport = this.state.recordingImport;
+    const importOptions = this._getRecordingImportOptions(recordingImport);
     const recordingWindowId = this.state.recordingWindowId;
-    const recordingEndUrl = await this._getRecordingTabUrl(this.state.currentTabId);
+    const recordingEndUrl = this.state.recordingEndUrl
+      || await this._getRecordingTabUrl(this.state.currentTabId)
+      || String(recorded.at(-1)?.url || '');
     const saveOptions = recordingImport
       ? { ...recordingImport, recordingEndUrl }
-      : recordingImport;
+      : null;
     const toSave = this._mergeRecordedWithSnapshot(recorded);
-    const saveContext = {
-      mode: recordingImport?.mode || (recordingImport ? 'recordingImport' : 'legacySaveSteps'),
-      apiBase: this.api.base,
-      appendPosition: recordingImport?.appendPosition,
-      appendAfterCaseId: recordingImport?.appendAfterCaseId,
-      targetStepId: recordingImport?.targetStepId,
-      stepAppendPosition: recordingImport?.stepAppendPosition,
-      appendAfterStepId: recordingImport?.appendAfterStepId,
-      recordingEndUrl,
-      replaceOldStepCount: recordingImport?.replaceOldStepCount,
-      stepCount: Array.isArray(toSave) ? toSave.length : 0,
-      recordedStepCount: recorded.length,
-    };
-    // 标签页关闭也要先保存最终地址，便于导入失败后从草稿重试。
+    const saveContext = this._buildSaveContext(recordingImport, recordingEndUrl, toSave, recorded);
+    // 主录制页关闭前保留完整导入上下文；子标签页关闭仅更新标签注册表。
     this.state.recordingEndUrl = recordingEndUrl;
     await this._saveSessionDraft();
     this._clearMergeContext();
     this.state.mode = 'idle';
     this.state.currentTabId = null;
+    this.state.recordingTabs = [];
+    this.state.currentRecordingTabIndex = 0;
     this.state.recordingOpenedNewTab = false;
     this.state.recordingWindowId = null;
     this.state.recordingScreenshotMode = 'standard';
@@ -888,24 +1226,42 @@ export class RecorderManager {
 
     let saved = false;
     let saveError = '';
+    let quotaDetails = null;
+    let pendingSaveId = '';
     if (testCaseId && toSave && toSave.length > 0) {
       try {
-        await this._saveRecordedSteps(testCaseId, toSave, saveOptions);
+        if (importOptions) {
+          await this._saveRecordedSteps(testCaseId, toSave, saveOptions);
+        } else if (this.state.recordingSessionEnabled && this.state.recordingSessionId && this.state.recordingSessionHealthy !== false) {
+          await this._commitRecordingSession(testCaseId);
+        } else {
+          await this._discardRecordingSession(testCaseId);
+          await this._saveRecordedSteps(testCaseId, toSave, null);
+        }
         saved = true;
         await this._clearSessionDraft();
         this._showNotification('录制标签页已关闭', `已保存 ${toSave.length} 个操作步骤`);
       } catch (err) {
         saveError = err?.message || String(err);
         this._showNotification('保存失败', saveError);
+        quotaDetails = err?.quotaDetails || err?.apiData?.data || null;
+        pendingSaveId = !importOptions && quotaDetails?.resource === 'steps_per_case'
+          ? this._createPendingQuotaSave(testCaseId, toSave, recorded.length)
+          : '';
       }
     } else {
       saveError = '录制标签页已关闭，但没有可保存的步骤。';
+      await this._discardRecordingSession(testCaseId);
     }
-    if (!saved && saveError && recorded.length > 0) {
+    const retryable = !saved && !pendingSaveId && Boolean(saveError) && recorded.length > 0;
+    if (retryable) {
       await this._markSessionDraftSaveFailed(saveError);
     } else if (!saved) {
       await this._clearSessionDraft();
     }
+    this.state.recordingSessionId = '';
+    this.state.recordingSessionEnabled = false;
+    this.state.recordingSessionHealthy = false;
     if (recordingWindowId) {
       chrome.windows.remove(recordingWindowId).catch(() => {});
     }
@@ -916,8 +1272,10 @@ export class RecorderManager {
       reason: 'tab_closed',
       stepCount: recorded.length,
       saved,
-      retryable: !saved && Boolean(saveError) && recorded.length > 0,
+      retryable,
       error: saved ? undefined : saveError,
+      quotaDetails,
+      pendingSaveId,
       saveContext,
     });
     this._notifyPopup();
@@ -958,20 +1316,49 @@ export class RecorderManager {
   }
 
   async handleRecordingTabLoadComplete(tabId, tabUrl = '') {
-    if (this.state.mode !== 'recording' || this.state.currentTabId !== tabId) {
+    if (this.state.mode !== 'recording') {
       const restored = await this._restoreSessionDraft(tabId);
-      if (!restored || this.state.currentTabId !== tabId) return;
+      if (!restored) return;
     }
-    if ((Date.now() - Number(this.state.recordingStartedAt || 0)) < 4000 && this.state.recordedSteps.length === 0) return;
-    if (!tabUrl || !(String(tabUrl).startsWith('http://') || String(tabUrl).startsWith('https://'))) return;
+    if (!tabUrl || !this._isInjectableUrl(String(tabUrl))) return;
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) return;
+    const existing = this._findRecordingTabById(tabId);
+    const opener = tab.openerTabId != null ? this._findRecordingTabById(tab.openerTabId) : null;
+    if (!existing && !opener) return;
+    const isInitialRecordingTab = existing && Number(existing.index) === 0;
+    if (
+      isInitialRecordingTab
+      && (Date.now() - Number(this.state.recordingStartedAt || 0)) < 4000
+      && this.state.recordedSteps.length === 0
+    ) {
+      return;
+    }
+    const tabInfo = this._registerRecordingTab(tab);
+    if (!tabInfo) return;
     try {
       await this._waitForTabLoad(tabId);
       await this._reinjectRecorder(tabId, this.state.recordingScreenshotMode || 'standard');
       await this._saveSessionDraft();
-      this._showNotification('录制已续接', `页面跳转后已恢复录制工具栏，当前已捕获 ${this.state.recordedSteps.length} 步`);
+      this._showNotification(
+        tabInfo.index === 0 ? '录制已续接' : `已接管新标签页 #${tabInfo.index}`,
+        `当前已捕获 ${this.state.recordedSteps.length} 步`,
+      );
     } catch (e) {
       console.warn('[Recorder] 页面跳转后恢复录制失败:', e?.message || e);
     }
+  }
+
+  async handleRecordingTabCreated(tab) {
+    if (this.state.mode !== 'recording') {
+      const restored = await this._restoreSessionDraft(null);
+      if (!restored) return;
+    }
+    const opener = tab?.openerTabId != null ? this._findRecordingTabById(tab.openerTabId) : null;
+    if (!opener) return;
+    const tabInfo = this._registerRecordingTab(tab);
+    if (!tabInfo) return;
+    await this._saveSessionDraft();
   }
 
   _notifyPopup() {

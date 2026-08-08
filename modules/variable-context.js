@@ -12,10 +12,14 @@ const STEP_IDENTITY_KEYS = new Set([
   'original_step_id',
   'step_index',
   'action_type',
+  'original_action_type',
+  'recording_source',
+  'description',
   'source',
   'schema_version',
   'catalog_version',
   'canonical_digest',
+  'diagnostic_fields',
 ]);
 
 export const LOCAL_VARIABLE_ACTION_TYPES = new Set([
@@ -73,10 +77,12 @@ export class CuecastVariableContext {
   }
 
   resolveText(value) {
-    if (typeof value !== 'string' || !value.includes('${')) return value;
-    const whole = value.match(/^\$\{([^{}]+)}$/);
+    if (typeof value !== 'string' || (!value.includes('${') && !value.includes('{{'))) return value;
+    const whole = value.match(/^\$\{([^{}]+)}$/) || value.match(/^\{\{([^{}]+)}}$/);
     if (whole) return this.get(whole[1].trim());
-    return value.replace(/\$\{([^{}]+)}/g, (_all, expression) => stringifyValue(this.get(String(expression).trim())));
+    return value.replace(/\$\{([^{}]+)}|\{\{([^{}]+)}}/g, (_all, canonical, cuecast) => (
+      stringifyValue(this.get(String(canonical ?? cuecast).trim()))
+    ));
   }
 
   resolveStep(step) {
@@ -209,7 +215,9 @@ function resolveRuntimeValue(value, context, isRoot = false) {
 
 function collectReferences(value, references, isRoot = false) {
   if (typeof value === 'string') {
-    for (const match of value.matchAll(/\$\{([^{}]+)}/g)) references.add(String(match[1]).trim());
+    for (const match of value.matchAll(/\$\{([^{}]+)}|\{\{([^{}]+)}}/g)) {
+      references.add(String(match[1] ?? match[2]).trim());
+    }
     return;
   }
   if (Array.isArray(value)) {

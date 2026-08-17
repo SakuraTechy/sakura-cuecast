@@ -82,6 +82,78 @@ export class ApiClient {
       executionCapability,
     });
   }
+
+  /** 将 Admin 执行证书下载到扩展所在电脑，返回 Chrome 可读取的本机绝对路径。 */
+  async downloadExecutionFile(reference, executionCapability = '', executionBatchId = '') {
+    const downloadPath = String(reference?.download_path || '').trim();
+    if (!downloadPath.startsWith('/automation/playwright/testcases/')) {
+      throw new Error('执行文件下载引用非法');
+    }
+    const originalName = String(reference?.file_name || 'certificate.bin').replace(/[^A-Za-z0-9._-]/g, '_');
+    const batchId = String(executionBatchId || '').trim().replace(/[^A-Za-z0-9._-]/g, '_');
+    const relativePath = batchId && !/^\.+$/.test(batchId)
+      ? `sakura-cuecast/execution-files/${batchId}/${originalName}`
+      : `sakura-cuecast/execution-files/${Date.now()}-${originalName}`;
+    const token = this._getToken();
+    const capability = String(executionCapability || '').trim();
+    const downloadId = await chrome.downloads.download({
+      url: `${this.base}${downloadPath}`,
+      filename: relativePath,
+      saveAs: false,
+      conflictAction: 'uniquify',
+      ...(token || capability ? {
+        headers: [
+          ...(token ? [{ name: 'Authorization', value: `Bearer ${token}` }] : []),
+          ...(capability ? [{ name: 'X-Execution-Capability', value: capability }] : []),
+        ],
+      } : {}),
+    });
+    const item = await this._waitForDownload(downloadId, 60000);
+    return { downloadId, localPath: item.filename };
+  }
+
+  async cleanupExecutionFile(downloadId) {
+    if (downloadId == null) return;
+    await chrome.downloads.removeFile(downloadId).catch(() => {});
+    await chrome.downloads.erase({ id: downloadId }).catch(() => {});
+  }
+
+  _waitForDownload(downloadId, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      let timer;
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        chrome.downloads.onChanged.removeListener(onChanged);
+      };
+      const readItem = async () => {
+        const items = await chrome.downloads.search({ id: downloadId });
+        const item = items[0];
+        if (!item || item.state !== 'complete' || !item.filename) {
+          throw new Error('执行文件下载完成但未取得本机路径');
+        }
+        return item;
+      };
+      const onChanged = (delta) => {
+        if (delta.id !== downloadId) return;
+        if (delta.error?.current) {
+          cleanup();
+          reject(new Error(`执行文件下载失败：${delta.error.current}`));
+        } else if (delta.state?.current === 'complete') {
+          cleanup();
+          void readItem().then(resolve, reject);
+        }
+      };
+      chrome.downloads.onChanged.addListener(onChanged);
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`执行文件下载超时（${timeoutMs}ms）`));
+      }, timeoutMs);
+      void readItem().then((item) => {
+        cleanup();
+        resolve(item);
+      }).catch(() => {});
+    });
+  }
   saveSteps(id, steps) { return this.request('POST', `/testcases/${id}/steps`, { steps }); }
   importRecording(payload) {
     return this.request('POST', '/automation/automationUiScene/recordings/import', payload, { timeoutMs: 60000 });

@@ -81,6 +81,24 @@ input:focus {
   outline: 2px solid rgb(28 88 217 / 18%);
 }
 
+.checkbox-setting {
+  grid-template-columns: 18px 1fr;
+  align-items: start;
+  cursor: pointer;
+}
+
+.checkbox-setting input {
+  width: 18px;
+  height: 18px;
+  margin: 2px 0 0;
+  accent-color: var(--primary);
+}
+
+.checkbox-setting > span {
+  display: grid;
+  gap: 4px;
+}
+
 small {
   font-size: 12px;
   font-weight: 400;

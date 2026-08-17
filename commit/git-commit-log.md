@@ -1,3 +1,3514 @@
+# 2026-08-17 统一变量引用语法并回传 CDP 保存变量定位器
+
+## 涉及文件
+
+- modules/player-manager.js
+- modules/variable-context.js
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+保存变量步骤和后续引用步骤同时出现 `${name}`、`{{name}}` 两套展示方式，容易让用户误以为必须手工转换。CDP 从页面元素保存变量时虽然已读取到元素值，但步骤结果没有携带实际命中的定位器，导致报告中的候选策略无法标记选中状态。
+
+## 变更内容
+
+1. 新录制和页面提示统一使用 `{{name}}`，CueCast 继续兼容历史 `${name}`，避免旧用例失效。
+2. CDP 从页面元素保存变量时返回实际命中的定位器、命中数量和可见数量，并写入公共步骤定位诊断。
+3. 增加保存变量定位器契约测试，验证配置来源、CDP 执行通道和录制候选评分均可正确回传。
+
+## 验证
+
+- `node --check modules/player-manager.js`、`node --check modules/variable-context.js`：通过。
+- `node --test tests/operation-contract.test.js`：20/20 通过。
+- `sakura-admin-ui: pnpm typecheck`：通过。
+- `sakura-admin: mvn -pl continew-automation -am "-DskipTests=false" "-Dtest=AutomationInfrastructureRuntimeBindingResolverTest" "-Dsurefire.failIfNoSpecifiedTests=false" test`：3/3 通过，构建成功。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
+-            appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', null, null, {
++            appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', localResult?.locator || null, null, {
+@@
+-        value = await this._readVariableFromLocatorCDP(tabId, step);
++        const captured = await this._readVariableFromLocatorCDP(tabId, step);
++        value = captured.value;
++        locator = captured.locator;
+@@
+-      return { variable };
++      return { variable, ...(locator ? { locator } : {}) };
+@@
+-      if (v && v.ok && typeof v.value === 'string') return v.value;
++      if (v && v.ok && typeof v.value === 'string') return returnDetails ? v : v.value;
+```
+
+### modules/variable-context.js
+
+```diff
+@@
+- * 与 Playwright Runner 共享 ${name}、${object.key}、${list[0]} 的替换契约，但不依赖 Node API。
++ * 新步骤统一使用 {{name}}、{{object.key}}、{{list[0]}}；历史 ${name} 继续兼容，但不依赖 Node API。
+```
+
+### tests/operation-contract.test.js
+
+```diff
+@@
++test('CueCast CDP 从页面保存变量时返回实际命中定位器', async () => {
++  const manager = Object.create(PlayerManager.prototype);
++  manager._waitForVariableValueCDP = async () => ({
++    ok: true,
++    value: '防统方系统 - 系统管理平台',
++    via: 'meta-css_fallback',
++    matched_count: 1,
++    visible_count: 1,
++  });
++  const context = new CuecastVariableContext();
++  const result = await manager._executeLocalVariableAction(5, {
++    action_type: 'global_variable_set',
++    variable_name: 'test',
++    source_type: 'locator',
++    target_selector: 'span.user-title',
++    locator_meta: {
++      candidates: [{ type: 'css_fallback', value: 'span.user-title', score: 0.72 }],
++    },
++  }, context);
++
++  assert.equal(result.variable.value_preview, '防统方系统 - 系统管理平台');
++  assert.equal(result.locator.source, 'locator_meta.candidates[0]');
++  assert.equal(result.locator.executionSource, 'cdp:meta-css_fallback');
++  assert.equal(result.locator.recordingScore, 0.72);
++});
+```
+
+# 2026-08-17 对齐 CDP 定位来源并保留完整操作输入
+
+## 涉及文件
+
+- modules/player-manager.js
+- modules/operation-diagnostics.js
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+CDP 报告把 `cdp:meta-css_fallback` 作为定位来源，而 Playwright 报告使用 `locator_meta.candidates[0]`，两者实际描述的是执行通道和配置来源两个不同层级。录制候选已经包含 0 到 1 的置信分，但该分数也不能冒充 Playwright 运行时 `semantic-v1` 语义评分。另外，统一操作输入原来只保存 512 字符预览，前端即使增加提示也无法复制完整值。
+
+## 变更内容
+
+1. CDP 公共定位来源统一为 `locator_meta.candidates[index]`、`target_selector` 或 `target_xpath`，原 `cdp:*` 信息独立保存为执行定位通道。
+2. CDP 命中录制候选时输出原始候选分数和 `recording_candidate` 类型，报告可明确展示“录制候选评分”。
+3. 配置值和执行值保留完整的非敏感文本；断言摘要、结果事实等其他预览仍保持长度限制。
+4. 增加 CDP 来源/评分和超过 512 字符完整输入契约测试。
+
+## 验证
+
+- `node --check modules/player-manager.js`、`node --check modules/operation-diagnostics.js`：通过。
+- `node --test tests/operation-contract.test.js`：19/19 通过。
+- `sakura-playwright: node --test tests/unit/operation-diagnostics.test.js`：15/15 通过。
+- `sakura-admin-ui: pnpm typecheck`：通过。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
+   static _actualLocatorFromVia(step, via, matchedCount = 1, visibleCount = null) {
+     const source = String(via || '').trim();
+     if (!source) return null;
+     const candidates = PlayerManager._normalizeLocatorMetaCandidates(step?.locator_meta);
++    const locatorMeta = PlayerManager._parseLocatorMetaObject(step?.locator_meta);
++    const recordedCandidates = Array.isArray(locatorMeta?.candidates) ? locatorMeta.candidates : [];
+@@
+-    return {
+-      source: `cdp:${source}`,
++    const canonicalSource = recordedCandidate
++      ? `locator_meta.candidates[${recordedCandidate.index}]`
++      : source === 'css'
++        ? 'target_selector'
++        : source === 'xpath'
++          ? 'target_xpath'
++          : `cdp:${source}`;
++    const recordingScore = Number(recordedCandidate?.score);
++    return {
++      source: canonicalSource,
++      executionSource: `cdp:${source}`,
+       type,
+       value,
+       matchedCount,
++      ...(visibleCount != null ? { visibleCount } : {}),
++      ...(Number.isFinite(recordingScore) ? { recordingScore } : {}),
+@@
+       selected: {
+         source: actualLocator.source || '',
++        execution_source: actualLocator.executionSource || '',
+         type: actualLocator.type || '',
+         value: actualLocator.value || '',
+         decision: 'ordered-first-match',
++        ...(Number.isFinite(actualLocator.recordingScore)
++          ? { score: actualLocator.recordingScore, score_kind: 'recording_candidate' }
++          : {}),
+       },
+```
+
+### modules/operation-diagnostics.js
+
+```diff
+@@
+-      ...(configured !== undefined ? { configured: display(key, configured, definitionStep, field) } : {}),
+-      ...(effective !== undefined ? { effective: display(key, effective, runtimeStep, field) } : {}),
++      ...(configured !== undefined ? { configured: display(key, configured, definitionStep, field, false) } : {}),
++      ...(effective !== undefined ? { effective: display(key, effective, runtimeStep, field, false) } : {}),
+@@
+-function display(key, value, step, field = null) {
++function display(key, value, step, field = null, truncate = true) {
+@@
+-  return { value_state: 'visible', preview: safeText(value) };
++  const text = truncate ? safeText : fullText;
++  if (URL_KEY.test(key)) return { value_state: 'visible', preview: safeUrl(value, truncate) };
++  if (Array.isArray(value)) return { value_state: 'visible', preview: text(value.join(', ')) };
++  return { value_state: 'visible', preview: text(value) };
+@@
+ function safeText(value) {
+-  return String(value == null ? '' : typeof value === 'object' ? JSON.stringify(value) : value)
+-    .replace(/[\r\n]+/g, ' ').slice(0, 512);
++  return fullText(value).slice(0, 512);
++}
++
++function fullText(value) {
++  return String(value == null ? '' : typeof value === 'object' ? JSON.stringify(value) : value)
++    .replace(/[\r\n]+/g, ' ');
+ }
+```
+
+### tests/operation-contract.test.js
+
+```diff
+@@
+-      assert.equal(error.actualLocator.source, 'cdp:meta-css_fallback');
++      assert.equal(error.actualLocator.source, 'locator_meta.candidates[0]');
++      assert.equal(error.actualLocator.executionSource, 'cdp:meta-css_fallback');
++      assert.equal(error.actualLocator.recordingScore, 0.72);
+@@
+-test('CueCast CDP 输出可验证的定位诊断且不伪造语义评分', () => {
++test('CueCast CDP 显示录制候选评分而不冒充执行语义评分', () => {
+@@
++  assert.equal(diagnostics.selected.source, 'locator_meta.candidates[0]');
++  assert.equal(diagnostics.selected.execution_source, 'cdp:meta-css_fallback');
++  assert.equal(diagnostics.selected.score, 0.72);
++  assert.equal(diagnostics.selected.score_kind, 'recording_candidate');
++});
++
++test('CueCast 操作输入保留超过 512 字符的完整配置值和执行值', () => {
++  const longValue = `locator-${'x'.repeat(700)}`;
++  const result = attachOperationDiagnostic(
++    { action_type: 'click', status: 'passed' },
++    { action_type: 'click', target_ref: longValue },
++    { action_type: 'click', target_ref: longValue },
++  );
++  const target = result.details.operation.inputs.find((item) => item.key === 'target_ref');
++  assert.equal(target.configured.preview, longValue);
++  assert.equal(target.effective.preview, longValue);
+ });
+```
+
+# 2026-08-17 统一变量断言值并补齐 CDP 定位诊断
+
+## 涉及文件
+
+- modules/player-manager.js
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+CDP 回放在生成统一操作详情时把已经解析变量的运行步骤同时当成配置步骤，导致配置值丢失 `{{变量名}}`；同时 CDP 结果只有扁平定位字段，没有 Playwright 报告所使用的定位诊断结构。报告因此无法一致地区分配置值、解析后的期望值和页面实际值，也无法展示 CDP 的候选定位决策。
+
+## 变更内容
+
+1. CDP 结果使用原始定义步骤生成配置值，使用运行步骤生成执行值，页面读取结果继续单独保存为实际值。
+2. CDP 命中定位器后输出候选数量、定位来源、定位类型、定位结果和步骤耗时。
+3. CDP 不执行 Playwright 的语义评分，定位诊断不写入虚假 `score`，由报告明确显示“未评分”。
+4. 增加变量断言三值契约和 CDP 定位诊断契约测试，并同步目录当前 125 个表单字段基线。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --test tests/operation-contract.test.js`：18/18 通过。
+- `sakura-playwright: node --test tests/unit/operation-diagnostics.test.js`：14/14 通过。
+- `sakura-admin-ui: pnpm typecheck`：通过。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
+       const appendStepResult = (step, index, status, startedAt, error = '', locator = null, executorResult = null, stepDetails = {}) => {
++        const definitionStep = PlayerManager._adaptRecordedStep(steps[index] || step);
+@@
+-        result = attachOperationDiagnostic(result, step, step, { executor: 'extension-cdp' });
++        result = attachOperationDiagnostic(result, definitionStep, step, { executor: 'extension-cdp' });
+@@
++  static _buildCdpLocatorDiagnostics(step, actualLocator, status, durationMs) {
++    if (!actualLocator?.source) return null;
++    const configuredLocators = PlayerManager._normalizeLocatorMetaCandidates(step?.locator_meta);
++    [
++      { type: 'css', value: step?.target_selector },
++      { type: 'xpath', value: step?.target_xpath },
++    ].forEach((candidate) => {
++      const value = String(candidate.value || '').trim();
++      if (value && !configuredLocators.some((item) => item.type === candidate.type && item.value === value)) {
++        configuredLocators.push({ type: candidate.type, value });
++      }
++    });
++    return {
++      version: 1,
++      mode: 'cdp-ordered-candidate',
++      outcome: status === 'passed' ? 'resolved' : 'action-failed',
++      configured_candidate_count: configuredLocators.length,
++      selected: {
++        source: actualLocator.source || '',
++        type: actualLocator.type || '',
++        value: actualLocator.value || '',
++        decision: 'ordered-first-match',
++      },
++      // CDP 当前只返回步骤总耗时，不能伪装成 Playwright 的语义定位等待耗时。
++      wait: { wall_ms: Math.max(0, Number(durationMs) || 0), measurement: 'step_total' },
++    };
++  }
+```
+
+### tests/operation-contract.test.js
+
+```diff
+@@
+-test('CueCast 断言输入执行值使用实际读取结果', () => {
++test('CueCast 变量断言区分配置值、解析后的期望值和页面实际值', () => {
+@@
++  assert.equal(expectedInput.configured.preview, '{{test}}1');
++  assert.equal(expectedInput.effective.preview, '防统方系统 - 系统管理平台1');
++  assert.deepEqual(expectedInput.actual, { value_state: 'visible', preview: '防统方系统 - 系统管理平台' });
++  assert.deepEqual(expectedInput.source, { code: 'variable_reference', label: '引用变量：test' });
++});
++
++test('CueCast CDP 输出可验证的定位诊断且不伪造语义评分', () => {
++  const diagnostics = PlayerManager._buildCdpLocatorDiagnostics(
++    {
++      target_selector: 'span.user-title',
++      target_xpath: '/html/body/div[1]/span',
++      locator_meta: {
++        candidates: [
++          { type: 'css_fallback', value: 'span.user-title', score: 0.7 },
++          { type: 'text_exact', value: '{{test}}', score: 0.6 },
++        ],
++      },
++    },
++    {
++      source: 'cdp:meta-css_fallback',
++      type: 'css_fallback',
++      value: 'span.user-title',
++      matchedCount: 1,
++      visibleCount: 1,
++    },
++    'failed',
++    465,
++  );
++  assert.equal(diagnostics.mode, 'cdp-ordered-candidate');
++  assert.equal(diagnostics.outcome, 'action-failed');
++  assert.equal('score' in diagnostics.selected, false);
++  assert.deepEqual(diagnostics.wait, { wall_ms: 465, measurement: 'step_total' });
+ });
+@@
+-  assert.equal(fieldCount, 124);
++  assert.equal(fieldCount, 125);
+```
+
+# 2026-08-17 Chrome 不开放证书控制命令时快速失败
+
+## 涉及文件
+
+- modules/player-manager.js
+- tests/effective-execution-config.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+目标 Chrome 的扩展 debugger 同时过滤 `Security.setIgnoreCertificateErrors` 和 `Security.setOverrideCertificateErrors`。原证书拦截页键盘绕过会让页面变成不可调试目标，最终产生误导性的 `Cannot attach to this target`，不能作为可靠兜底。
+
+## 变更内容
+
+1. 保留 Chrome 实际支持两种 Security 协议时的正常忽略证书能力。
+2. 两种协议均不可用时立即停止 CDP 初始化，提示关闭该选项、改用 Playwright Runner 或安装受信任证书。
+3. 删除证书拦截页的 `thisisunsafe` 键盘绕过，避免导航后 target 失去调试能力。
+4. 将 admin 执行错误从“无法附加”调整为更准确的“无法初始化”，覆盖附加成功但协议初始化失败的情况。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --test tests/effective-execution-config.test.js tests/current-profile-batch-session-manager.test.js tests/cdp-batch-session-manager.test.js`：33/33 通过。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
+-        } else if (ctx.certificateErrorMode === 'interstitial-bypass') {
+-          await this._navigateWithCertificateInterstitialBypass(playTabId, initialNavigationUrl);
+         } else {
+           await chrome.tabs.update(playTabId, { url: initialNavigationUrl, active: true });
+@@
+-          throw new Error(`admin 扩展 CDP 无法附加到回放标签页：${ctx.cdpAttachError || '未知错误'}`);
++          throw new Error(`admin 扩展 CDP 无法初始化回放标签页：${ctx.cdpAttachError || '未知错误'}`);
+@@
+-      // Chrome 扩展 debugger 可能过滤整个证书控制接口；保留 debugger 附加，导航时处理证书拦截页。
+-      ctx.certificateErrorMode = 'interstitial-bypass';
+-      return;
++      // 证书拦截页会变成扩展不可调试目标，不能用键盘序列规避；直接提示可执行的替代方案。
++      throw new Error(
++        '当前 Chrome 不允许扩展忽略 HTTPS 证书错误，请关闭该选项后重试，或改用 Playwright Runner/安装受信任证书',
++      );
+@@
+-  async _navigateWithCertificateInterstitialBypass(tabId, url) {
+-    const result = await this._cdpSend(tabId, 'Page.navigate', { url });
+-    if (!/^net::ERR_CERT_/i.test(String(result?.errorText || ''))) return;
+-    await this._waitForTabLoad(tabId);
+-    await this._sleep(150);
+-    for (const key of 'thisisunsafe') {
+-      await this._cdpSend(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', ...payload });
+-      await this._cdpSend(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode });
+-    }
+-    await this._sleep(250);
+-  }
+```
+
+### tests/effective-execution-config.test.js
+
+```diff
+@@
+-test('Chrome debugger 不开放 Security 命令时改用证书拦截页继续访问序列', async () => {
++test('Chrome debugger 不开放 Security 命令时快速失败并提示替代方案', async () => {
+@@
+-    assert.equal(await player._attachDebugger(42, context), true);
+-    assert.equal(context.certificateErrorMode, 'interstitial-bypass');
+-    await player._navigateWithCertificateInterstitialBypass(42, 'https://self-signed.example/login');
+-    assert.equal(keyDownText, 'thisisunsafe');
++    assert.equal(await player._attachDebugger(42, context), false);
++    assert.match(context.cdpAttachError, /当前 Chrome 不允许扩展忽略 HTTPS 证书错误/);
++    assert.match(context.cdpAttachError, /Playwright Runner\/安装受信任证书/);
++    assert.deepEqual(commands.map((item) => item.method), [
++      'Security.setIgnoreCertificateErrors',
++      'Security.setOverrideCertificateErrors',
++    ]);
++    assert.equal(detachCount, 1);
++    assert.equal(context.debuggerAttached, false);
+```
+
+# 2026-08-17 重试尚未就绪的 Chrome debugger target
+
+## 涉及文件
+
+- modules/player-manager.js
+- tests/effective-execution-config.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+回放窗口创建后，`about:blank` 标签页已经由 tabs/windows API 返回，但 Chrome debugger target 可能仍未注册完成。立即附加会返回 `Cannot attach to this target`，现有单次尝试会直接结束 CDP 执行。
+
+## 变更内容
+
+1. 仅对 `Cannot attach to this target` 和标签页尚未注册错误执行最多四次短间隔重试。
+2. 每次重试前确认标签页仍存在，不对“其他 debugger 已附加”等非瞬时错误重试。
+3. 区分 debugger 附加失败与附加后的 CDP 初始化失败，便于后续定位真实阶段。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --test tests/effective-execution-config.test.js tests/current-profile-batch-session-manager.test.js tests/cdp-batch-session-manager.test.js`：33/33 通过。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
+   async _attachDebugger(tabId, ctx) {
++    let attachError = null;
++    for (let attempt = 0; attempt < 4; attempt += 1) {
++      try {
++        await chrome.debugger.attach({ tabId }, '1.3');
++        ctx.debuggerAttached = true;
++        attachError = null;
++        break;
++      } catch (error) {
++        attachError = error;
++        const retryable = /Cannot attach to this target|No tab with given id/i
++          .test(String(error?.message || error));
++        if (!retryable || attempt >= 3) break;
++        // 新建 about:blank 标签页的 debugger target 可能晚于 tabs/windows API 返回，短暂等待后重试。
++        await this._sleep(150 * (attempt + 1));
++        const tab = await chrome.tabs.get(tabId).catch(() => null);
++        if (!tab) break;
++      }
++    }
++    if (!ctx.debuggerAttached) {
++      ctx.cdpAttachError = attachError?.message || String(attachError || '未知错误');
++      return false;
++    }
+```
+
+### tests/effective-execution-config.test.js
+
+```diff
+@@
++test('新建标签页 target 尚未就绪时有限重试 debugger attach', async () => {
++  const context = { debuggerAttached: false, ignoreHttpsErrors: true };
++  assert.equal(await player._attachDebugger(42, context), true);
++  assert.equal(attachCount, 3);
++  assert.equal(context.debuggerAttached, true);
++});
+```
+
+# 2026-08-17 兼容 Chrome debugger 完全禁用证书控制命令
+
+## 涉及文件
+
+- modules/player-manager.js
+- tests/effective-execution-config.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+目标 Chrome 不仅不支持 `Security.setIgnoreCertificateErrors`，也过滤了旧版 `Security.setOverrideCertificateErrors`。第二层兜底仍会让 debugger 附加失败，CDP 无法进入实际导航。
+
+## 变更内容
+
+1. 两套 Security 命令均返回 `-32601` 时不再中止 debugger 附加，标记为证书拦截页兼容模式。
+2. 兼容模式使用 `Page.navigate` 识别 `net::ERR_CERT_*`，确认发生证书错误后才发送 Chrome 内置继续访问序列，避免向正常页面误输入。
+3. 增加两套 Security 命令都不可用的契约测试，并验证继续访问序列完整发送。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --test tests/effective-execution-config.test.js tests/current-profile-batch-session-manager.test.js tests/cdp-batch-session-manager.test.js`：32/32 通过。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
++        } else if (ctx.certificateErrorMode === 'interstitial-bypass') {
++          await this._navigateWithCertificateInterstitialBypass(playTabId, initialNavigationUrl);
+@@
++    try {
++      await this._cdpSend(tabId, 'Security.setOverrideCertificateErrors', { override: true });
++    } catch (error) {
++      if (!/wasn't found|not found/i.test(String(error?.message || error))) throw error;
++      // Chrome 扩展 debugger 可能过滤整个证书控制接口；保留 debugger 附加，导航时处理证书拦截页。
++      ctx.certificateErrorMode = 'interstitial-bypass';
++      return;
++    }
+@@
++  async _navigateWithCertificateInterstitialBypass(tabId, url) {
++    const result = await this._cdpSend(tabId, 'Page.navigate', { url });
++    if (!/^net::ERR_CERT_/i.test(String(result?.errorText || ''))) return;
++    await this._waitForTabLoad(tabId);
++    for (const key of 'thisisunsafe') {
++      const code = `Key${key.toUpperCase()}`;
++      const windowsVirtualKeyCode = key.toUpperCase().charCodeAt(0);
++      const payload = {
++        key,
++        code,
++        text: key,
++        unmodifiedText: key,
++        windowsVirtualKeyCode,
++      };
++      await this._cdpSend(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', ...payload });
++      await this._cdpSend(tabId, 'Input.dispatchKeyEvent', {
++        type: 'keyUp',
++        key,
++        code,
++        windowsVirtualKeyCode,
++      });
++    }
++  }
+```
+
+### tests/effective-execution-config.test.js
+
+```diff
+@@
++test('Chrome debugger 不开放 Security 命令时改用证书拦截页继续访问序列', async () => {
++  assert.equal(await player._attachDebugger(42, context), true);
++  assert.equal(context.certificateErrorMode, 'interstitial-bypass');
++  await player._navigateWithCertificateInterstitialBypass(42, 'https://self-signed.example/login');
++  const keyDownText = commands
++    .filter((item) => item.method === 'Input.dispatchKeyEvent' && item.params.type === 'keyDown')
++    .map((item) => item.params.text)
++    .join('');
++  assert.equal(keyDownText, 'thisisunsafe');
++});
+```
+
+# 2026-08-17 兼容 Chrome debugger 证书错误协议并调整 CDP 配置布局
+
+## 涉及文件
+
+- modules/player-manager.js
+- tests/effective-execution-config.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+部分 Chrome 的扩展 debugger 目标不支持 `Security.setIgnoreCertificateErrors`，直接调用会把 CDP 附加误报为失败。CDP 配置中的浏览器和证书开关也需要保持同一行展示。
+
+## 变更内容
+
+1. `Security.setIgnoreCertificateErrors` 不可用时，回退到 `Security.setOverrideCertificateErrors` 与证书错误事件继续处理，避免阻断 debugger 附加。
+2. CDP 配置把浏览器选择和“忽略 HTTPS 证书错误”开关放到同一行。
+3. 增加旧版 debugger 协议兜底测试。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --test tests/effective-execution-config.test.js tests/current-profile-batch-session-manager.test.js tests/cdp-batch-session-manager.test.js`：31/31 通过。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
+-      await this._cdpSend(tabId, 'Security.setIgnoreCertificateErrors', {
+-        ignore: ctx.ignoreHttpsErrors === true,
+-      });
++      await this._configureCertificateErrors(tabId, ctx);
+@@
++    // 部分 Chrome 的扩展 debugger 不暴露 setIgnoreCertificateErrors，使用旧版事件协议兜底。
++    await this._cdpSend(tabId, 'Security.setOverrideCertificateErrors', { override: true });
++    const listener = (source, method, params) => {
++      if (source?.tabId !== tabId || method !== 'Security.certificateError') return;
++      void this._cdpSend(tabId, 'Security.handleCertificateError', {
++        eventId: params?.eventId,
++        action: 'continue',
++      });
++    };
+```
+
+### tests/effective-execution-config.test.js
+
+```diff
+@@
++test('旧版 Chrome debugger 协议使用证书错误事件兜底', async () => {
++  assert.equal(await player._attachDebugger(42, context), true);
++  assert.deepEqual(commands.slice(0, 3), [
++    { method: 'Security.setIgnoreCertificateErrors', params: { ignore: true } },
++    { method: 'Security.setOverrideCertificateErrors', params: { override: true } },
++    { method: 'Page.enable', params: {} },
++  ]);
++});
+```
+
+# 2026-08-17 为 CDP 回放接入忽略 HTTPS 证书错误配置
+
+## 涉及文件
+
+- background.js
+- modules/player-manager.js
+- modules/current-profile-batch-session-manager.js
+- modules/cdp-batch-session-manager.js
+- tests/effective-execution-config.test.js
+- tests/current-profile-batch-session-manager.test.js
+- tests/cdp-batch-session-manager.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+Admin 的 Playwright Runner 已支持“忽略 HTTPS 证书错误”，但 CDP 回放既没有读取批次冻结配置，也是在业务页加载完成后才附加 debugger。自签名或内部 CA 页面会先进入 Chrome 证书错误页，导致 CDP 用例无法执行。
+
+## 变更内容
+
+1. CueCast 从 Admin 冻结的 `ignore_https_errors` 读取证书策略，并随浏览器会话准备参数传递。
+2. 当前 Profile 和受控无痕会话在开启该策略时先创建 `about:blank`，再由 Player 附加 debugger、调用 `Security.setIgnoreCertificateErrors`，最后导航业务 URL。
+3. 新增当前 Profile、受控无痕会话及 debugger 命令顺序测试，覆盖配置透传和首次导航时序。
+
+## 验证
+
+- 分别执行 `node --check` 检查 `modules/player-manager.js`、`modules/cdp-batch-session-manager.js`、`modules/current-profile-batch-session-manager.js` 和 `background.js`：通过。
+- `node --test tests/effective-execution-config.test.js tests/current-profile-batch-session-manager.test.js tests/cdp-batch-session-manager.test.js`：30/30 通过。
+
+## 具体代码改动
+
+### background.js
+
+```diff
+@@
+-          prepareBrowserSession: ({ startUrl }) => batchSessionManager.prepareCase({
++          prepareBrowserSession: ({ startUrl, ignoreHttpsErrors }) => batchSessionManager.prepareCase({
+@@
+             startUrl,
++            ignoreHttpsErrors,
+```
+
+### modules/player-manager.js
+
+```diff
+@@
+       browserBootstrapMode: browserBootstrap.mode,
++      ignoreHttpsErrors: enabledFlag(rawEffectiveConfig.ignore_https_errors),
+@@
++        cdpAvailable = await this._attachDebugger(playTabId, ctx);
++        if (skipInitialNavigation) {
++          await chrome.tabs.update(playTabId, { active: true });
++        } else {
++          await chrome.tabs.update(playTabId, { url: initialNavigationUrl, active: true });
++        }
+@@
+       await chrome.debugger.attach({ tabId }, '1.3');
+       ctx.debuggerAttached = true;
++      // 必须在业务页面首次导航前设置；否则自签名证书页面会先落入 Chrome 错误页。
++      await this._cdpSend(tabId, 'Security.setIgnoreCertificateErrors', {
++        ignore: ctx.ignoreHttpsErrors === true,
++      });
+```
+
+### modules/current-profile-batch-session-manager.js
+
+```diff
+@@
+-        url: start,
++        // 开关开启时必须先创建空白页，由 Player 附加 CDP 并设置证书策略后再导航。
++        url: ignoreHttpsErrors === true ? 'about:blank' : start,
+@@
+-        skipInitialNavigation: true,
++        skipInitialNavigation: ignoreHttpsErrors !== true,
++        navigationUrl: start,
+```
+
+### modules/cdp-batch-session-manager.js
+
+```diff
+@@
+-        target = await this.driver.createTarget(contextId, launchUrl, { newWindow: true, background: false });
++        target = await this.driver.createTarget(
++          contextId,
++          ignoreHttpsErrors === true ? 'about:blank' : launchUrl,
++          { newWindow: true, background: false },
++        );
+@@
+-        skipInitialNavigation: true,
++        skipInitialNavigation: ignoreHttpsErrors !== true,
++        navigationUrl: launchUrl,
+```
+
+### tests/effective-execution-config.test.js
+
+```diff
+@@
++test('CDP debugger applies HTTPS certificate policy before enabling the page domain', async () => {
++  const context = { debuggerAttached: false, ignoreHttpsErrors: true };
++  assert.equal(await player._attachDebugger(42, context), true);
++  assert.deepEqual(commands.slice(0, 2), [
++    { method: 'Security.setIgnoreCertificateErrors', params: { ignore: true } },
++    { method: 'Page.enable', params: {} },
++  ]);
++});
+```
+
+### tests/current-profile-batch-session-manager.test.js
+
+```diff
+@@
++test('忽略 HTTPS 证书错误时先创建空白页并交给 Player 导航', async () => {
++  const prepared = await harness.manager.prepareCase({
++    startUrl: 'https://self-signed.example/login',
++    ignoreHttpsErrors: true,
++  });
++  assert.equal(harness.createdWindows[0].url, 'about:blank');
++  assert.equal(prepared.skipInitialNavigation, false);
++});
+```
+
+### tests/cdp-batch-session-manager.test.js
+
+```diff
+@@
++test('受控会话忽略 HTTPS 证书错误时先创建空白页', async () => {
++  const prepared = await harness.manager.prepareCase({
++    startUrl: 'https://self-signed.example/login',
++    ignoreHttpsErrors: true,
++  });
++  assert.equal(harness.tabs.get(prepared.tabId).url, 'about:blank');
++  assert.equal(prepared.navigationUrl, 'https://self-signed.example/login');
++});
+```
+
+# 2026-08-17 展示证书文件名和上传交互事实
+
+## 涉及文件
+
+- modules/operation-diagnostics.js
+- modules/player-manager.js
+- tests/execution-file-upload.test.js
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+环境证书在执行前会被物化为包含 `file_name` 的对象引用，原诊断格式化直接对对象执行字符串转换，导致报告显示 `[object Object]`。同时 CDP 上传成功只回传命中定位器，没有返回文件名、文件数量和上传结果，交互结果区域为空。
+
+## 变更内容
+
+1. 证书和文件引用优先提取安全文件名；引用尚未物化时显示环境证书角色，不展示下载地址、本机路径或证书内容。
+2. CDP 上传完成后返回文件名、文件数量、上传状态和证书文件列表，并由步骤结果写入统一诊断。
+3. 上传交互事实增加中文标签，文件列表使用可读文本展示。
+4. 增加证书上传结果和诊断展示契约测试。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --check modules/operation-diagnostics.js`：通过。
+- `node --test tests/execution-file-upload.test.js`：10/10 通过。
+- `node --test --test-name-pattern="证书角色显示文件名" tests/operation-contract.test.js`：1/1 通过。
+
+## 具体代码改动
+
+### modules/operation-diagnostics.js
+
+```diff
+@@
+   filename: '文件名',
+   file_count: '文件数量',
++  upload_status: '上传结果',
++  certificate_uploaded: '证书上传',
++  uploaded_certificate_files: '已上传证书文件',
+@@
+-function basename(value) {
+-  return String(value).split(/[\\/]/).filter(Boolean).at(-1) || String(value);
++function basename(value) {
++  if (value && typeof value === 'object') {
++    const fileName = value.file_name || value.fileName || value.original_name || value.originalName
++      || value.name || value.path || value.local_path || value.localPath;
++    if (fileName) return basename(fileName);
++    if (value.scope === 'project_environment') {
++      const slot = value.slot_id || value.slotId;
++      return slot ? `环境证书角色（${slot}）` : '环境证书角色';
++    }
++    return safeText(JSON.stringify(value));
++  }
++  const text = String(value);
++  return text.split(/[\\/]/).filter(Boolean).at(-1) || text;
+ }
+```
+
+### modules/player-manager.js
+
+```diff
+@@
++        const operationFacts = locator?.operationFacts && typeof locator.operationFacts === 'object'
++          ? locator.operationFacts
++          : {};
+@@
++          ...operationFacts,
+@@
+-            return PlayerManager._actualLocatorFromVia(step, step?.target_xpath ? 'xpath' : 'css');
++            const fileNames = staged.files.map(PlayerManager._fileNameFromPath);
++            const locator = PlayerManager._actualLocatorFromVia(step, step?.target_xpath ? 'xpath' : 'css');
++            return {
++              ...(locator || {}),
++              operationFacts: {
++                filename: fileNames.length === 1 ? fileNames[0] : fileNames.join(', '),
++                file_count: fileNames.length,
++                upload_status: '上传控件已设置',
++                ...(String(step?.action_type || '').toLowerCase() === 'certificate_upload' ? {
++                  certificate_uploaded: true,
++                  uploaded_certificate_files: fileNames,
++                } : {}),
++              },
++            };
+```
+
+### tests/execution-file-upload.test.js
+
+```diff
+@@
++test('CDP certificate upload reports filename and interaction result without local path', async () => {
++  const result = await manager._executeFileUploadCDP(5, {
++    action_type: 'certificate_upload',
++    target_selector: '#license-file',
++    certificate_ref: {
++      type: 'admin_execution_file',
++      file_name: '172_19_5_45_audit.lic',
++      download_path: '/automation/playwright/testcases/SCENE/CASE/steps/STEP/execution-file',
++    },
++  });
++  assert.equal(result.operationFacts.filename, '172_19_5_45_audit.lic');
++  assert.equal(result.operationFacts.file_count, 1);
++  assert.equal(result.operationFacts.upload_status, '上传控件已设置');
++  assert.deepEqual(result.operationFacts.uploaded_certificate_files, ['172_19_5_45_audit.lic']);
++  assert.equal(JSON.stringify(result).includes('C:\\Temp'), false);
++});
+```
+
+### tests/operation-contract.test.js
+
+```diff
+@@
++test('CueCast 证书角色显示文件名并输出上传交互结果', () => {
++  const certificateReference = {
++    type: 'admin_execution_file',
++    asset_id: 123,
++    file_name: '172_19_5_45_audit.lic',
++    download_path: '/automation/playwright/testcases/SCENE/CASE/execution-file',
++  };
++  const result = attachOperationDiagnostic(
++    {
++      action_type: 'certificate_upload',
++      status: 'passed',
++      filename: '172_19_5_45_audit.lic',
++      file_count: 1,
++      upload_status: '上传控件已设置',
++      certificate_uploaded: true,
++      uploaded_certificate_files: ['172_19_5_45_audit.lic'],
++    },
++    { action_type: 'certificate_upload', certificate_ref: certificateReference },
++    { action_type: 'certificate_upload', certificate_ref: certificateReference },
++  );
++  const certificateInput = result.details.operation.inputs.find((item) => item.key === 'certificate_ref');
++  assert.equal(certificateInput.configured.preview, '172_19_5_45_audit.lic');
++  assert.equal(certificateInput.effective.preview, '172_19_5_45_audit.lic');
++});
+```
+
+# 2026-08-17 将断言实际值写入执行参数诊断
+
+## 涉及文件
+
+- modules/operation-diagnostics.js
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+成功断言的 `operation_assertion` 虽然已经生成，但执行参数表仍只读取配置值和运行时期望值。旧目录字段缺少 `role` 时，前端无法稳定识别期望参数，导致“执行值”继续显示预取值。
+
+## 变更内容
+
+1. CueCast 统一诊断把断言实际值写入期望参数的 `actual` 字段，并保留断言判定中的实际值。
+2. 管理端报告优先展示参数 `actual`，同时兼容旧目录没有 `role` 的 `expect/regex/attribute` 字段。
+3. 增加成功断言执行参数实际值契约测试；Playwright 诊断同步使用同一字段，保持两种执行器协议一致。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --test --test-name-pattern="成功断言也保留|断言输入执行值|CDP 断言失败将页面实际值" tests/operation-contract.test.js`：通过。
+- `node --test --test-name-pattern="断言详情保留期望值" ../sakura-playwright/tests/unit/operation-diagnostics.test.js`：通过。
+
+## 具体代码改动
+
+### modules/operation-diagnostics.js
+
+```diff
+@@
+   const profile = String(
+     definitionStep.diagnostic_profile || definitionStep.diagnosticProfile || ACTION_PROFILES[actionType] || 'generic',
+   );
++  const assertion = result.operation_assertion ? safeAssertion(result.operation_assertion) : null;
+@@
+-    inputs: collectInputs(definitionStep, runtimeStep),
++    inputs: applyAssertionActual(collectInputs(definitionStep, runtimeStep), profile, assertion),
+@@
+-      ...(result.operation_assertion ? { assertion: safeAssertion(result.operation_assertion) } : {}),
++      ...(assertion ? { assertion } : {}),
+@@
++function applyAssertionActual(inputs, profile, assertion) {
++  if (profile !== 'assertion' || !assertion?.actual || assertion.actual.value_state === 'unavailable') {
++    return inputs;
++  }
++  return inputs.map((input) => {
++    const key = String(input?.key || '').toLowerCase();
++    const expected = input?.role === 'expected' || ['expect', 'regex', 'attribute'].includes(key);
++    return expected ? { ...input, actual: assertion.actual } : input;
++  });
++}
+```
+
+### tests/operation-contract.test.js
+
+```diff
+@@
++test('CueCast 断言输入执行值使用实际读取结果', () => {
++  const result = attachOperationDiagnostic(
++    { action_type: 'assert_element_match', status: 'passed', operation_assertion: {
++      subject: '指定元素', operator: 'contains',
++      expected: { value_state: 'visible', preview: '上传' },
++      actual: { value_state: 'visible', preview: '上传成功' }, passed: true,
++    } },
++    { action_type: 'assert_element_match', expect: '上传', match_mode: 'contains' },
++  );
++  const expectedInput = result.details.operation.inputs.find((item) => item.key === 'expect');
++  assert.deepEqual(expectedInput.actual, { value_state: 'visible', preview: '上传成功' });
++});
+```
+
+# 2026-08-17 补齐 CDP 成功断言的实际值诊断
+
+## 涉及文件
+
+- modules/player-manager.js
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+CDP 失败断言已经能保存实际值，但成功断言只回传定位器，没有生成 `operation_assertion`。统一报告因此在成功场景仍把期望值显示为执行值，无法在断言配置表中展示真实页面值。
+
+## 变更内容
+
+1. 步骤结果组装兼容从定位器结果中提取成功断言诊断，同时不把无定位器的断言结果误记为元素定位器。
+2. CDP 的错误提示、URL、整页文本、元素文本和元素可见断言成功时统一写入实际值。
+3. 增加成功断言实际值契约测试。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --test --test-name-pattern="五种元素断言|元素断言失败仍保留|成功断言也保留|CDP 断言失败将页面实际值" tests/operation-contract.test.js`：4/4 通过。
+- `node --test tests/execution-file-upload.test.js`：9/9 通过。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
+-        const { operation_assertion: operationAssertion, ...persistedStepDetails } = normalizedStepDetails;
++        const { operation_assertion: configuredOperationAssertion, ...persistedStepDetails } = normalizedStepDetails;
++        const operationAssertion = configuredOperationAssertion || locator?.operationAssertion;
++        const resultLocator = locator && typeof locator === 'object' && locator.source ? locator : null;
+@@
+-          ...(locator ? {
+-            locator_source: locator.source || '',
++          ...(resultLocator ? {
++            locator_source: resultLocator.source || '',
+@@
++  static _buildAssertionDiagnostic(payload) {
++    return {
++      subject: PlayerManager._assertionTargetLabel(payload.target),
++      operator: String(payload.match || 'equals'),
++      expected: { value_state: 'visible', preview: String(payload.expected ?? '') },
++      actual: { value_state: 'visible', preview: String(payload.actual ?? '') },
++      passed: payload.passed === true,
++    };
++  }
+@@
++  static _createAssertionResult(locator, payload) {
++    return {
++      ...(locator && typeof locator === 'object' ? locator : {}),
++      operationAssertion: PlayerManager._buildAssertionDiagnostic({ ...payload, passed: true }),
++    };
++  }
+@@
+-      return actualLocator;
++      return PlayerManager._createAssertionResult(actualLocator, {
++        target: assertion.target,
++        match: assertion.match,
++        expected,
++        actual,
++      });
+```
+
+### tests/operation-contract.test.js
+
+```diff
+@@
++test('CueCast CDP 成功断言也保留统一实际值', async () => {
++  const manager = Object.create(PlayerManager.prototype);
++  manager._waitForElementAssertionCDP = async () => ({
++    ok: true,
++    visible: true,
++    value: '上传成功',
++    via: 'meta-css_fallback',
++    matched_count: 1,
++    visible_count: 1,
++  });
++  manager._logAssertTextCdpDebug = () => {};
++
++  const result = await manager._executeAssertTextStepCDP(5, {
++    action_type: 'assert_element_match',
++    target_selector: 'p.el-message__content',
++    locator_meta: { candidates: [{ type: 'css_fallback', value: 'p.el-message__content' }] },
++    match_mode: 'contains',
++    expect: '上传',
++  });
++
++  assert.equal(result.operationAssertion.expected.preview, '上传');
++  assert.equal(result.operationAssertion.actual.preview, '上传成功');
++  assert.equal(result.operationAssertion.passed, true);
++  assert.equal(result.type, 'css_fallback');
++});
+```
+
+# 2026-08-17 保留失败断言的实际命中定位器
+
+## 涉及文件
+
+- modules/player-manager.js
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+CDP 元素断言已经找到元素但文本比较失败时，异常只保留期望值和实际值，步骤失败结果的定位器参数固定传入 `null`。Admin 报告因此显示“仅有配置定位器”，无法标识真正读取到文本的候选策略。
+
+## 变更内容
+
+1. 元素文本或可见性断言失败时，把实际命中的定位器附加到断言异常。
+2. 步骤失败结果优先上报该定位器，保留来源、类型、值、匹配数量和可见数量。
+3. 增加包含、等于、不包含、正则匹配和元素可见五种方式的语义测试，并覆盖失败断言定位器上报。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --test --test-name-pattern="五种元素断言|元素断言失败仍保留|CDP 断言失败将页面实际值" tests/operation-contract.test.js`：3/3 通过。
+- `node --test tests/execution-file-upload.test.js`：9/9 通过。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
++          const assertionLocator = err?.actualLocator && typeof err.actualLocator === 'object'
++            ? err.actualLocator
++            : null;
+@@
+-          appendStepResult(runtimeStep, i, 'failed', stepStartedAt, errorMsg, null, null, {
++          appendStepResult(runtimeStep, i, 'failed', stepStartedAt, errorMsg, assertionLocator, null, {
+@@
++    if (payload.actualLocator && typeof payload.actualLocator === 'object') {
++      error.actualLocator = payload.actualLocator;
++    }
+@@
++      const actualLocator = PlayerManager._actualLocatorFromVia(
++        step,
++        result.via,
++        result.matched_count,
++        result.visible_count,
++      );
+       const hit = PlayerManager._matchAssertionText(actual, expected, assertion.match);
+@@
++          actualLocator,
+         });
+```
+
+### tests/operation-contract.test.js
+
+```diff
+@@
++test('CueCast 五种元素断言匹配方式保持实际值对期望值的比较语义', () => {
++  assert.equal(PlayerManager._matchAssertionText('上传成功', '上传成功1', 'contains'), false);
++  assert.equal(PlayerManager._matchAssertionText('上传成功1', '上传成功', 'contains'), true);
++  assert.equal(PlayerManager._matchAssertionText('上传成功', '上传成功', 'equals'), true);
++  assert.equal(PlayerManager._matchAssertionText('上传成功1', '上传成功', 'equals'), false);
++  assert.equal(PlayerManager._matchAssertionText('上传失败', '成功', 'not_contains'), true);
++  assert.equal(PlayerManager._matchAssertionText('上传成功', '^上传.*成功$', 'regex'), true);
++  assert.deepEqual(
++    PlayerManager._resolveAssertionConfig({ action_type: 'assert_element_match', match_mode: 'visible' }, true),
++    { target: 'element', match: 'visible', readMode: 'auto' },
++  );
++});
+@@
++test('CueCast CDP 元素断言失败仍保留实际命中的候选定位器', async () => {
++  const manager = Object.create(PlayerManager.prototype);
++  manager._waitForElementAssertionCDP = async () => ({
++    ok: true,
++    visible: true,
++    value: '上传成功',
++    via: 'meta-css_fallback',
++    matched_count: 1,
++    visible_count: 1,
++  });
++  manager._logAssertTextCdpDebug = () => {};
++
++  await assert.rejects(
++    () => manager._executeAssertTextStepCDP(5, {
++      action_type: 'assert_element_match',
++      target_selector: 'p.el-message__content',
++      target_xpath: '/html/body/div[6]/p',
++      locator_meta: {
++        candidates: [{ type: 'css_fallback', value: 'p.el-message__content' }],
++      },
++      match_mode: 'contains',
++      expect: '上传成功1',
++    }),
++    (error) => {
++      assert.equal(error.actualLocator.source, 'cdp:meta-css_fallback');
++      assert.equal(error.actualLocator.type, 'css_fallback');
++      assert.equal(error.actualLocator.value, 'p.el-message__content');
++      assert.equal(error.actualLocator.matchedCount, 1);
++      assert.equal(error.operationAssertion.actual.preview, '上传成功');
++      return true;
++    },
++  );
++});
+```
+
+# 2026-08-17 按批次保存 CDP 临时文件并支持配置清理
+
+## 涉及文件
+
+- modules/api-client.js
+- modules/player-manager.js
+- background.js
+- options/options.html
+- options/options.js
+- options/options.css
+- tests/execution-file-upload.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+CDP 执行文件原先使用“时间戳-原文件名”，不便于按批次定位和排查。批次结束后是否删除文件也需要由扩展用户控制，同时不能因保留文件而长期保留 Service Worker 的下载跟踪记录。
+
+## 变更内容
+
+1. 有批次 ID 时，证书下载到 Chrome 下载根目录下的 `sakura-cuecast/execution-files/<batchId>/<原文件名>`。
+2. 无批次 ID 的旧回放链路继续使用时间戳文件名，避免同名覆盖。
+3. 扩展配置页增加“批次结束后自动清理证书临时文件”，默认开启。
+4. 关闭自动清理后保留磁盘文件，但仍删除内存与 `chrome.storage.session` 中的批次下载记录。
+
+## 验证
+
+- `node --check background.js; node --check modules/api-client.js; node --check modules/player-manager.js; node --check options/options.js`：通过。
+- `node --test tests/execution-file-upload.test.js`：9/9 通过。
+- `node --test tests/cdp-batch-session-manager.test.js tests/current-profile-batch-session-manager.test.js`：21/21 通过。
+
+## 具体代码改动
+
+### modules/api-client.js
+
+```diff
+@@
+-  async downloadExecutionFile(reference, executionCapability = '') {
++  async downloadExecutionFile(reference, executionCapability = '', executionBatchId = '') {
+@@
++    const batchId = String(executionBatchId || '').trim().replace(/[^A-Za-z0-9._-]/g, '_');
++    const relativePath = batchId && !/^\.+$/.test(batchId)
++      ? `sakura-cuecast/execution-files/${batchId}/${originalName}`
++      : `sakura-cuecast/execution-files/${Date.now()}-${originalName}`;
+@@
+-      filename: `sakura-cuecast/execution-files/${Date.now()}-${originalName}`,
++      filename: relativePath,
+```
+
+### modules/player-manager.js
+
+```diff
+@@
+-  async cleanupExecutionFiles(batchId) {
++  async cleanupExecutionFiles(batchId, options = {}) {
+     const normalizedBatchId = String(batchId || '').trim();
+     if (!normalizedBatchId) return;
++    const removeFiles = options.removeFiles !== false;
+@@
+-    if (!downloadIds.length) return;
+-    await Promise.all(downloadIds.map((id) => this.api.cleanupExecutionFile(id)));
++    if (removeFiles && downloadIds.length) {
++      await Promise.all(downloadIds.map((id) => this.api.cleanupExecutionFile(id)));
++    }
+@@
+-          const downloaded = await this.api.downloadExecutionFile(candidate, executionCapability);
++          const downloaded = await this.api.downloadExecutionFile(candidate, executionCapability, executionBatchId);
+```
+
+### background.js
+
+```diff
+@@
++  cleanupExecutionFilesOnBatchEnd: true,
+ };
+@@
++  cleanupExecutionFilesOnBatchEnd: true,
+ });
+@@
++  state.cleanupExecutionFilesOnBatchEnd = settings.cleanupExecutionFilesOnBatchEnd !== false;
+@@
+-      await player.cleanupExecutionFiles(message.batchId);
++      await player.cleanupExecutionFiles(message.batchId, {
++        removeFiles: state.cleanupExecutionFilesOnBatchEnd,
++      });
+```
+
+### options/options.html
+
+```diff
+@@
++      <label class="checkbox-setting">
++        <input id="cleanupExecutionFilesOnBatchEnd" name="cleanupExecutionFilesOnBatchEnd" type="checkbox">
++        <span>
++          <strong>批次结束后自动清理证书临时文件</strong>
++          <small>关闭后，文件保留在 Chrome 下载目录的 <code>sakura-cuecast/execution-files/&lt;batchId&gt;</code> 中。</small>
++        </span>
++      </label>
+```
+
+### options/options.js
+
+```diff
+@@
++  cleanupExecutionFilesOnBatchEnd: true,
+ });
+@@
++  cleanupExecutionFilesOnBatchEnd: document.getElementById('cleanupExecutionFilesOnBatchEnd'),
+@@
++    cleanupExecutionFilesOnBatchEnd: raw.cleanupExecutionFilesOnBatchEnd !== false,
+@@
++  refs.cleanupExecutionFilesOnBatchEnd.checked = settings.cleanupExecutionFilesOnBatchEnd;
+@@
++    cleanupExecutionFilesOnBatchEnd: refs.cleanupExecutionFilesOnBatchEnd.checked,
+```
+
+### options/options.css
+
+```diff
+@@
++.checkbox-setting {
++  grid-template-columns: 18px 1fr;
++  align-items: start;
++  cursor: pointer;
++}
++
++.checkbox-setting input {
++  width: 18px;
++  height: 18px;
++  margin: 2px 0 0;
++  accent-color: var(--primary);
++}
++
++.checkbox-setting > span {
++  display: grid;
++  gap: 4px;
++}
+```
+
+### tests/execution-file-upload.test.js
+
+```diff
+@@
+-    }, 'execution-capability-token');
++    }, 'execution-capability-token', 'batch-20260817-001');
+@@
++    assert.equal(downloadOptions.filename, 'sakura-cuecast/execution-files/batch-20260817-001/client.lic');
+@@
+-    async downloadExecutionFile() {
++    async downloadExecutionFile(_reference, _capability, batchId) {
++      assert.equal(batchId, 'batch-retain');
+       return { downloadId: 94, localPath: 'C:\\Temp\\client.lic' };
+@@
++test('CDP batch cleanup can retain files while clearing persisted tracking', async () => {
++  const originalChrome = globalThis.chrome;
++  const sessionState = {};
++  globalThis.chrome = downloadChrome();
++  globalThis.chrome.storage = {
++    session: {
++      async get() {
++        return sessionState;
++      },
++      async set(value) {
++        Object.assign(sessionState, value);
++      },
++    },
++  };
++  const cleanupIds = [];
++  const api = {
++    async cleanupExecutionFile(downloadId) {
++      cleanupIds.push(downloadId);
++    },
++  };
++  try {
++    const manager = new PlayerManager({}, api);
++    await manager._registerExecutionFileDownloads('batch-keep-files', [95]);
++    await manager.cleanupExecutionFiles('batch-keep-files', { removeFiles: false });
++
++    assert.deepEqual(cleanupIds, []);
++    assert.deepEqual(sessionState.cuecastExecutionFileDownloadsByBatch, {});
++  } finally {
++    globalThis.chrome = originalChrome;
++  }
++});
+```
+
+# 2026-08-17 修复 CDP 断言报告缺少页面实际值
+
+## 涉及文件
+
+- modules/player-manager.js
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+CDP 元素断言失败时，页面实际文本仅拼接到错误消息，未进入统一操作诊断。Admin 报告因此只能在“断言配置”中展示运行时解析后的期望值，无法生成包含真实实际值的“断言判定”。
+
+## 变更内容
+
+1. CDP 文本断言失败对象附带结构化 `operationAssertion`，分别保存断言对象、匹配方式、期望值、实际值和判定结果。
+2. 步骤失败结果将该结构传给 `attachOperationDiagnostic`，生成 `details.operation.outcome.assertion` 后移除内部临时字段。
+3. 增加证书上传失败提示场景的契约测试，验证报告实际值为页面返回文本。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --test --test-name-pattern="CDP 断言失败将页面实际值" tests/operation-contract.test.js`：1/1 通过。
+- 完整 `tests/operation-contract.test.js`：本次新增用例通过；现有目录字段计数断言仍为 124，而当前目录实际为 125，结果为 11/12，通过项之外的失败与本次修复无关。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
++        const normalizedStepDetails = stepDetails && typeof stepDetails === 'object' ? stepDetails : {};
++        const { operation_assertion: operationAssertion, ...persistedStepDetails } = normalizedStepDetails;
+         const details = {
+           ...(executorResult?.infrastructure ? { infrastructure: executorResult.infrastructure } : {}),
+-          ...(stepDetails && typeof stepDetails === 'object' ? stepDetails : {}),
++          ...persistedStepDetails,
+         };
+@@
++          ...(operationAssertion && typeof operationAssertion === 'object' ? { operation_assertion: operationAssertion } : {}),
+@@
++          const operationAssertion = err?.operationAssertion && typeof err.operationAssertion === 'object'
++            ? err.operationAssertion
++            : null;
+@@
++            ...(operationAssertion ? { operation_assertion: operationAssertion } : {}),
+@@
++  static _createAssertionFailureError(payload) {
++    const error = new Error(PlayerManager._formatAssertionFailure(payload));
++    // 错误文本用于日志；结构化字段用于报告准确区分期望值和页面实际值。
++    error.operationAssertion = {
++      subject: PlayerManager._assertionTargetLabel(payload.target),
++      operator: String(payload.match || 'equals'),
++      expected: { value_state: 'visible', preview: String(payload.expected ?? '') },
++      actual: { value_state: 'visible', preview: String(payload.actual ?? '') },
++      passed: false,
++    };
++    return error;
++  }
+@@
+-        throw new Error(PlayerManager._formatAssertionFailure({
++        throw PlayerManager._createAssertionFailureError({
+```
+
+### tests/operation-contract.test.js
+
+```diff
+@@
++test('CueCast CDP 断言失败将页面实际值写入统一诊断详情', () => {
++  const failure = PlayerManager._createAssertionFailureError({
++    target: 'element',
++    match: 'contains',
++    expected: '上传成功',
++    actual: '网卡校验异常，请重新申请证书',
++    css: 'p.el-message__content',
++    xpath: '/html/body/div[6]/p',
++  });
++  const result = attachOperationDiagnostic(
++    {
++      action_type: 'assert_element_match',
++      status: 'failed',
++      error: failure.message,
++      operation_assertion: failure.operationAssertion,
++    },
++    {
++      action_type: 'assert_element_match',
++      expect: '上传成功',
++      match_mode: 'contains',
++      target_selector: 'p.el-message__content',
++    },
++  );
++
++  assert.equal(result.details.operation.outcome.assertion.expected.preview, '上传成功');
++  assert.equal(result.details.operation.outcome.assertion.actual.preview, '网卡校验异常，请重新申请证书');
++  assert.equal(result.details.operation.outcome.assertion.passed, false);
++  assert.equal('operation_assertion' in result, false);
++});
+```
+
+# 2026-08-14 延迟 CDP 执行文件到批次结束清理
+
+## 涉及文件
+
+- modules/player-manager.js
+- background.js
+- tests/execution-file-upload.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+`DOM.setFileInputFiles` 设置的是文件控件状态，页面可能在后续步骤或表单提交时才真正读取文件。原实现按步骤 `finally` 删除下载文件，可能导致网页提交阶段找不到证书文件。
+
+## 变更内容
+
+1. 带批次 ID 的 Admin 执行文件下载记录到批次，不再在步骤结束时删除。
+2. `END/ABORT` 成功后统一清理该批次所有下载文件。
+3. 下载 ID 写入 `chrome.storage.session`，Service Worker 重启后仍可清理。
+4. 无批次的旧本地回放链路继续按步骤清理。
+
+## 验证
+
+- `node --check modules/player-manager.js; node --check background.js`：通过。
+- `node --test tests/cdp-batch-session-manager.test.js tests/current-profile-batch-session-manager.test.js tests/execution-file-upload.test.js`：29/29 通过。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
++    /** Admin 执行文件按批次保留到 END/ABORT，避免网页后续提交时文件已被删除。 */
++    this._executionFileDownloadsByBatch = new Map();
+@@
++  async cleanupExecutionFiles(batchId) {
++    const normalizedBatchId = String(batchId || '').trim();
++    if (!normalizedBatchId) return;
++    const session = chrome.storage?.session;
++    const stored = session?.get
++      ? await session.get(EXECUTION_FILE_DOWNLOADS_KEY).catch(() => ({}))
++      : {};
++    const persisted = stored?.[EXECUTION_FILE_DOWNLOADS_KEY] || {};
++    const downloadIds = [...new Set([
++      ...(this._executionFileDownloadsByBatch.get(normalizedBatchId) || []),
++      ...(persisted[normalizedBatchId] || []),
++    ])];
++    if (!downloadIds.length) return;
++    await Promise.all(downloadIds.map((id) => this.api.cleanupExecutionFile(id)));
++    this._executionFileDownloadsByBatch.delete(normalizedBatchId);
++  }
+@@
+-    const staged = await this._stageFilePathsFromStep(step, executionCapability);
++    const staged = await this._stageFilePathsFromStep(step, executionCapability, executionBatchId);
+@@
++      if (String(executionBatchId || '').trim()) {
++        await this._registerExecutionFileDownloads(executionBatchId, downloadIds);
++        return { files, downloadIds: [] };
++      }
+```
+
+### background.js
+
+```diff
+@@
++function finishPlaybackBatch(batchManager, method, message, sourceTabId) {
++  return batchManager[method](message.batchId, message.executionCapability, sourceTabId)
++    .then(async (response) => {
++      // 网页可能在步骤结束后才真正提交文件，必须等批次成功结束再删除下载文件。
++      await player.cleanupExecutionFiles(message.batchId);
++      return response;
++    });
++}
+@@
+-        : cdpBatchSessions).endBatch(message.batchId, message.executionCapability, tabId)
++        : cdpBatchSessions, 'endBatch', message, tabId)
+@@
+-        : cdpBatchSessions).abortBatch(message.batchId, message.executionCapability, tabId)
++        : cdpBatchSessions, 'abortBatch', message, tabId)
+```
+
+### tests/execution-file-upload.test.js
+
+```diff
+@@
++test('CDP execution file remains until batch cleanup, including Service Worker restart', async () => {
++  const originalChrome = globalThis.chrome;
++  const sessionState = {};
++  globalThis.chrome = downloadChrome();
++  globalThis.chrome.storage = {
++    session: {
++      async get() {
++        return sessionState;
++      },
++      async set(value) {
++        Object.assign(sessionState, value);
++      },
++    },
++  };
++  const cleanupIds = [];
++  const api = {
++    async downloadExecutionFile() {
++      return { downloadId: 94, localPath: 'C:\\Temp\\client.lic' };
++    },
++    async cleanupExecutionFile(downloadId) {
++      cleanupIds.push(downloadId);
++    },
++  };
++  try {
++    const manager = new PlayerManager({}, api);
++    await manager._executeFileUploadCDP(5, {
++      action_type: 'certificate_upload',
++      target_selector: '#license-file',
++      certificate_ref: {
++        type: 'admin_execution_file',
++        download_path: '/automation/playwright/testcases/SCENE/CASE/steps/STEP/execution-file',
++      },
++    }, 'capability', 'batch-retain');
++    assert.deepEqual(cleanupIds, []);
++
++    const restartedManager = new PlayerManager({}, api);
++    await restartedManager.cleanupExecutionFiles('batch-retain');
++    assert.deepEqual(cleanupIds, [94]);
++    assert.deepEqual(sessionState.cuecastExecutionFileDownloadsByBatch, {});
++  } finally {
++    globalThis.chrome = originalChrome;
++  }
++});
+```
+
+# 2026-08-14 修复 CDP 上传时文件控件节点失效
+
+## 涉及文件
+
+- modules/player-manager.js
+- tests/execution-file-upload.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+动态页面在定位文件控件后可能立即重渲染，旧实现把 `DOM.describeNode` 返回的 `nodeId` 传给 `DOM.setFileInputFiles`，此时 Chrome 会返回 `Could not find node with given id` 并直接结束步骤。
+
+## 变更内容
+
+1. 文件上传改用本轮 `Runtime.evaluate` 返回的 `objectId`，避免额外复用易失效的 `nodeId`。
+2. 仅对节点或对象失效的 CDP 协议错误重新定位并重试，其他错误仍立即返回。
+3. 新增首次节点失效、第二次重新定位成功并清理临时文件的测试。
+
+## 验证
+
+- `node --test tests/execution-file-upload.test.js`：7/7 通过。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
++  /** 页面异步重渲染会使 DOM nodeId/objectId 失效，文件上传可重新定位后安全重试。 */
++  static _isCdpStaleFileInputError(err) {
++    const message = String(err?.message || err).toLowerCase();
++    return message.includes('could not find node with given id')
++      || message.includes('could not find object with given id');
++  }
+@@
+-          await this._cdpSend(tabId, 'DOM.setFileInputFiles', { nodeId: node.nodeId, files: staged.files });
+-          return PlayerManager._actualLocatorFromVia(step, step?.target_xpath ? 'xpath' : 'css');
++            await this._cdpSend(tabId, 'DOM.setFileInputFiles', { objectId, files: staged.files });
++            return PlayerManager._actualLocatorFromVia(step, step?.target_xpath ? 'xpath' : 'css');
++          } catch (error) {
++            if (!PlayerManager._isCdpStaleFileInputError(error)) throw error;
++            lastError = '文件控件在上传时已刷新，正在重新定位';
++          }
+```
+
+### tests/execution-file-upload.test.js
+
+```diff
+@@
++test('CDP upload re-locates file input when its DOM node is refreshed', async () => {
++  const originalChrome = globalThis.chrome;
++  globalThis.chrome = downloadChrome();
++  const cleanupIds = [];
++  let uploadAttempts = 0;
++  const api = {
++    async downloadExecutionFile() {
++      return { downloadId: 89, localPath: 'C:\\Temp\\client.lic' };
++    },
++    async cleanupExecutionFile(downloadId) {
++      cleanupIds.push(downloadId);
++    },
++  };
++  try {
++    const manager = new PlayerManager({}, api);
++    manager._cdpSend = async (_tabId, method, params) => {
++      if (method === 'Runtime.evaluate') return { result: { objectId: `input-${uploadAttempts + 1}` } };
++      if (method === 'DOM.describeNode') {
++        return { node: { nodeName: 'INPUT', attributes: ['type', 'file'] } };
++      }
++      if (method === 'DOM.setFileInputFiles') {
++        uploadAttempts += 1;
++        if (uploadAttempts === 1) {
++          throw new Error('{"code":-32000,"message":"Could not find node with given id"}');
++        }
++        assert.equal(params.objectId, 'input-2');
++        return {};
++      }
++      return {};
++    };
++
++    await manager._executeFileUploadCDP(5, {
++      action_type: 'certificate_upload',
++      target_selector: '#license-file',
++      certificate_ref: {
++        type: 'admin_execution_file',
++        download_path: '/automation/playwright/testcases/SCENE/CASE/steps/STEP/execution-file',
++      },
++    });
++
++    assert.equal(uploadAttempts, 2);
++    assert.deepEqual(cleanupIds, [89]);
++  } finally {
++    globalThis.chrome = originalChrome;
++  }
++});
+```
+
+# 2026-08-14 完善 CDP 环境证书引用解析与失败清理
+
+## 涉及文件
+
+- modules/player-manager.js
+- tests/execution-file-upload.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+Admin 返回的环境证书下载引用可能经过 JSON 序列化，或因兼容链路缺少 `type` 字段。原实现会把这类引用当作普通文件路径，最终报“缺少 file_ref 本机绝对路径”。同时，下载成功但路径无效时需要清理 Chrome 临时文件。
+
+## 变更内容
+
+1. CDP 暂存流程支持 JSON 字符串形式和带 `download_path` 的 Admin 下载引用。
+2. 未被 Admin 物化的环境资源引用输出明确错误，避免误报本机路径错误。
+3. 下载后继续使用统一路径校验；暂存或路径校验失败时清理已下载文件。
+4. 新增三项解析、未物化引用和无效本机路径清理测试。
+
+## 验证
+
+- `node --test tests/execution-file-upload.test.js`：6/6 通过。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
+-    for (const candidate of candidates) {
++    try {
++      for (const rawCandidate of candidates) {
++        const candidate = PlayerManager._parseFileReference(rawCandidate);
++        if (candidate && typeof candidate === 'object' && candidate.download_path) {
++          const downloaded = await this.api.downloadExecutionFile(candidate, executionCapability);
++          downloadIds.push(downloaded.downloadId);
++          localCandidates.push(downloaded.localPath);
++        } else if (candidate && typeof candidate === 'object'
++          && candidate.scope === 'project_environment') {
++          throw new Error(`${actionType || 'file_upload'} 的环境文件引用未由 Admin 物化为下载引用`);
++        }
++      }
++    } catch (error) {
++      await Promise.all(downloadIds.map((id) => this.api.cleanupExecutionFile(id)));
++      throw error;
+```
+
+### tests/execution-file-upload.test.js
+
+```diff
+@@
++test('CDP staging accepts serialized Admin execution file reference without type field', async () => {
++  const originalChrome = globalThis.chrome;
++  globalThis.chrome = downloadChrome();
++  const cleanupIds = [];
++  const api = {
++    async downloadExecutionFile(reference) {
++      assert.equal(reference.download_path, '/automation/playwright/testcases/100/CASE_001/execution-files/STEP_CERT');
++      return { downloadId: 92, localPath: 'C:\\Temp\\client.lic' };
++    },
++    async cleanupExecutionFile(downloadId) {
++      cleanupIds.push(downloadId);
++    },
++  };
++  try {
++    const manager = new PlayerManager({}, api);
++    const staged = await manager._stageFilePathsFromStep({
++      action_type: 'certificate_upload',
++      certificate_ref: JSON.stringify({
++        download_path: '/automation/playwright/testcases/100/CASE_001/execution-files/STEP_CERT',
++        file_name: 'client.lic',
++      }),
++    });
++
++    assert.deepEqual(staged.files, ['C:\\Temp\\client.lic']);
++    assert.deepEqual(staged.downloadIds, [92]);
++    assert.deepEqual(cleanupIds, []);
++  } finally {
++    globalThis.chrome = originalChrome;
++  }
++});
++
++test('CDP staging reports unmaterialized environment certificate reference', async () => {
++  const originalChrome = globalThis.chrome;
++  globalThis.chrome = downloadChrome();
++  try {
++    const manager = new PlayerManager({}, {});
++
++    await assert.rejects(() => manager._stageFilePathsFromStep({
++      action_type: 'certificate_upload',
++      certificate_ref: {
++        scope: 'project_environment',
++        kind: 'certificate',
++        slot_id: '878671771996430365',
++      },
++    }), /环境文件引用未由 Admin 物化为下载引用/);
++  } finally {
++    globalThis.chrome = originalChrome;
++  }
++});
+```
+
+# 2026-08-14 支持环境证书受控下载后执行 CDP 上传
+
+## 涉及文件
+
+- modules/api-client.js
+- modules/player-manager.js
+- tests/execution-file-upload.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+Admin 与 Playwright Runner 部署在远程执行环境，CueCast CDP 在用户电脑的 Chrome 中执行。环境证书不能把 Runner 路径直接交给 Chrome，必须通过 Admin 的批次受控下载接口传输到扩展所在电脑，并在上传完成或失败后清理本机临时文件。下载接口同时要求短期 `executionCapability`，不能写入步骤 JSON 或下载 URL。
+
+## 变更内容
+
+1. 执行文件下载请求同时携带 Admin 登录令牌和 `X-Execution-Capability`。
+2. PlayerManager 将当前批次 capability 传入证书暂存流程，下载完成后再调用 `DOM.setFileInputFiles`。
+3. 无论 CDP 上传成功或失败，均在 `finally` 中清理 Chrome 下载记录和本机临时文件。
+4. 新增下载成功、下载失败和 CDP 上传失败清理测试。
+
+## 验证
+
+- `node --test tests/execution-file-upload.test.js`：3/3 通过。
+- `node --test tests/*.test.js`：76/76 通过。
+
+## 具体代码改动
+
+### modules/api-client.js
+
+```diff
+@@
+-  async downloadExecutionFile(reference) {
++  async downloadExecutionFile(reference, executionCapability = '') {
+@@
++    const capability = String(executionCapability || '').trim();
+@@
+-      ...(token ? { headers: [{ name: 'Authorization', value: `Bearer ${token}` }] } : {}),
++      ...(token || capability ? {
++        headers: [
++          ...(token ? [{ name: 'Authorization', value: `Bearer ${token}` }] : []),
++          ...(capability ? [{ name: 'X-Execution-Capability', value: capability }] : []),
++        ],
++      } : {}),
+```
+
+### modules/player-manager.js
+
+```diff
+@@
+               actualLocator = await this._executeStepCDP(playTabId, executableStep, targetUrl, ctx.locale, runtimeNextStep, {
+                 beforeActionScreenshot: captureCurrentStep,
++                executionCapability: ctx.executionCapability,
+               });
+@@
+-  async _executeFileUploadCDP(tabId, step) {
+-    const staged = await this._stageFilePathsFromStep(step);
++  async _executeFileUploadCDP(tabId, step, executionCapability = '') {
++    const staged = await this._stageFilePathsFromStep(step, executionCapability);
+@@
+-        const downloaded = await this.api.downloadExecutionFile(candidate);
++        const downloaded = await this.api.downloadExecutionFile(candidate, executionCapability);
+```
+
+### tests/execution-file-upload.test.js
+
+```diff
+@@
++test('Admin execution file downloads to a local path with execution capability header', async () => {
++  const client = new ApiClient(() => 'http://admin.local', () => 'admin-token');
++  const result = await client.downloadExecutionFile({
++    type: 'admin_execution_file',
++    download_path: '/automation/playwright/testcases/SCENE/CASE/steps/STEP/execution-file?projectEnvironmentId=7',
++    file_name: 'client.lic',
++  }, 'execution-capability-token');
++  assert.deepEqual(result, { downloadId: 71, localPath: 'C:\\Temp\\client.lic' });
++});
++
++test('Admin execution file download failure is reported', async () => {
++  const client = new ApiClient(() => 'http://admin.local', () => '');
++  await assert.rejects(() => client.downloadExecutionFile({
++    download_path: '/automation/playwright/testcases/SCENE/CASE/steps/STEP/execution-file',
++  }, 'capability'), /NETWORK_FAILED/);
++});
++
++test('CDP upload failure still cleans the staged execution file', async () => {
++  await assert.rejects(() => manager._executeFileUploadCDP(5, {
++    action_type: 'certificate_upload',
++    target_selector: '#license-file',
++    certificate_ref: {
++      type: 'admin_execution_file',
++      download_path: '/automation/playwright/testcases/SCENE/CASE/steps/STEP/execution-file',
++    },
++  }, 'execution-capability-token'), /CDP upload failed/);
++  assert.deepEqual(cleanupIds, [88]);
++});
+```
+
+# 2026-08-13 兼容模式改为新建普通 Chrome 回放窗口
+
+## 涉及文件
+
+- modules/current-profile-batch-session-manager.js
+- tests/current-profile-batch-session-manager.test.js
+- ../sakura-admin-ui/src/views/automation/automationUiScene/components/AutomationExecutionCaseModal.vue
+- ../sakura-admin-ui/src/views/test/testPlan/index.vue
+- ../docs/cdp-playback-case-session-modes-implementation-plan.md
+- commit/git-commit-log.md
+
+## 变更原因
+
+兼容模式需要以独立浏览器窗口运行，避免回放标签页与 Admin 当前窗口混在一起。窗口仍属于用户当前 Chrome Profile，保留登录态和下载设置，但不是无痕窗口。
+
+## 变更内容
+
+1. `legacy-profile` 批次首次回放改为 `chrome.windows.create` 新建普通窗口。
+2. 后续用例继续复用该窗口的最终活动页；失败后关闭受控页签，并在下一条用例创建新的普通回放窗口。
+3. Service Worker 恢复时用 `managedWindowId + activeTabId` 证明新窗口首个标签页的归属；无法证明时不关闭页面。
+4. 场景执行、测试计划和实施方案同步改为“新建普通 Chrome 回放窗口”。
+
+## 验证
+
+- `node --test tests/current-profile-batch-session-manager.test.js`：通过。
+- `node --check modules/current-profile-batch-session-manager.js`：通过。
+- admin-ui `pnpm run typecheck`：通过。
+- `git diff --check`：通过。
+
+## 具体代码改动
+
+### modules/current-profile-batch-session-manager.js
+
+```diff
+@@
+- * 管理普通 Chrome Profile 中的批次回放标签页。
++ * 管理普通 Chrome Profile 中的批次回放窗口。
+@@
+-      activeTab = await this.chrome.tabs.create({
+-        windowId: this.batch.sourceWindowId,
+-        openerTabId: this.batch.sourceTabId,
++      const playbackWindow = await this.chrome.windows.create({
+         url: start,
+-        active: true,
++        focused: true,
+       });
++      activeTab = playbackWindow?.tabs?.[0];
++      this.batch.managedWindowId = Number(playbackWindow.id ?? activeTab.windowId);
+```
+
+### tests/current-profile-batch-session-manager.test.js
+
+```diff
+@@
+-test('当前 Profile 批次在 Admin 普通窗口创建标签页并连续复用', async () => {
++test('当前 Profile 批次创建普通浏览器窗口并连续复用', async () => {
+@@
++      async create(createData) {
++        const windowId = 10 + createdWindows.length + 1;
++        windows.set(windowId, { id: windowId, incognito: false });
++        return { id: windowId, incognito: false, tabs: [{ ...tab }] };
++      },
+```
+
+### ../sakura-admin-ui/src/views/automation/automationUiScene/components/AutomationExecutionCaseModal.vue
+
+```diff
+@@
+-                              <div><strong>当前浏览器兼容模式：</strong>在 Admin 当前普通窗口创建一个回放标签页，批次内持续复用并共享 Chrome Profile。</div>
++                              <div><strong>当前浏览器兼容模式：</strong>新建普通 Chrome 回放窗口，批次内持续复用并共享 Chrome Profile。</div>
+```
+
+### ../sakura-admin-ui/src/views/test/testPlan/index.vue
+
+```diff
+@@
+-                  ? '默认在当前普通 Chrome 窗口中创建并复用一个回放标签页；共享登录态和站点存储，不提供无痕隔离。'
++                  ? '默认新建并复用一个普通 Chrome 回放窗口；共享登录态和站点存储，不提供无痕隔离。'
+```
+
+### ../docs/cdp-playback-case-session-modes-implementation-plan.md
+
+```diff
+@@
+-| `legacy-profile` | 批次首次执行时在当前普通 Chrome 窗口新建回放标签页，后续用例复用同一最终活动页并共享用户当前 Chrome Profile | 作为默认的“当前浏览器兼容模式（非隔离）”保留；用于下载、系统确认、旧用例兼容和连续业务流程 |
++| `legacy-profile` | 批次首次执行时新建普通 Chrome 回放窗口，后续用例复用同一最终活动页并共享用户当前 Chrome Profile | 作为默认的“当前浏览器兼容模式（非隔离）”保留；用于下载、系统确认、旧用例兼容和连续业务流程 |
+```
+
+# 2026-08-13 默认使用当前 Chrome Profile 并复用批次回放标签页
+
+## 涉及文件
+
+- background.js
+- modules/player-manager.js
+- modules/current-profile-batch-session-manager.js
+- tests/current-profile-batch-session-manager.test.js
+- ../sakura-admin-ui/src/views/automation/automationUiScene/extensionPlayback.ts
+- ../sakura-admin-ui/src/views/automation/automationUiScene/components/AutomationExecutionCaseModal.vue
+- ../sakura-admin-ui/src/views/test/testPlan/index.vue
+- ../sakura-admin/continew-automation/src/main/java/top/continew/admin/automation/model/req/playwright/AutomationCdpPlaybackOptionsReq.java
+- ../docs/cdp-playback-case-session-modes-implementation-plan.md
+- commit/git-commit-log.md
+
+## 变更原因
+
+`legacy-profile` 虽然使用普通 Chrome Profile，但此前每条用例仍由 PlayerManager 新建窗口，无法继承 `reuse-browser` 的批次连续状态。用户要求将当前浏览器兼容模式设为 CDP 默认，并在普通 Profile 中复用同一回放页签，同时避免无痕窗口、重复新建窗口和误关闭用户页面。
+
+## 变更内容
+
+1. 新增普通 Profile 批次管理器，在 Admin 当前普通窗口首次创建一个回放标签页，成功用例之间复用最终活动页。
+2. 用例失败、取消或活动页丢失时只重建本批次回放标签页；批次结束关闭 CueCast 创建的标签页，不关闭 Admin 标签页或 Chrome 窗口。
+3. 普通 Profile 与受控无痕批次统一使用 BEGIN/PLAY/END/ABORT 生命周期，并使用 `executionCapability` 校验批次归属。
+4. Service Worker 恢复时只关闭可由 Admin 标签页 `opener` 链证明归属的普通标签页，无法证明时保留用户页面。
+5. 场景执行、测试计划和后端 CDP DTO 默认改为 `current-profile/legacy-profile`，受控无痕三模式仍可手动选择。
+6. END/ABORT 显式携带 `browserSessionSource`，Admin 同时校验返回的来源和模式，拒绝静默协议错配。
+
+## 验证
+
+- `node --test`：73/73 通过。
+- `node --test tests/current-profile-batch-session-manager.test.js`：5/5 通过。
+- `node --check modules/current-profile-batch-session-manager.js background.js modules/player-manager.js`：通过。
+- admin-ui `pnpm run typecheck`：通过。
+- admin-ui `pnpm exec eslint src/views/automation/automationUiScene/extensionPlayback.ts`：通过。
+- Admin Maven 已进入 Reactor 编译，但被既有 `continew-module-system` 缺失 `top.continew.admin.common.enums`、`RoleContext` 等类型阻断；本次 DTO 未出现编译错误。
+- `git diff --check`：通过。
+
+## 具体代码改动
+
+### background.js
+
+```diff
+@@
++import { CurrentProfileBatchSessionManager } from './modules/current-profile-batch-session-manager.js';
+@@
++const currentProfileBatchSessions = new CurrentProfileBatchSessionManager(chrome);
+@@
+-      cdpBatchSessions.beginBatch({
++      (message.browserSessionSource === 'current-profile'
++        ? currentProfileBatchSessions
++        : cdpBatchSessions).beginBatch({
+@@
++      const batchSessionManager = message.browserSessionSource === 'managed-context'
++        ? cdpBatchSessions
++        : message.browserSessionSource === 'current-profile' && message.sessionMode === 'legacy-profile'
++          && currentProfileBatchSessions.ownsBatch(message.batchId)
++          ? currentProfileBatchSessions
++          : null;
+```
+
+### modules/player-manager.js
+
+```diff
+@@
+         sessionNavigationDecision = String(preparedSession?.sessionTransition || '');
++        for (const managedTabId of preparedSession?.managedTabIds || []) {
++          if (Number.isInteger(Number(managedTabId))) ctx.managedTabIds.add(Number(managedTabId));
++        }
+```
+
+### modules/current-profile-batch-session-manager.js
+
+```diff
+@@
++export class CurrentProfileBatchSessionManager {
++  async prepareCase({ batchId, sessionMode, browserSessionSource, executionCapability, startUrl }) {
++    this.assertBatch(batchId, sessionMode, browserSessionSource);
++    await this.assertExecutionCapability(executionCapability);
++    let activeTab = await this.getOwnedTab(this.batch.activeTabId);
++    if (!activeTab) {
++      activeTab = await this.chrome.tabs.create({
++        windowId: this.batch.sourceWindowId,
++        openerTabId: this.batch.sourceTabId,
++        url: start,
++        active: true,
++      });
++    }
++    return {
++      tabId: Number(activeTab.id),
++      keepTabOpenAfterPlayback: true,
++      skipInitialNavigation,
++    };
++  }
++}
+```
+
+### tests/current-profile-batch-session-manager.test.js
+
+```diff
+@@
++test('当前 Profile 批次在 Admin 普通窗口创建标签页并连续复用', async () => {
++  const first = await harness.manager.prepareCase({
++    batchId: 'batch-legacy',
++    startUrl: 'https://app.example/login',
++  });
++  const second = await harness.manager.prepareCase({
++    batchId: 'batch-legacy',
++    startUrl: 'https://app.example/login',
++  });
++  assert.equal(harness.createdTabs.length, 1);
++  assert.equal(first.tabId, second.tabId);
++  assert.equal(harness.tabs.has(1), true);
++});
+```
+
+### ../sakura-admin-ui/src/views/automation/automationUiScene/extensionPlayback.ts
+
+```diff
+@@
+-export const endExtensionCdpBatch = async (batchId: string, executionCapability?: string) => {
++export const endExtensionCdpBatch = async (
++  batchId: string,
++  browserSessionSource: AutomationCdpPlaybackOptions['browserSessionSource'],
++  executionCapability?: string,
++) => {
+   const response = await waitForExtensionAck('AT_PLATFORM_END_PLAYBACK_BATCH', {
+     batchId,
++    browserSessionSource,
+     executionCapability,
+   }, 30000)
+```
+
+### ../sakura-admin-ui/src/views/automation/automationUiScene/components/AutomationExecutionCaseModal.vue
+
+```diff
+@@
+ const cdpSessionModeOptions = computed(() => [
++  { label: '当前浏览器兼容模式（非隔离）', value: 'legacy-profile' },
+   ...(cdpManagedContextAvailable.value && cdpGrayEnabled.value ? runnerSessionModeOptions : []),
+-  { label: '当前浏览器兼容模式（非隔离）', value: 'legacy-profile' },
+ ])
+@@
+-    browserSessionSource: cdpManagedContextAvailable.value && cdpGrayEnabled.value ? 'managed-context' : 'current-profile',
+-    sessionMode: cdpManagedContextAvailable.value && cdpGrayEnabled.value ? 'isolated' : 'legacy-profile',
++    browserSessionSource: 'current-profile',
++    sessionMode: 'legacy-profile',
+```
+
+### ../sakura-admin-ui/src/views/test/testPlan/index.vue
+
+```diff
+@@
+ const execCdpSessionModeOptions = computed(() => [
++  { label: '当前浏览器兼容模式（非隔离）', value: 'legacy-profile' },
+   ...(execCdpManagedContextAvailable.value && execCdpGrayEnabled.value ? runnerSessionModeOptions : []),
+-  { label: '当前浏览器兼容模式（非隔离）', value: 'legacy-profile' },
+ ])
+@@
+-      browserSessionSource: execCdpManagedContextAvailable.value && execCdpGrayEnabled.value ? 'managed-context' : 'current-profile',
+-      sessionMode: execCdpManagedContextAvailable.value && execCdpGrayEnabled.value ? 'isolated' : 'legacy-profile',
++      browserSessionSource: 'current-profile',
++      sessionMode: 'legacy-profile',
+```
+
+### ../sakura-admin/continew-automation/src/main/java/top/continew/admin/automation/model/req/playwright/AutomationCdpPlaybackOptionsReq.java
+
+```diff
+@@
+-    private String browserSessionSource = "managed-context";
++    private String browserSessionSource = "current-profile";
+@@
+-    private String sessionMode = "isolated";
++    private String sessionMode = "legacy-profile";
+```
+
+### ../docs/cdp-playback-case-session-modes-implementation-plan.md
+
+```diff
+@@
+-| `legacy-profile` | 每条用例新建窗口，但共享用户当前 Chrome Profile | 始终作为“当前浏览器兼容模式（非隔离）”保留；用于下载、系统确认、旧用例兼容和历史展示 |
++| `legacy-profile` | 批次首次执行时在当前普通 Chrome 窗口新建回放标签页，后续用例复用同一最终活动页并共享用户当前 Chrome Profile | 作为默认的“当前浏览器兼容模式（非隔离）”保留；用于下载、系统确认、旧用例兼容和连续业务流程 |
+```
+
+# 2026-08-13 明确 CDP 下载确认边界并保证失败后会话销毁
+
+## 涉及文件
+
+- modules/cdp-browser-context-driver.js
+- tests/cdp-browser-context-driver.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+关闭 Chrome 的“下载前询问每个文件的保存位置”后，受控无痕会话仍可能弹出 Chrome 下载确认窗口。真实 Chrome 已证明页签级 `chrome.debugger` 无权调用 browser-level 下载策略；`automaticDownloads` 仅管理站点连续下载许可，不能绕过危险、不安全或其他浏览器级确认。扩展不能把人工确认静默视为成功，但必须取消下载并销毁自有窗口，避免阻塞后续批次。
+
+## 变更内容
+
+1. 移除页签级 debugger 不支持的 `Page.setDownloadBehavior`，恢复正常 CDP 附加。
+2. 撤销无效的 `contentSettings.automaticDownloads` 方案和对应 Manifest 权限。
+3. 清理阶段主动查询 `in_progress` 无痕下载，输出 `state/danger/error/paused/filename/url` 诊断。
+4. 危险或暂停下载立即返回 `CDP_DOWNLOAD_REQUIRES_CONFIRMATION`，明确要求切换 Playwright Runner。
+5. 普通下载等待终态，超时返回 `CDP_DOWNLOAD_TIMEOUT`。
+6. 两类下载失败都会先取消下载、关闭受控窗口并删除 Context，再把错误回传，防止后续批次被残留窗口阻塞。
+
+## 验证
+
+- `node --test`：68/68 通过。
+- CDP 专项测试：28/28 通过。
+- `node --check modules/player-manager.js modules/cdp-browser-context-driver.js`：通过。
+- `git diff --check`：通过。
+
+## 具体代码改动
+
+### modules/cdp-browser-context-driver.js
+
+```diff
+@@
+-      const activeIds = [...this.activeDownloads.entries()]
++      const trackedIds = [...this.activeDownloads.entries()]
+         .filter(([, tracked]) => tracked.contextId === browserContextId)
+         .map(([downloadId]) => downloadId);
++      const queried = await Promise.resolve(
++        this.chrome.downloads.search ? this.chrome.downloads.search({ state: 'in_progress' }) : [],
++      ).catch(() => []);
++      const queriedIds = queried
++        .filter((item) => item?.incognito === true)
++        .map((item) => item.id)
++        .filter((id) => id != null);
++      const activeIds = [...new Set([...trackedIds, ...queriedIds])];
+@@
++      const blocked = activeIds
++        .map((downloadId) => this.activeDownloads.get(downloadId)?.item)
++        .filter((item) => item && ((item.danger && item.danger !== 'safe') || item.paused === true));
++      if (blocked.length) {
++        await this.cancelDownloads(activeIds);
++        throw new CdpBrowserContextError(
++          'CDP_DOWNLOAD_REQUIRES_CONFIRMATION',
++          `Chrome 要求人工确认该下载，扩展 CDP 无法绕过；${blocked.map(downloadDiagnostic).join('；')}。请改用 Playwright Runner`,
++        );
++      }
+```
+
+### tests/cdp-browser-context-driver.test.js
+
+```diff
+@@
++test('下载超时后仍关闭受控窗口并清除 Context 归属', async () => {
++  await assert.rejects(
++    () => driver.disposeBrowserContext(contextId),
++    (error) => error.code === 'CDP_DOWNLOAD_TIMEOUT',
++  );
++  assert.equal(driver.contexts.has(contextId), false);
++  assert.equal(harness.windows.has(target.tab.windowId), false);
++});
+```
+
+# 2026-08-13 修复 CDP 探测、下载与受控无痕窗口清理闭环
+
+## 涉及文件
+
+- manifest.json
+- modules/cdp-browser-context-driver.js
+- modules/cdp-batch-session-manager.js
+- tests/cdp-browser-context-driver.test.js
+- tests/cdp-batch-session-manager.test.js
+- ../sakura-admin-ui/src/views/automation/automationUiScene/extensionPlayback.ts
+- commit/git-commit-log.md
+
+## 变更原因
+
+CDP 配置页重复触发 A/B 无痕会话能力探测；下载未结束时批次立即关闭窗口，且 Context 归属在窗口确认消失前被删除，导致自有残留窗口被误判为外部无痕窗口。END 超时后的 ABORT 还可能与原清理并发，使批次停在 `cleanup-failed` 并阻塞后续执行。
+
+## 变更内容
+
+1. 能力探测增加 single-flight 和版本化 session 缓存，成功缓存 2 小时、失败缓存 30 秒；探测窗口改为后台创建。
+2. 增加 Chrome downloads 权限，受控 Context 跟踪下载开始与终态；清理前等待下载，超时尝试取消并返回可操作错误。
+3. 只在受控窗口确认消失且不存在外部无痕窗口后删除 Context 归属，失败时保留归属供 ABORT 重试。
+4. END/ABORT 共享单次清理 Promise，并冻结 capability 比对目标，避免并发清理和批次清空竞态。
+5. Admin 清理 ACK 超时提高到 30 秒，覆盖 15 秒下载等待和 8 秒窗口关闭确认。
+6. 清理失败时保留下载监听器和驱动连接，确保后续 ABORT 能继续观察下载终态并完成重试。
+
+## 验证
+
+- `node --test`：67/67 通过。
+- `node --test tests/cdp-browser-context-driver.test.js tests/cdp-batch-session-manager.test.js`：27/27 通过。
+- `node --check modules/cdp-browser-context-driver.js; node --check modules/cdp-batch-session-manager.js`：通过。
+- admin-ui `pnpm run typecheck`：通过。
+- admin-ui `pnpm exec eslint src/views/automation/automationUiScene/extensionPlayback.ts`：通过。
+
+## 具体代码改动
+
+### manifest.json
+
+```diff
+@@
+     "debugger",
++    "downloads",
+     "notifications",
+```
+
+### modules/cdp-browser-context-driver.js
+
+```diff
+@@
+-    this.contexts.delete(browserContextId);
+-    let foreign = await this.getIncognitoWindows();
+-    while (foreign.length > 0 && Date.now() < deadline) {
++    await this.waitForDownloads(browserContextId);
++    let owned = await this.getContextWindows(context);
++    while (owned.length > 0 && Date.now() < deadline) {
+       await sleep(TARGET_POLL_INTERVAL_MS);
+-      foreign = await this.getIncognitoWindows();
++      owned = await this.getContextWindows(context);
+     }
++    if (owned.length > 0) {
++      throw new CdpBrowserContextError(
++        'CDP_SESSION_CLEANUP_FAILED',
++        `受控无痕窗口仍未关闭：${owned.map((item) => item.id).join(',')}`,
++      );
++    }
++    const foreign = await this.getIncognitoWindows();
++    if (foreign.length > 0) {
++      throw new CdpBrowserContextError(
++        'CDP_INCOGNITO_SESSION_CONTAMINATED',
++        '批次运行期间出现了非 CueCast 管理的无痕窗口，无法证明测试状态已销毁；请关闭全部无痕窗口后重试',
++      );
++    }
++    this.contexts.delete(browserContextId);
+@@
+-    await this.disconnect();
+     if (failures.length) {
+       throw new CdpBrowserContextError(
+         'CDP_SESSION_CLEANUP_FAILED',
+         `受控无痕会话清理失败：${failures.join('；')}`,
+       );
+     }
++    await this.disconnect();
+@@
+-      const targetA = await this.createTarget(contextA, url);
++      const targetA = await this.createTarget(contextA, url, { background: true });
+```
+
+### modules/cdp-batch-session-manager.js
+
+```diff
+@@
+-    const driver = this.driverFactory();
+-    const result = await driver.probe(sourceTabId, probeUrl);
+-    this.cachedCapabilities = result;
+-    return result;
++    if (this.probePromise) return this.probePromise;
++    this.probePromise = (async () => {
++      const cached = stored?.[CAPABILITY_CACHE_KEY];
++      if (cached?.timestamp && cached.extensionVersion === extensionVersion) return cached.result;
++      const result = await this.driverFactory().probe(sourceTabId, probeUrl);
++      await this.chrome.storage.session.set({ [CAPABILITY_CACHE_KEY]: { timestamp: Date.now(), extensionVersion, result } });
++      return result;
++    })().finally(() => { this.probePromise = null; });
++    return this.probePromise;
+@@
+   async cleanupBatch() {
++    if (this.cleanupPromise) return this.cleanupPromise;
++    this.cleanupPromise = this._cleanupBatch().finally(() => { this.cleanupPromise = null; });
++    return this.cleanupPromise;
++  }
+```
+
+### tests/cdp-browser-context-driver.test.js
+
+```diff
+@@
++test('受控下载未完成时保留 Context 归属并尝试取消下载', async () => {
++  harness.emitDownloadCreated({ id: 77, incognito: true, state: 'in_progress' });
++  await assert.rejects(
++    () => driver.waitForDownloads(contextId, 1),
++    (error) => error.code === 'CDP_DOWNLOAD_IN_PROGRESS',
++  );
++  assert.equal(driver.contexts.has(contextId), true);
++  assert.deepEqual(harness.cancelledDownloads, [77]);
++});
+```
+
+### tests/cdp-batch-session-manager.test.js
+
+```diff
+@@
++test('并发能力探测共享一次真实探测并持久化结果', async () => {
++  const [first, second] = await Promise.all([
++    harness.manager.probeCapabilities(1, 'https://admin.example/scenes'),
++    harness.manager.probeCapabilities(1, 'https://admin.example/scenes'),
++  ]);
++  assert.equal(harness.probeCount, 1);
++  assert.deepEqual(first, second);
++});
++
++test('并发 END 和 ABORT 共享同一次批次清理', async () => {
++  await Promise.all([
++    harness.manager.endBatch('batch-isolated', EXECUTION_CAPABILITY),
++    harness.manager.abortBatch('batch-isolated', EXECUTION_CAPABILITY),
++  ]);
++  assert.deepEqual(harness.disposed, ['context-1']);
++});
+```
+
+### ../sakura-admin-ui/src/views/automation/automationUiScene/extensionPlayback.ts
+
+```diff
+@@
+-  const response = await waitForExtensionAck('AT_PLATFORM_END_PLAYBACK_BATCH', { batchId, executionCapability }, 8000)
++  const response = await waitForExtensionAck('AT_PLATFORM_END_PLAYBACK_BATCH', { batchId, executionCapability }, 30000)
+@@
+-  const response = await waitForExtensionAck('AT_PLATFORM_ABORT_PLAYBACK_BATCH', { batchId, executionCapability }, 8000)
++  const response = await waitForExtensionAck('AT_PLATFORM_ABORT_PLAYBACK_BATCH', { batchId, executionCapability }, 30000)
+```
+
+# 2026-08-13 修复能力探测命令处理期间提前 detach
+
+## 涉及文件
+
+- modules/cdp-browser-context-driver.js
+- modules/cdp-auth-state.js
+- tests/cdp-browser-context-driver.test.js
+- tests/cdp-auth-state.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+真实 Chrome 能力探测已进入扩展独占无痕会话，但 Cookie CDP 命令返回 `Detached while handling command`。根因不是 Chrome 不支持，而是 `sendBrowserCommand()` 在 `try` 中直接返回 `chrome.debugger.sendCommand()` 的 Promise，JavaScript 会先执行 `finally`，导致命令尚未完成就主动调用 `chrome.debugger.detach()`。
+
+## 变更内容
+
+1. 所有临时 debugger 命令显式 `await`，只在命令完成或失败后执行 detach。
+2. Cookie 读取从已废弃的 `Network.getAllCookies` 改为页签范围 `Network.getCookies({ urls })`。
+3. 认证快照只读取本批次实际访问 URL 和 origin 可见的 Cookie，不扩大到整个浏览器。
+4. `Detached while handling command` 等瞬时断连会重新 attach 并重试一次，第二次失败仍明确返回错误。
+5. 能力探测继续验证 Cookie 捕获/恢复，不通过降低门禁掩盖 `reuse-auth` 问题。
+
+## 验证
+
+- `node --test tests/cdp-browser-context-driver.test.js tests/cdp-auth-state.test.js tests/cdp-batch-session-manager.test.js`：27/27 通过。
+- `node --test`：64/64 通过。
+- `node --check background.js modules/cdp-browser-context-driver.js modules/cdp-auth-state.js modules/cdp-batch-session-manager.js modules/player-manager.js`：通过。
+- admin-ui `npm run typecheck`：通过。
+- admin-ui `extensionPlayback.ts` 精确 ESLint：通过。
+
+## 具体代码改动
+
+### modules/cdp-browser-context-driver.js
+
+```diff
+@@
+-          return this.chrome.debugger.sendCommand(debuggee, 'Network.getAllCookies');
++          return await this.chrome.debugger.sendCommand(debuggee, 'Network.getCookies', {
++            urls: Array.isArray(params.urls) ? params.urls : [],
++          });
+@@
+-        return this.chrome.debugger.sendCommand(debuggee, method, commandParams);
++        // 必须等待命令完成后再进入 finally detach，否则 Chrome 会报 Detached while handling command。
++        return await this.chrome.debugger.sendCommand(debuggee, method, commandParams);
++      } catch (error) {
++        if (!isDetachedCommandError(error) || attempt > 0) throw error;
++        await sleep(TARGET_POLL_INTERVAL_MS);
+       } finally {
+         if (attachedHere) await this.chrome.debugger.detach(debuggee).catch(() => {});
+       }
+```
+
+### modules/cdp-auth-state.js
+
+```diff
+@@
+-      const cookieResult = await driver.sendBrowserCommand('Storage.getCookies', { browserContextId });
+       const originSet = new Set([
+@@
++      const cookieUrls = [...new Set([
++        ...tabs.map((tab) => String(tab?.url || '')),
++        String(lastUrl || ''),
++        ...originSet,
++      ].filter((url) => /^https?:\/\//i.test(url)))];
++      const cookieResult = await driver.sendBrowserCommand('Storage.getCookies', {
++        browserContextId,
++        urls: cookieUrls,
++      });
+```
+
+### tests/cdp-browser-context-driver.test.js
+
+```diff
+@@
++test('认证状态 Cookie 命令瞬时 detach 时重新附加并重试一次', async () => {
++  const harness = createHarness({ detachCookieOnce: true });
++  const result = await driver.sendBrowserCommand('Storage.getCookies', {
++    browserContextId: contextId,
++    urls: ['https://app.example/home'],
++  });
++  assert.equal(result.cookies[0].name, 'sid');
++  assert.equal(harness.commands.filter((item) => item.method === 'Network.getCookies').length, 2);
++  assert.equal(harness.commands.filter((item) => item.method === 'attach').length, 2);
++});
+```
+
+### tests/cdp-auth-state.test.js
+
+```diff
+@@
++test('认证快照按批次实际访问 URL 读取受控无痕 Cookie', async () => {
++  await service.capture({
++    browserContextId: 'context-1',
++    driver,
++    tabs: [
++      { id: 101, url: 'https://app.example/account' },
++      { id: 102, url: 'https://account.example/profile' },
++    ],
++    origins: ['https://account.example'],
++    lastUrl: 'https://app.example/home',
++  });
++  assert.deepEqual(cookieOptions.urls, [
++    'https://app.example/account',
++    'https://account.example/profile',
++    'https://app.example/home',
++    'https://account.example',
++    'https://app.example',
++  ]);
++});
+```
+
+---
+
+# 2026-08-13 修正 CDP 三模式为扩展独占无痕会话
+
+## 涉及文件
+
+- README.md
+- background.js
+- modules/cdp-batch-session-manager.js
+- modules/cdp-browser-context-driver.js
+- modules/player-manager.js
+- tests/cdp-batch-session-manager.test.js
+- tests/cdp-browser-context-driver.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+真实 Chrome 151 已在开启 CueCast 无痕权限后返回 `Target.attachToBrowserTarget: {"code":-32000,"message":"Not allowed"}`。Chromium 只允许 browser-wide CDP 连接创建 BrowserContext，扩展页签 debugger 无法取得该权限。原实现会永久回退为当前 Profile 兼容模式，三种会话无法落地。需要改为 Chrome 实际允许的扩展独占无痕会话，同时保护用户默认 Profile 和用户自行打开的无痕窗口。
+
+## 变更内容
+
+1. 删除 browser target attach/create/dispose 路径，改用 `chrome.windows.create({ incognito: true })` 管理受控无痕会话生命周期。
+2. `isolated` 和 `reuse-auth` 在用例间关闭最后一个受控无痕窗口再重建；`reuse-browser` 保留同一窗口和最终活动页。
+3. Cookie 捕获/恢复通过受控无痕页签的 CDP Network 域完成，不新增 `cookies`/`browsingData` 权限。
+4. 批次开始前检测用户无痕窗口；存在时明确拒绝且绝不关闭。Service Worker 重启后只清理仍可由持久化 tabId 证明归属的窗口。
+5. 弹窗/派生页出现时即时写入 tab/window 元数据；认证快照前先释放 PlayerManager debugger，避免重复附加冲突。
+6. 能力响应增加 `managedSessionStrategy=exclusive-incognito`，保留 `managedBrowserContext`/`managed-context` 兼容字段。
+
+## 验证
+
+- `node --test`：62/62 通过。
+- `node --check background.js modules/cdp-browser-context-driver.js modules/cdp-batch-session-manager.js modules/player-manager.js`：通过。
+- admin-ui `npm run typecheck`：通过。
+- admin-ui 改动文件 `npx eslint --no-fix ...`：通过。
+- `git diff --check`：通过，仅有工作区 LF/CRLF 提示。
+- 真实 Chrome 替代路线仍需重载扩展后完成业务矩阵，本记录未把 Node 模拟测试计为真实 Chrome 验收。
+
+## 具体代码改动
+
+### README.md
+
+```diff
+@@
+-- **每条用例独立登录（默认）**：每条用例创建独立 BrowserContext，用例结束后销毁，登录态和站点存储不跨用例保留。
++- **每条用例独立登录（默认）**：每条用例创建扩展独占的无痕会话，用例结束后关闭全部受控无痕窗口，登录态和站点存储不跨用例保留。
+@@
+-受管 BrowserContext 仍需在真实 Chrome 125+ 环境完成一次门禁验证。
++Chrome 扩展页签调试会话无权调用 `Target.attachToBrowserTarget` 和 `Target.createBrowserContext`。CueCast 改用扩展独占无痕会话实现三种语义。
+```
+
+### background.js
+
+```diff
+@@
++        .catch((e) => sendResponse({
++          ok: false,
++          managedBrowserContext: false,
++          managedSessionStrategy: 'exclusive-incognito',
++          supportedSessionModes: ['legacy-profile'],
++          errorCode: e.code,
++          error: e.message || String(e),
++        }));
+@@
+ chrome.tabs.onCreated.addListener((tab) => {
++  cdpBatchSessions.handleTabCreated(tab);
+   void recorder.handleRecordingTabCreated(tab).catch(() => {});
+ });
+```
+
+### modules/cdp-batch-session-manager.js
+
+```diff
+@@
+       activeTabId: null,
+       managedTabIds: new Set(),
++      managedWindowIds: new Set(),
++      pendingIncognitoTabIds: new Set(),
++      contaminated: false,
+@@
++  handleTabCreated(tab) {
++    if (!this.batch || tab?.incognito !== true) return;
++    void this.trackManagedTabCreated(tab);
++  }
+@@
+-      await recoveryDriver.connect(anchorTabId);
+-      await recoveryDriver.disposeBrowserContext(contextId);
++      // Service Worker 重启后只按持久化窗口和标签页归属清理。
++      await recoveryDriver.cleanupRecoveredSession(metadata);
+@@
++  async assertSessionIsolation() {
++    if (this.batch?.contaminated) {
++      const error = new Error('批次运行期间出现了非 CueCast 管理的无痕窗口');
++      error.code = 'CDP_INCOGNITO_SESSION_CONTAMINATED';
++      throw error;
++    }
++    await this.driver?.assertNoForeignIncognitoWindows?.();
++  }
+```
+
+### modules/cdp-browser-context-driver.js
+
+```diff
+@@
+- * 通过 chrome.debugger 的 browser target session 管理独立 BrowserContext。
++ * 通过扩展独占的无痕会话提供受控状态边界。
++ * chrome.debugger 的页签会话没有 browser-wide 权限，不能调用 Target.createBrowserContext。
+@@
+-      const attached = await this.chrome.debugger.sendCommand(
+-        { tabId: normalizedTabId },
+-        'Target.attachToBrowserTarget',
+-      );
++    await this.assertIncognitoAccessAllowed();
++    await this.assertNoForeignIncognitoWindows();
++    this.anchorTabId = normalizedTabId;
+@@
+-      const result = await this.sendBrowserCommand('Target.createBrowserContext', {
+-        disposeOnDetach,
+-      });
++      const createdWindow = await this.chrome.windows.create({
++        url: targetUrl,
++        incognito: true,
++        focused: !background,
++        type: 'normal',
++      });
+@@
++      managedSessionStrategy: 'exclusive-incognito',
+@@
++    const recordedTabIds = new Set([
++      ...(metadata.managedTabIds || []),
++      metadata.activeTabId,
++    ].map(Number).filter(Number.isInteger));
++    // 只有仍可由持久化 tabId 证明归属的窗口才自动关闭。
++    for (const tabId of recordedTabIds) {
++      const tab = await this.chrome.tabs.get(tabId).catch(() => null);
++      if (tab?.incognito && recordedWindowIds.has(tab.windowId)) provenWindowIds.add(tab.windowId);
++    }
+```
+
+### modules/player-manager.js
+
+```diff
+@@
+       let success = !errorMsg;
+       if (typeof opts.finalizeBrowserSession === 'function') {
++        const debuggerTabId = ctx.activeTabId ?? playTabId;
++        if (ctx.debuggerAttached && debuggerTabId != null) {
++          await this._detachDebugger(debuggerTabId, ctx);
++        }
+         const managedTabs = await this._refreshManagedTabs(ctx).catch(() => []);
+```
+
+### tests/cdp-batch-session-manager.test.js
+
+```diff
+@@
++    async cleanupRecoveredSession(metadata) {
++      for (const contextId of new Set([
++        metadata.caseContextId,
++        metadata.browserContextId,
++      ].filter(Boolean))) {
++        await this.disposeBrowserContext(contextId);
++      }
++    }
+@@
+-test('isolated 每条用例创建并销毁独立 BrowserContext', async () => {
++test('isolated 每条用例创建并销毁独立受控会话', async () => {
+@@
++test('批次中出现非受控无痕窗口后阻断 reuse-browser 快速复用', async () => {
++  await assert.rejects(() => harness.manager.prepareCase({
++    batchId: 'batch-reuse-browser',
++    executionCapability: EXECUTION_CAPABILITY,
++    startUrl: 'https://app.example/login',
++  }),
++    (error) => error.code === 'CDP_INCOGNITO_SESSION_CONTAMINATED');
++});
+```
+
+### tests/cdp-browser-context-driver.test.js
+
+```diff
+@@
+-test('能力探测通过 browser child session 创建并清理两个 BrowserContext', async () => {
++test('能力探测通过两个顺序无痕会话验证状态销毁', async () => {
+@@
++test('存在用户无痕窗口时拒绝能力探测且不关闭用户窗口', async () => {
++  const harness = createHarness({ foreignIncognito: true });
++  const result = await new CdpBrowserContextDriver(harness.chrome)
++    .probe(1, 'https://admin.example/scenes');
++  assert.equal(result.errorCode, 'CDP_INCOGNITO_SESSION_CONFLICT');
++  assert.equal(harness.windows.has(9), true);
++});
+@@
++test('Service Worker 重启后不凭旧 windowId 关闭无法证明归属的用户无痕窗口', async () => {
++  await assert.rejects(() => recoveryDriver.cleanupRecoveredSession(metadata),
++    (error) => error.code === 'CDP_INCOGNITO_SESSION_CONTAMINATED');
++});
+```
+
+---
+
+# 2026-08-13 补齐受控 BrowserContext 无痕权限门禁
+
+## 涉及文件
+
+- modules/cdp-browser-context-driver.js
+- tests/cdp-browser-context-driver.test.js
+- README.md
+- commit/git-commit-log.md
+
+## 变更原因
+
+受控 BrowserContext 属于无痕上下文。如果用户未在 Chrome 扩展详情中开启“允许在无痕模式下运行”，CueCast 无法通过 `tabs` 和 `scripting` 接管新 Context 页面，原实现却会继续执行完整探测并返回下游模糊错误，admin-ui 只能显示“扩展 CDP 能力探测失败”。需要在连接 browser target 前建立明确的权限门禁，并提供可直接操作的修复提示。
+
+## 变更内容
+
+1. 能力探测首先通过 `chrome.extension.isAllowedIncognitoAccess()` 检查无痕访问权限。
+2. 未授权时返回 `CDP_INCOGNITO_ACCESS_REQUIRED`，提示在 CueCast 扩展详情中开启“允许在无痕模式下运行”并刷新页面。
+3. Chrome 无法提供权限检查 API 时返回独立错误码，避免误判为 BrowserContext 或页面脚本故障。
+4. 新增未授权契约测试，并确保权限失败时不会附着调试器或创建任何 Context。
+5. 安装说明补充“允许在无痕模式下运行”的必要配置，避免加载扩展后遗漏能力前置条件。
+
+## 验证
+
+- `node --test tests/cdp-browser-context-driver.test.js`：5/5 通过。
+- `node --experimental-default-type=module --test tests/*.test.js`：55/55 通过。
+- `node --check modules/cdp-browser-context-driver.js`：通过。
+- `git diff --check`：通过，仅有工作区既有 LF/CRLF 提示。
+
+## 具体代码改动
+
+### modules/cdp-browser-context-driver.js
+
+```diff
+@@
+-  async probe(anchorTabId, probeUrl) {
++  async assertIncognitoAccessAllowed() {
++    const checkAccess = this.chrome?.extension?.isAllowedIncognitoAccess;
++    if (typeof checkAccess !== 'function') {
++      throw new CdpBrowserContextError(
++        'CDP_INCOGNITO_ACCESS_CHECK_UNAVAILABLE',
++        '当前 Chrome 无法检查 CueCast 的无痕模式访问权限，请升级 Chrome 后重新加载扩展',
++      );
++    }
++    const allowed = await checkAccess.call(this.chrome.extension);
++    if (!allowed) {
++      throw new CdpBrowserContextError(
++        'CDP_INCOGNITO_ACCESS_REQUIRED',
++        'CueCast 未获准在无痕模式下运行。请在 chrome://extensions 打开 CueCast 详情，开启“允许在无痕模式下运行”，然后刷新当前页面',
++      );
++    }
++  }
++
++  async probe(anchorTabId, probeUrl) {
+@@
+-    try {
+-      await this.connect(anchorTabId);
++    try {
++      // 受控 BrowserContext 属于无痕上下文；未授权时 tabs/scripting 无法接管其页面。
++      await this.assertIncognitoAccessAllowed();
++      await this.connect(anchorTabId);
+```
+
+### tests/cdp-browser-context-driver.test.js
+
+```diff
+@@
+-function createHarness({ leakState = false, failDispose = false } = {}) {
++function createHarness({ leakState = false, failDispose = false, incognitoAllowed = true } = {}) {
+@@
+-  const chrome = {
++  const chrome = {
++    extension: {
++      async isAllowedIncognitoAccess() { return incognitoAllowed; },
++    },
+@@
++test('未开启无痕访问时返回可操作的能力门禁原因', async () => {
++  const harness = createHarness({ incognitoAllowed: false });
++  const driver = new CdpBrowserContextDriver(harness.chrome);
++
++  const result = await driver.probe(1, 'https://admin.example/scenes');
++
++  assert.equal(result.managedBrowserContext, false);
++  assert.equal(result.errorCode, 'CDP_INCOGNITO_ACCESS_REQUIRED');
++  assert.match(result.reason, /允许在无痕模式下运行/);
++  assert.equal(harness.commands.length, 0);
++});
+```
+
+### README.md
+
+```diff
+@@
+ 3. 点击「加载已解压的扩展程序」
+ 4. 选择扩展目录（`D:\King\sakura\sakura-cuecast`）
++5. 打开 CueCast 的“详情”，开启“允许在无痕模式下运行”；三种受控 BrowserContext 会话依赖此权限，未开启时只保留当前浏览器兼容模式。
+```
+
+---
+
+# 2026-08-12 统一定位器跨执行器适配
+
+## 涉及文件
+
+- modules/player-manager.js
+- content/player.js
+- tests/cuecast-recording-compatibility.test.js
+- tests/operation-contract.test.js
+- tests/fixtures/locator-contract-v1.json
+- commit/git-commit-log.md
+
+## 变更原因
+
+`extension-cdp` 会把 `(//span[@class='user-title'])[1]` 错误改写为 `/(//span[@class='user-title'])[1]`，并且 `assert_element_match` 没有与点击、输入共用完整的 `locator_meta` 候选链。需要让 CueCast CDP 和 DOM 降级路径保持 XPath 原语义，统一断言定位器，并与 Playwright 的候选类型契约对齐。
+
+## 变更内容
+
+1. XPath 只移除显式 `xpath=` 前缀，并仅为历史 `html/...`、`body/...` 裸路径补 `/`；括号 XPath、相对 XPath、绝对 XPath和函数表达式均原样执行。
+2. CDP 在执行前校验主 XPath 和 `locator_meta` XPath，区分 `LOCATOR_XPATH_INVALID`、`LOCATOR_XPATH_UNSUPPORTED`，并明确拒绝 jQuery、JS Path、testRigor 私有定位策略。
+3. `assert_element_match`、变量读取、输入和按键复用 `locator_meta -> 稳定 id -> XPath -> CSS` 元素解析链，回传来源、类型、命中数和可见数。
+4. DOM 降级路径采用同一 XPath 保留规则和错误结构；高亮改用 Web Animations，避免临时修改 `class` 导致精确属性 XPath 在真正执行前失效。
+5. 新增共享定位契约 fixture，区分录制器当前候选类型和历史 `tree_item_text` 兼容类型；CueCast 与 Playwright 测试共同读取该文件。
+6. 录制动作契约测试锁定 `target_xpath` 和 `locator_meta` 在运行时 canonical action 转换后不丢失。
+
+## 验证
+
+- `node --experimental-default-type=module --test tests/*.test.js`：54/54 通过。
+- `node --check modules/player-manager.js`、`node --check content/player.js`：通过。
+- Playwright Runner `npm run check`：通过。
+- Playwright Runner `npm run test:unit`：87/87 通过。
+- Playwright Runner `npm run test:locator`：21/21 通过，包含真实 Chromium 下 legacy、semantic-v1、CDP 表达式和 CueCast DOM 降级验证。
+- 真实已加载扩展的 Chrome 回放仍需人工验收；自动化测试结果未替代该环境门禁。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
++  /**
++   * XPath 必须原样交给浏览器。仅兼容旧数据中的 html/...、body/... 裸绝对路径，
++   * 不能给括号 XPath、.// 相对 XPath或函数表达式擅自补斜杠。
++   */
++  static _normalizeXPath(xpath) {
++    let normalized = String(xpath || '').trim();
++    if (/^xpath\s*=/i.test(normalized)) normalized = normalized.replace(/^xpath\s*=\s*/i, '').trim();
++    if (!normalized || PlayerManager._isVolatileRcXPath(normalized)) return '';
++    return /^(?:html|body)\//i.test(normalized) ? `/${normalized}` : normalized;
++  }
+@@
+-  static _buildElementAssertionExpr(selector, xpath, readMode = 'auto') {
+-    const chain = PlayerManager._buildDomTargetChain(selector, xpath);
++  static _buildElementAssertionExpr(selector, xpath, readMode = 'auto', locatorMeta = null) {
++    const resultChain = PlayerManager._buildDomTargetResultChain(selector, xpath, locatorMeta);
+@@
++    await this._validateStepXpathsCDP(tabId, step);
+     switch (actionType) {
+```
+
+### content/player.js
+
+```diff
+@@
+-  function findBestXPathMatch(xpRaw) {
+-    let x = xpRaw;
+-    if (x && !x.startsWith('//') && !x.startsWith('/html') && !x.startsWith('/*')) {
+-      x = `/${x}`;
+-    }
++  function normalizeXPath(xpath) {
++    let normalized = String(xpath || '').trim();
++    if (/^xpath\s*=/i.test(normalized)) normalized = normalized.replace(/^xpath\s*=\s*/i, '').trim();
++    if (!normalized || isVolatileRcXPath(normalized)) return '';
++    return /^(?:html|body)\//i.test(normalized) ? `/${normalized}` : normalized;
+   }
+@@
+-    if (el) {
+-      el.classList.add('__at_playing__');
+-      setTimeout(() => el.classList.remove('__at_playing__'), 1000);
++    if (el && typeof el.animate === 'function') {
++      // 高亮不能修改 class/style；精确属性 XPath 会因此在真正执行前失效。
++      el.animate([
++        { outline: '3px solid #4caf50', outlineOffset: '2px' },
++        { outline: '3px solid #4caf50', outlineOffset: '2px' },
++      ], { duration: 1000, easing: 'linear' });
+     }
+```
+
+### tests/cuecast-recording-compatibility.test.js
+
+```diff
+@@
++const locatorContract = JSON.parse(fs.readFileSync(new URL(
++  './fixtures/locator-contract-v1.json',
++  import.meta.url,
++), 'utf8'));
+@@
++test('括号 XPath 在所有 CDP 表达式中保持原样并复用 locator_meta 候选', () => {
++  const xpath = "(//span[@class='user-title'])[1]";
++  assert.equal(PlayerManager._normalizeXPath(xpath), xpath);
++  assert.equal(PlayerManager._normalizeXPath('.//span[@class="user-title"]'), './/span[@class="user-title"]');
++  const expression = PlayerManager._buildElementAssertionExpr(
++    '',
++    xpath,
++    'text',
++    { candidates: [{ type: 'css_attr_data-qa', value: "[data-qa='user-title']", score: 0.97 }] },
++  );
++  assert.match(expression, /data-qa/);
++  assert.match(expression, /locator_meta|meta-css_attr_data-qa/);
++  assert.doesNotMatch(expression, /\/\(\/\/span/);
++});
+```
+
+### tests/operation-contract.test.js
+
+```diff
+@@
++  const assertionLocatorMeta = {
++    candidates: [{ type: 'xpath_fallback', value: "(//span[@class='user-title'])[1]", score: 0.42 }],
++    context: { assertion: { target: 'element', match: 'contains', source: 'text' } },
++  };
+   const assertion = PlayerManager._adaptRecordedStep({
+     action_type: 'assert_text',
+     value: '{{test}}',
+-    locator_meta: { context: { assertion: { target: 'element', match: 'contains', source: 'text' } } },
++    target_xpath: "(//span[@class='user-title'])[1]",
++    locator_meta: assertionLocatorMeta,
+   });
++  assert.equal(assertion.target_xpath, "(//span[@class='user-title'])[1]");
++  assert.deepEqual(assertion.locator_meta, assertionLocatorMeta);
+```
+
+### tests/fixtures/locator-contract-v1.json
+
+```diff
+@@
++{
++  "version": 1,
++  "recorder_candidate_types": [
++    "css_attr_data-testid",
++    "css_attr_data-test",
++    "css_attr_data-qa",
++    "css_attr_data-cy",
++    "xpath_fallback",
++    "tree_interaction",
++    "tree_node_text",
++    "text_exact",
++    "text_exact_tag"
++  ],
++  "compatibility_candidate_types": [
++    "tree_item_text"
++  ],
++  "candidates": [
++    {
++      "type": "xpath_fallback",
++      "value": "(//span[@class='user-title'])[1]",
++      "score": 0.42
++    }
++  ]
++}
+```
+
+# 2026-08-11 实现 CDP 批量回放三种用例会话
+
+## 涉及文件
+
+- README.md
+- docs/changelog.md
+- manifest.json
+- background.js
+- content/bridge.js
+- modules/player-manager.js
+- modules/cdp-browser-context-driver.js
+- modules/cdp-auth-state.js
+- modules/cdp-batch-session-manager.js
+- tests/v1_2_merge_contract.test.js
+- tests/cdp-browser-context-driver.test.js
+- tests/cdp-auth-state.test.js
+- tests/cdp-batch-session-manager.test.js
+- tests/cdp-session-audit-contract.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+Admin 的 CDP 回放批量执行原先只能沿用当前 Chrome Profile，无法像 Playwright Runner 一样明确控制用例间的登录态和页面上下文。需要在不清理用户 Profile、不泄漏认证数据且保留旧执行入口的前提下，提供独立会话、成功登录态复用和同一浏览器连续执行三种模式。
+
+## 变更内容
+
+1. 使用 Chrome 125+ 的 CDP browser child session 创建、验证和销毁受控 BrowserContext；能力探测验证 Cookie、localStorage、sessionStorage 和 IndexedDB 隔离，失败时只声明旧版兼容模式。
+2. 实现 isolated、reuse-auth、reuse-browser 三种批次会话。批次配置与短期 executionCapability 绑定，配置不一致、目标丢失或清理失败均返回明确错误码。
+3. reuse-auth 仅原子提交上一条成功用例的 Cookie、Web Storage 和 IndexedDB；通过同源空白主文档在业务脚本执行前恢复，快照限制为 5 MiB 且只存放在 chrome.storage.session。
+4. PlayerManager 接入批次 prepare/finalize 生命周期，执行历史只保存模式、重置次数和导航决策，不保存 Context、target、tab、Cookie 或快照。
+5. Service Worker 增加能力探测及 BEGIN/END/ABORT 协议，并在重启后先校验 batchId 与 executionCapability、再清理遗留 Context；清理不能确认时保留元数据供重试。
+6. 扩展 ACK 回传请求 nonce，前端可精确匹配并发消息，同时兼容未回传 nonce 的旧扩展。
+7. 增加驱动、认证状态、三模式生命周期、故障恢复及审计脱敏测试，并补充 README 和产品更新日志。
+
+## 验证
+
+- node --test tests/*.test.js：53/53 通过。
+- node --check 对 background.js、content/bridge.js、modules/player-manager.js 和三个新增 CDP 模块检查通过。
+- git diff --check：通过。
+- Playwright Runner `npm run check`、87 个单元测试和 3 个会话集成测试通过。
+- Admin 主代码打包通过；两个目标测试类受模块内既有测试源码编译错误阻断，未开始执行。
+- admin-ui `pnpm typecheck` 与生产构建通过。
+- 真实 Chrome 125+ BrowserContext 门禁尚未执行：Chrome 正在运行且 Native Host 正常，但 ChatGPT Chrome 扩展已被禁用，自动化连接不可用。未将模拟测试结果记作真实浏览器验收通过。
+
+## 具体代码改动
+
+### README.md
+
+```diff
+@@
+ ## 安装方法
+
++三种批量回放用例会话依赖 Chrome 125 及以上版本提供的 CDP flat session。低版本 Chrome 或能力探测未通过时，只保留“使用当前浏览器”的旧版兼容回放，不会静默降级为其他会话模式。
+@@
++### Admin 批量回放用例会话
++
++- **每条用例独立登录（默认）**：每条用例创建独立 BrowserContext，用例结束后销毁，登录态和站点存储不跨用例保留。
++- **复用上一条用例的登录态**：每条用例仍使用新的 BrowserContext；仅在上一条用例成功时，将 Cookie、localStorage、sessionStorage 和 IndexedDB 快照恢复到下一条用例。
++- **同一浏览器窗口连续执行**：批次内复用同一个 BrowserContext 和活动标签页；用例失败或目标页丢失时重置上下文。
+```
+
+### docs/changelog.md
+
+```diff
+@@
+ ## 2026-08
+
++- CDP 批量回放新增“每条用例独立登录”“复用上一条用例的登录态”“同一浏览器窗口连续执行”三种用例会话模式；失败时重置受影响上下文，认证快照仅在扩展会话内保存，并保留旧版当前浏览器兼容模式。
+ - 修复步骤数量超出限额时，保存步骤变少的问题。
+```
+
+### manifest.json
+
+```diff
+@@
+ {
+   "manifest_version": 3,
++  "minimum_chrome_version": "125",
+   "name": "CueCast",
+```
+
+### background.js
+
+```diff
+@@
+ import { ApiClient } from './modules/api-client.js';
++import { CdpBatchSessionManager } from './modules/cdp-batch-session-manager.js';
+@@
+ const player = new PlayerManager(state, api);
++const cdpBatchSessions = new CdpBatchSessionManager(chrome);
+@@
++    case 'AT_PLATFORM_CDP_CAPABILITIES':
++      cdpBatchSessions.probeCapabilities(tabId, sender.tab?.url)
++        .then(sendResponse)
++        .catch((e) => sendResponse({
++          ok: false,
++          managedBrowserContext: false,
++          supportedSessionModes: ['legacy-profile'],
++          error: e.message || String(e),
++        }));
++      return true;
+@@
+-      cdpBatchSessions.endBatch(message.batchId, message.executionCapability)
++      cdpBatchSessions.endBatch(message.batchId, message.executionCapability, tabId)
+```
+
+### content/bridge.js
+
+```diff
+@@
+       || data.type === 'AT_PLATFORM_CLOSE_PLAY_TAB'
++      || data.type === 'AT_PLATFORM_CDP_CAPABILITIES'
++      || data.type === 'AT_PLATFORM_BEGIN_PLAYBACK_BATCH'
++      || data.type === 'AT_PLATFORM_END_PLAYBACK_BATCH'
++      || data.type === 'AT_PLATFORM_ABORT_PLAYBACK_BATCH'
+       || data.type === 'AT_PLATFORM_CHECK_SELECTOR'
+@@
+-          { type: 'AT_PLATFORM_ACK', original: data.type, response, testCaseId: data.testCaseId, purpose: data.purpose || '' },
++          { type: 'AT_PLATFORM_ACK', original: data.type, nonce: data.nonce, response, testCaseId: data.testCaseId, purpose: data.purpose || '' },
+```
+
+### modules/player-manager.js
+
+```diff
+@@
++/** 执行历史只保存会话决策，不保存 Context、target、tab 或认证状态标识。 */
++function buildSessionTransitionAudit(transition, opts = {}) {
++  const source = transition && typeof transition === 'object' ? transition : {};
++  const requestedMode = String(source.requestedMode || opts.sessionMode || '');
++  const appliedMode = String(source.appliedMode || opts.sessionMode || '');
++  const browserSessionSource = String(source.browserSessionSource || opts.browserSessionSource || '');
++  if (!requestedMode && !appliedMode && !browserSessionSource) return null;
++  return {
++    requestedMode,
++    appliedMode,
++    browserSessionSource,
++    reset: source.reset === true,
++    resetCount: Number(source.resetCount) || 0,
++    resetReason: String(source.resetReason || ''),
++    navigationDecision: String(source.navigationDecision || opts.navigationDecision || ''),
++    authStateCommitted: source.authStateCommitted === true,
++  };
++}
+```
+
+### modules/cdp-browser-context-driver.js
+
+```diff
+@@
++/**
++ * 通过 chrome.debugger 的 browser target session 管理独立 BrowserContext。
++ * 该驱动不会调用 browsingData，也不会删除用户当前 Profile 中的任何状态。
++ */
++export class CdpBrowserContextDriver {
++  constructor(chromeApi = globalThis.chrome) {
++    this.chrome = chromeApi;
++    this.anchorTabId = null;
++    this.browserSessionId = '';
++    this.contextIds = new Set();
++    this.targetIds = new Set();
++  }
+```
+
+### modules/cdp-auth-state.js
+
+```diff
+@@
++const DEFAULT_SNAPSHOT_LIMIT_BYTES = 5 * 1024 * 1024;
+@@
++export class CdpAuthStateService {
++  constructor(chromeApi = globalThis.chrome, { snapshotLimitBytes = DEFAULT_SNAPSHOT_LIMIT_BYTES } = {}) {
++    this.chrome = chromeApi;
++    this.snapshotLimitBytes = snapshotLimitBytes;
++  }
+```
+
+### modules/cdp-batch-session-manager.js
+
+```diff
+@@
++const MANAGED_SESSION_MODES = new Set(['isolated', 'reuse-auth', 'reuse-browser']);
+@@
++/**
++ * 管理一个扩展 CDP 批次的浏览器状态边界。
++ * Admin 只接收脱敏转换结果；Context、Cookie 和认证快照始终留在扩展本机内存/session storage。
++ */
++export class CdpBatchSessionManager {
++  constructor(chromeApi = globalThis.chrome, dependencies = {}) {
++    this.chrome = chromeApi;
++    this.driverFactory = dependencies.driverFactory || (() => new CdpBrowserContextDriver(chromeApi));
++    this.authState = dependencies.authState || new CdpAuthStateService(chromeApi);
++    this.driver = null;
++    this.batch = null;
++    this.authSnapshot = null;
++    this.cachedCapabilities = null;
++  }
+@@
++  async cleanupStoredBatch(batchId, executionCapability, sourceTabId) {
++    const stored = await this.chrome.storage.session.get(SESSION_METADATA_KEY).catch(() => ({}));
++    const metadata = stored?.[SESSION_METADATA_KEY];
++    if (!metadata) {
++      await this.clearStoredSession();
++      return;
++    }
++    const candidateHash = await sha256(executionCapability);
++    if (!candidateHash || candidateHash !== metadata.executionCapabilityHash) {
++      const error = new Error('CDP executionCapability 与遗留批次会话不匹配');
++      error.code = 'CDP_EXECUTION_CAPABILITY_MISMATCH';
++      throw error;
++    }
++  }
+```
+
+### tests/v1_2_merge_contract.test.js
+
+```diff
+@@
+   const commands = [
+     'AT_PLATFORM_DISCARD_RECORDING_SAVE',
++    'AT_PLATFORM_CDP_CAPABILITIES',
++    'AT_PLATFORM_BEGIN_PLAYBACK_BATCH',
++    'AT_PLATFORM_END_PLAYBACK_BATCH',
++    'AT_PLATFORM_ABORT_PLAYBACK_BATCH',
+     'AT_PLATFORM_CHECK_SELECTOR',
+   ];
+@@
++  assert.match(bridge, /original: data\.type, nonce: data\.nonce/);
+```
+
+### tests/cdp-browser-context-driver.test.js
+
+```diff
+@@
++test('能力探测通过 browser child session 创建并清理两个 BrowserContext', async () => {
++  const harness = createHarness();
++  const driver = new CdpBrowserContextDriver(harness.chrome);
++
++  const result = await driver.probe(1, 'https://admin.example/scenes');
++
++  assert.equal(result.managedBrowserContext, true);
++  assert.deepEqual(result.supportedSessionModes, ['isolated', 'reuse-auth', 'reuse-browser']);
++  assert.deepEqual(harness.disposed, ['context-2', 'context-1']);
+```
+
+### tests/cdp-auth-state.test.js
+
+```diff
+@@
++test('reuse-auth 在同一候选标签页依次恢复各 origin 的 sessionStorage', async () => {
++  const navigations = [];
++  const closedTargets = [];
++  const chrome = {
++    scripting: {
++      async executeScript(options) {
++        assert.equal(options.target.tabId, 101);
++        return [{ result: { ok: true } }];
++      },
++    },
++  };
+```
+
+### tests/cdp-batch-session-manager.test.js
+
+```diff
+@@
++test('reuse-browser 成功复用最终活动页，失败后整 Context 重建', async () => {
++  const harness = createHarness();
++  await begin(harness.manager, 'reuse-browser');
++
++  const first = await harness.manager.prepareCase({
++    batchId: 'batch-reuse-browser',
++    executionCapability: EXECUTION_CAPABILITY,
++    startUrl: 'https://app.example/login',
++  });
++  harness.tabs.get(first.tabId).url = 'https://app.example/home';
+@@
++test('Service Worker 重启后的 END 先校验执行能力再清理遗留 Context', async () => {
++  const harness = createHarness();
++  await begin(harness.manager, 'isolated');
++  await harness.manager.prepareCase({
++    batchId: 'batch-isolated',
++    executionCapability: EXECUTION_CAPABILITY,
++    startUrl: 'https://app.example/login',
++  });
++  harness.manager.batch = null;
++  harness.manager.driver = null;
+@@
++test('reuse-auth 将成功注销后的空认证状态传播给下一条用例', async () => {
++  const harness = createHarness();
++  harness.manager.authState.capture = async ({ lastUrl }) => ({
++    version: 1,
++    marker: lastUrl.endsWith('/logged-out') ? 'logged-out' : 'logged-in',
++    lastUrl,
++    cookies: lastUrl.endsWith('/logged-out') ? [] : [{ name: 'sid', value: 'active' }],
++    origins: [],
++  });
+@@
++  assert.equal(harness.restores.at(-1).marker, 'logged-in');
++  harness.tabs.get(second.tabId).url = 'https://app.example/logged-out';
+```
+
+### tests/cdp-session-audit-contract.test.js
+
+```diff
+@@
++test('执行历史会话审计白名单不包含浏览器内部标识或认证状态', async () => {
++  const source = await readFile(path.join(projectRoot, 'modules/player-manager.js'), 'utf8');
++  const start = source.indexOf('function buildSessionTransitionAudit');
++  const end = source.indexOf('\n}\n', start) + 3;
++  const auditFunction = source.slice(start, end);
++
++  assert.ok(start >= 0 && end > start);
+@@
++  assert.doesNotMatch(auditFunction, /contextId|targetId|tabId|cookie|snapshot/i);
++});
+```
+
+# 2026-08-11 新增 CueCast 产品更新日志
+
+## 涉及文件
+
+- docs/changelog.md
+- README.md
+- commit/git-commit-log.md
+
+## 变更原因
+
+CueCast 项目缺少面向使用者的产品更新日志，2026 年 5 月至 8 月的功能新增、体验优化和问题修复没有统一的仓库内文档入口。
+
+## 变更内容
+
+1. 新增产品更新日志，按时间倒序记录 2026-08、2026-07、2026-06 和 2026-05 的更新内容。
+2. 在 README 文档区增加更新日志和录制、回放与定位说明入口，方便从项目首页访问文档。
+
+## 验证
+
+- 本地 Markdown 结构校验通过：一级标题正确，月份按 `2026-08` 至 `2026-05` 倒序排列，各月条目数分别为 6、26、21、11。
+- README 中 `docs/changelog.md` 链接目标存在。
+- `git diff --check -- README.md` 通过；当前会话未连接 VibeAround，未执行浏览器 Markdown 预览。
+
+## 具体代码改动
+
+### `docs/changelog.md`
+
+```diff
+@@
++# 官方更新日志
++
++## 2026-08
++
++- 修复步骤数量超出限额时，保存步骤变少的问题。
++- 优化分组卡片 Base URL 展示：仅在超出宽度时省略。
++- 修复视觉隐藏的单选框和复选框回放。
++- 录制面板支持「记录悬浮」，可为需要 hover 才显示的菜单或浮层手动生成悬浮步骤。
++- 支持在创建用例时设置执行窗口尺寸。
++- 支持在用例列表页编辑分组详情。
+@@
++## 2026-07
+@@
++## 2026-06
+@@
++## 2026-05
+```
+
+### `README.md`
+
+```diff
+@@
+ Manifest V3 Chrome 扩展，实现录制与回放功能。
+
++## 文档
++
++- [更新日志](docs/changelog.md)
++- [录制、回放与定位说明](docs/recording-playback-and-locators.md)
++
+ ## 安装方法
+```
+
+# 2026-08-11 修复通知断言 XPath 偏移与 Runner 浮层过滤
+
+## 涉及文件
+
+- content/recorder.js
+- tests/v1_2_merge_contract.test.js
+- ../sakura-playwright/src/runner/semantic-locator-resolver.js
+- ../sakura-playwright/tests/integration/semantic-locator.test.js
+- ../sakura-playwright/docs/playwright-runner-stage-completion.md
+- commit/git-commit-log.md
+
+## 变更原因
+
+用户提供的真实 Trace 显示，Element UI toast 在断言步骤开始后曾经可见，`p.el-message__content` 首轮查询实际命中 1 个元素，但 Runner 因录制端保存的 `overlay=true` 与自身浮层识别规则不一致而将其过滤；toast 消失后最终诊断只保留了 0/0。与此同时，CueCast 录制工具栏是 `body` 直属 `div`，被绝对 XPath 计算计入下标，导致同一通知在录制页为 `/html/body/div[6]/p`、回放页为 `/html/body/div[5]/p`。
+
+## 变更内容
+
+1. CueCast 计算 XPath 时忽略扩展自身 `__at_*` 节点，保持录制定位与无扩展回放 DOM 的下标一致。
+2. CueCast 为 `p` 通知元素增加精确文本候选，保留 CSS/XPath 之外的回退定位事实。
+3. Runner 补齐 Element/Ant/Naive 通知类浮层，并兼容直属 `body` 的 fixed/absolute 浮层判定，使已命中的通知不再被错误过滤。
+4. 增加录制器契约测试和 Runner 固定通知浮层集成测试，并同步阶段完成记录。
+
+## 验证
+
+- `node --test tests/*.test.js`：CueCast 31/31 通过。
+- `npm run check`：Runner 通过。
+- `npm run test:unit`：86/86 通过。
+- `npm run test:locator`：15/15 通过。
+- 独立 CLI 真实复跑因 Admin 返回 401 登录态过期未进入浏览器步骤；未将该环境阻塞误判为代码结果。
+
+## 具体代码改动
+
+### `content/recorder.js`
+
+```diff
+@@
+-    // 文本候选：用于按钮、链接、菜单项等语义动作的回退定位
++    // 文本候选：用于按钮、链接、菜单项和通知文本等语义动作的回退定位
+@@
+-    if (text && ['button', 'a', 'li', 'label', 'span', 'div'].includes(tag)) {
++    if (text && ['button', 'a', 'li', 'label', 'span', 'div', 'p'].includes(tag)) {
+@@
++  function isRecorderOwnedElement(node) {
++    return node?.nodeType === Node.ELEMENT_NODE
++      && String(node.id || '').startsWith('__at_');
++  }
+@@
+-      const siblings = Array.from(cur.parentNode?.children || []).filter(s => s.tagName === cur.tagName);
++      const siblings = Array.from(cur.parentNode?.children || [])
++        .filter(s => s.tagName === cur.tagName && !isRecorderOwnedElement(s));
+```
+
+### `tests/v1_2_merge_contract.test.js`
+
+```diff
+@@
++test('录制器定位信息不受扩展 UI 干扰并支持通知文本回退', async () => {
++  const recorder = await readFile(projectFile('content/recorder.js'), 'utf8');
++  assert.match(recorder, /function isRecorderOwnedElement\(node\)/);
++  assert.match(recorder, /!isRecorderOwnedElement\(s\)/);
++  assert.match(recorder, /\['button', 'a', 'li', 'label', 'span', 'div', 'p'\]\.includes\(tag\)/);
++});
+```
+
+### `../sakura-playwright/src/runner/semantic-locator-resolver.js`
+
+```diff
+@@
+-    const overlay = element.closest?.('[role="dialog"],[role="alertdialog"],dialog,.ant-modal,.ant-modal-wrap,.el-dialog,.el-overlay,.el-popper,.ant-select-dropdown,.ivu-select-dropdown,.n-modal,[data-overlay="true"]');
++    let overlay = element.closest?.('[role="dialog"],[role="alertdialog"],dialog,.ant-modal,.ant-modal-wrap,.el-dialog,.el-overlay,.el-popper,.el-message,.ivu-select-dropdown,.ivu-message-notice,.ant-select-dropdown,.ant-message-notice,.n-modal,.n-message,[data-overlay="true"]');
++    if (!overlay) {
++      // Element UI Message 等通知直接挂在 body 且使用 fixed/absolute，录制端也按此规则标记浮层。
++      let current = element;
++      while (current && current !== document.body) {
++        if (current.parentElement === document.body) {
++          const style = window.getComputedStyle(current);
++          if (['fixed', 'absolute'].includes(style.position)) {
++            overlay = current;
++            break;
++          }
++        }
++        current = current.parentElement;
++      }
++    }
+```
+
+### `../sakura-playwright/tests/integration/semantic-locator.test.js`
+
+```diff
+@@
++test('Element Message fixed overlay remains eligible for an element assertion', async () => {
++  const page = await browser.newPage();
++  await page.setContent(`
++    <div class="el-message" style="position: fixed; top: 20px; left: 20px; display: block;">
++      <p class="el-message__content">系统无证书，请上传证书</p>
++    </div>
++  `);
++  const step = {
++    action_type: 'assert_element_match',
++    target_selector: 'p.el-message__content',
++    target_xpath: '/html/body/div[5]/p',
++    value: '系统无证书，请上传证书',
++    read_mode: 'text',
++    match_mode: 'contains',
++  };
++  const meta = {
++    version: 1,
++    candidates: [
++      { type: 'css_fallback', value: 'p.el-message__content', score: 0.72 },
++      { type: 'xpath_fallback', value: '/html/body/div[6]/p', score: 0.42 },
++    ],
++    context: { overlay: true, tag: 'p' },
++  };
++
++  const resolved = await resolveSemanticLocator(page, step, { timeoutMs: 500 }, meta);
++
++  assert.equal(resolved.matchedCount, 1);
++  assert.equal(resolved.visibleCount, 1);
++  assert.equal(await resolved.locator.textContent(), '系统无证书，请上传证书');
++  assert.equal(resolved.diagnostics.selected.source, 'locator_meta.candidates[0]');
++  await page.close();
++});
+```
+
+### `../sakura-playwright/docs/playwright-runner-stage-completion.md`
+
+```diff
+@@
++## 2026-08-11：Element Message 断言定位一致性修复
++
++### 完成情况
++
++| 事项 | 结果 |
++| --- | --- |
++| Element UI 通知浮层识别 | Runner 与 CueCast 对直属 `body` 的 `fixed/absolute` 通知使用同一浮层规则，`el-message` 不再因 `overlay=true` 被错误过滤 |
++| 录制 XPath 稳定性 | CueCast 计算绝对 XPath 时忽略自身 `__at_*` 工具栏和弹窗节点，避免录制页与回放页产生 `/div[6]` 与 `/div[5]` 的下标偏移 |
++| 通知文本回退 | `p` 元素断言保存 `text_exact` 和 `text_exact_tag` 候选，CSS/XPath 变化时仍可按通知文本定位 |
++
++### 验证
++
++- CueCast `node --test tests/*.test.js`：31/31 通过。
++- Runner `npm run check`：通过。
++- Runner `npm run test:unit`：86/86 通过。
++- Runner `npm run test:locator`：15/15 通过，新增固定 Element Message 浮层断言回归用例通过。
++- 用户执行 Trace `data/file/automation/playwright/AAS_P/V6.5B06D011/AAS_P_SMOKE_001/SCENE_CASE_006/20260811/20260811150048` 已确认 CSS 首轮命中但被浮层语义过滤；修复后本地回归复现为 `1/1`。
+```
+
+# 2026-08-10 同步 Playwright 专属下载断言目录字段契约
+
+## 涉及文件
+
+- .gitattributes
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+Admin 操作目录新增仅由 Playwright Runner 执行的“点击并校验浏览器下载文件”方法，目录表单字段总数由 117 增加到 124。CueCast 仍只执行原 63 个跨执行器方法，但通用执行详情契约会遍历完整目录表单，因此需要同步字段总数断言，避免把合法的 Playwright 专属字段误判为目录回归。真实 Runner 验证同时发现文本下载 fixture 会被 Windows 自动转换为 CRLF，导致固定 SHA256 与仓库 LF blob 不一致，因此需要固定测试下载文件的行尾规则。
+
+## 变更内容
+
+1. 将完整操作目录的 `form_schema` 字段总数断言更新为 124。
+2. 不修改 CueCast action 注册表、播放器或 Chrome 扩展执行能力，`assert_download` 仍仅由 Playwright Runner 执行。
+3. 固定 test-lab 文本下载 fixture 使用 LF，并明确二进制下载 fixture 不参与文本行尾转换，保证下载摘要跨平台一致。
+
+## 验证
+
+- `node --test tests/operation-contract.test.js`：通过，11/11。
+- Playwright Runner case 290：通过；文件名、MIME、大小、文本内容和 SHA256 校验均成功。
+
+## 具体代码改动
+
+### `.gitattributes`
+
+```diff
+@@
++/test-lab/downloads/*.txt text eol=lf
++/test-lab/downloads/*.bin binary
+```
+
+### `tests/operation-contract.test.js`
+
+```diff
+@@
+-  assert.equal(fieldCount, 117);
++  assert.equal(fieldCount, 124);
+```
+
 # 2026-08-08 修复录制动作运行适配、变量解析与 Admin 回传重试
 
 ## 涉及文件

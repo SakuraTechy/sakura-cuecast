@@ -540,11 +540,63 @@
    * XPath 多匹配时不能用 FIRST_ORDERED_NODE（文档顺序第一个常为隐藏模板，弹窗内「确定」在后面）。
    * 例：//span[normalize-space()='确定'] 应对所有匹配做弹窗/堆叠优先。
    */
-  function findBestXPathMatch(xpRaw) {
-    let x = xpRaw;
-    if (x && !x.startsWith('//') && !x.startsWith('/html') && !x.startsWith('/*')) {
-      x = `/${x}`;
+  function normalizeXPath(xpath) {
+    let normalized = String(xpath || '').trim();
+    if (/^xpath\s*=/i.test(normalized)) normalized = normalized.replace(/^xpath\s*=\s*/i, '').trim();
+    if (!normalized || isVolatileRcXPath(normalized)) return '';
+    return /^(?:html|body)\//i.test(normalized) ? `/${normalized}` : normalized;
+  }
+
+  function locatorError(code, message, details = {}) {
+    const error = new Error(`[${code}] ${message}`);
+    error.code = code;
+    error.locatorError = { code, message, ...details };
+    return error;
+  }
+
+  function unsupportedLocatorStrategy(value) {
+    const raw = String(value || '').trim();
+    const prefixed = /^(jquery|js(?:_path)?|jspath|testrigor)\s*=/i.exec(raw);
+    if (prefixed) return prefixed[1].toLowerCase();
+    if (/^\$\s*\(/.test(raw)) return 'jquery';
+    if (/^(?:document|window)\s*\.\s*(?:querySelector|querySelectorAll)\s*\(/i.test(raw)) return 'js';
+    return '';
+  }
+
+  function validateXPath(xpathRaw, source = 'target_xpath') {
+    const normalized = normalizeXPath(xpathRaw);
+    if (!normalized) return normalized;
+    try {
+      const result = document.evaluate(normalized, document, null, XPathResult.ANY_TYPE, null);
+      const nodeResultTypes = [
+        XPathResult.UNORDERED_NODE_ITERATOR_TYPE,
+        XPathResult.ORDERED_NODE_ITERATOR_TYPE,
+        XPathResult.UNORDERED_NODE_SNAPSHOT_TYPE,
+        XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
+        XPathResult.ANY_UNORDERED_NODE_TYPE,
+        XPathResult.FIRST_ORDERED_NODE_TYPE,
+      ];
+      if (!nodeResultTypes.includes(result.resultType)) {
+        throw locatorError('LOCATOR_XPATH_UNSUPPORTED', 'XPath result is not a node set', {
+          source,
+          raw_xpath: String(xpathRaw || '').trim(),
+          normalized_xpath: normalized,
+        });
+      }
+      return normalized;
+    } catch (error) {
+      if (error?.code) throw error;
+      throw locatorError('LOCATOR_XPATH_INVALID', String(error?.message || error || 'XPath evaluation failed'), {
+        source,
+        raw_xpath: String(xpathRaw || '').trim(),
+        normalized_xpath: normalized,
+      });
     }
+  }
+
+  function findBestXPathMatch(xpRaw) {
+    const x = normalizeXPath(xpRaw);
+    if (!x) return null;
     try {
       const result = document.evaluate(x, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
       const nodes = [];
@@ -555,8 +607,12 @@
       if (nodes.length === 0) return null;
       if (nodes.length === 1) return nodes[0];
       return pickTopmostDialogMatch(nodes);
-    } catch (e) {
-      return null;
+    } catch (error) {
+      throw locatorError('LOCATOR_XPATH_INVALID', String(error?.message || error || 'XPath evaluation failed'), {
+        source: 'xpath',
+        raw_xpath: String(xpRaw || '').trim(),
+        normalized_xpath: x,
+      });
     }
   }
 
@@ -1284,10 +1340,8 @@
   }
 
   function findXPathMatches(xpRaw) {
-    let x = xpRaw;
-    if (x && !x.startsWith('//') && !x.startsWith('/html') && !x.startsWith('/*')) {
-      x = `/${x}`;
-    }
+    const x = normalizeXPath(xpRaw);
+    if (!x) return [];
     try {
       const result = document.evaluate(x, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
       const nodes = [];
@@ -1296,8 +1350,12 @@
         if (n && n.nodeType === Node.ELEMENT_NODE) nodes.push(n);
       }
       return nodes;
-    } catch {
-      return [];
+    } catch (error) {
+      throw locatorError('LOCATOR_XPATH_INVALID', String(error?.message || error || 'XPath evaluation failed'), {
+        source: 'xpath',
+        raw_xpath: String(xpRaw || '').trim(),
+        normalized_xpath: x,
+      });
     }
   }
 
@@ -1343,7 +1401,7 @@
           const el = findTreeInteraction(value);
           if (el) return el;
         }
-        if (type === 'tree_node_text') {
+        if (type === 'tree_node_text' || type === 'tree_item_text') {
           const el = findTreeNodeByText(value);
           if (el) return el;
         }
@@ -1354,6 +1412,25 @@
 
   // 查找元素：非 #id 时优先 XPath；忽略 rc_* 自增 id（勾选后重渲染会变），必要时兜底 Ant Select 搜索框
   function findElement(selector, xpath, locatorMeta) {
+    const meta = parseLocatorMeta(locatorMeta);
+    const locatorValues = [
+      { value: selector, source: 'target_selector' },
+      { value: xpath, source: 'target_xpath' },
+      ...(Array.isArray(meta?.candidates) ? meta.candidates : []).map((candidate) => ({
+        value: candidate?.value,
+        source: `locator_meta.${String(candidate?.type || 'unknown')}`,
+        type: String(candidate?.type || '').trim().toLowerCase(),
+      })),
+    ];
+    const privateTypes = new Set(['jquery', 'js', 'js_path', 'jspath', 'testrigor']);
+    for (const item of locatorValues) {
+      const strategy = privateTypes.has(item.type) ? item.type : unsupportedLocatorStrategy(item.value);
+      if (!strategy) continue;
+      throw locatorError('LOCATOR_STRATEGY_UNSUPPORTED', `Unsupported locator strategy: ${strategy}`, {
+        source: item.source,
+        strategy,
+      });
+    }
     const ctx = getLocatorContext(locatorMeta);
     const fromMeta = findByLocatorMeta(locatorMeta);
     if (fromMeta) return fromMeta;
@@ -1884,6 +1961,11 @@
   }
 
   function waitForElement(selector, xpath, textFallback = '', timeout = 5000, skipDisabledCheck = false, locatorMeta = null, skipPageErrorCheck = false) {
+    try {
+      validateXPath(xpath, 'target_xpath');
+    } catch (error) {
+      return Promise.reject(error);
+    }
     return new Promise((resolve) => {
       let remaining = timeout;
       const wallEnd = Date.now() + LOADING_WAIT_WALL_MS;
@@ -2252,9 +2334,13 @@
         break;
       }
 
+      case 'assert_element_match':
       case 'assert_text': {
         const expected = step.value != null ? String(step.value) : '';
-        const hasLocator = String(step.target_selector || '').trim() !== '' || String(step.target_xpath || '').trim() !== '';
+        const hasLocator = String(step.target_selector || '').trim() !== ''
+          || String(step.target_xpath || '').trim() !== ''
+          || (Array.isArray(parseLocatorMeta(step.locator_meta)?.candidates)
+            && parseLocatorMeta(step.locator_meta).candidates.length > 0);
         const PREVIEW_MAX = 8000;
         const assertion = resolveAssertionConfig(step, hasLocator);
         if (assertion.match !== 'visible' && expected.trim() === '') {
@@ -2436,10 +2522,19 @@
   // 高亮当前执行的元素
   function highlightElement(step) {
     document.querySelectorAll('.__at_playing__').forEach(el => el.classList.remove('__at_playing__'));
-    const el = findElement(step.target_selector, step.target_xpath, step.locator_meta);
-    if (el) {
-      el.classList.add('__at_playing__');
-      setTimeout(() => el.classList.remove('__at_playing__'), 1000);
+    let el = null;
+    try {
+      el = findElement(step.target_selector, step.target_xpath, step.locator_meta);
+    } catch {
+      // 高亮不能抢先吞掉真正执行阶段的结构化定位错误。
+      return;
+    }
+    if (el && typeof el.animate === 'function') {
+      // 高亮不能修改 class/style；精确属性 XPath 会因此在真正执行前失效。
+      el.animate([
+        { outline: '3px solid #4caf50', outlineOffset: '2px' },
+        { outline: '3px solid #4caf50', outlineOffset: '2px' },
+      ], { duration: 1000, easing: 'linear' });
     }
   }
 
@@ -2475,7 +2570,13 @@
           done({ ok: true });
         } catch (err) {
           const msg = err && err.message != null ? String(err.message) : String(err);
-          done({ ok: false, error: msg, variable_extraction_error: err?.variableExtraction || null });
+          done({
+            ok: false,
+            error: msg,
+            error_code: err?.code || '',
+            locator_error: err?.locatorError || null,
+            variable_extraction_error: err?.variableExtraction || null,
+          });
         }
       })();
       return true; // 异步响应
@@ -2494,7 +2595,13 @@
           runtimeVariables[name] = extracted.value;
           sendResponse({ ok: true, name, value: extracted.value, raw_value: extracted.raw, extract: extracted.extract });
         } catch (err) {
-          sendResponse({ ok: false, error: err && err.message ? String(err.message) : String(err), variable_extraction_error: err?.variableExtraction || null });
+          sendResponse({
+            ok: false,
+            error: err && err.message ? String(err.message) : String(err),
+            error_code: err?.code || '',
+            locator_error: err?.locatorError || null,
+            variable_extraction_error: err?.variableExtraction || null,
+          });
         }
       })();
       return true;

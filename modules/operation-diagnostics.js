@@ -85,6 +85,9 @@ const RESULT_FACT_LABELS = Object.freeze({
   selected_option: '最终选项',
   filename: '文件名',
   file_count: '文件数量',
+  upload_status: '上传结果',
+  certificate_uploaded: '证书上传',
+  uploaded_certificate_files: '已上传证书文件',
   opened_page_url: '新页面地址',
   active_page_url: '当前页面地址',
 });
@@ -107,6 +110,7 @@ export function buildOperationDiagnostic(definitionStep = {}, runtimeStep = {}, 
   const profile = String(
     definitionStep.diagnostic_profile || definitionStep.diagnosticProfile || ACTION_PROFILES[actionType] || 'generic',
   );
+  const assertion = result.operation_assertion ? safeAssertion(result.operation_assertion) : null;
   const operation = {
     schema_version: 1,
     ...(firstText(definitionStep.catalog_version, runtimeStep.catalog_version)
@@ -125,18 +129,30 @@ export function buildOperationDiagnostic(definitionStep = {}, runtimeStep = {}, 
       action_type: actionType || 'custom',
     },
     summary: summaryFor(actionType),
-    inputs: collectInputs(definitionStep, runtimeStep),
+    // 断言的执行值是页面实际读取结果，不能继续把期望值误当成执行值。
+    inputs: applyAssertionActual(collectInputs(definitionStep, runtimeStep), profile, assertion),
     outcome: {
       kind: profile,
       status: result.status || 'unknown',
       summary: summaryFor(actionType),
       facts: collectFacts(result),
-      ...(result.operation_assertion ? { assertion: safeAssertion(result.operation_assertion) } : {}),
+      ...(assertion ? { assertion } : {}),
     },
   };
   const target = buildTarget(definitionStep, result);
   if (target) operation.target = target;
   return operation;
+}
+
+function applyAssertionActual(inputs, profile, assertion) {
+  if (profile !== 'assertion' || !assertion?.actual || assertion.actual.value_state === 'unavailable') {
+    return inputs;
+  }
+  return inputs.map((input) => {
+    const key = String(input?.key || '').toLowerCase();
+    const expected = input?.role === 'expected' || ['expect', 'regex', 'attribute'].includes(key);
+    return expected ? { ...input, actual: assertion.actual } : input;
+  });
 }
 
 function collectInputs(definitionStep, runtimeStep) {
@@ -155,8 +171,8 @@ function collectInputs(definitionStep, runtimeStep) {
       key,
       ...(field?.label ? { label: String(field.label) } : {}),
       role: inputRole(key, field),
-      ...(configured !== undefined ? { configured: display(key, configured, definitionStep, field) } : {}),
-      ...(effective !== undefined ? { effective: display(key, effective, runtimeStep, field) } : {}),
+      ...(configured !== undefined ? { configured: display(key, configured, definitionStep, field, false) } : {}),
+      ...(effective !== undefined ? { effective: display(key, effective, runtimeStep, field, false) } : {}),
       ...(source ? { source } : {}),
     };
   }).filter(Boolean);
@@ -202,7 +218,8 @@ function buildTarget(definitionStep, result) {
 
 function collectFacts(result) {
   return ['reloaded', 'wait_duration_ms', 'implicit_wait_ms', 'previous_implicit_wait_ms', 'exit_code', 'affected_rows',
-    'row_count', 'selected_option', 'filename', 'file_count', 'opened_page_url', 'active_page_url']
+    'row_count', 'selected_option', 'filename', 'file_count', 'upload_status', 'certificate_uploaded',
+    'uploaded_certificate_files', 'opened_page_url', 'active_page_url']
     .filter((key) => result[key] != null)
     .map((key) => ({
       key,
@@ -224,12 +241,15 @@ function safeAssertion(assertion) {
   return output;
 }
 
-function display(key, value, step, field = null) {
+function display(key, value, step, field = null, truncate = true) {
   if (step.value_masked === true || step.value_masked === 1 || SENSITIVE_KEY.test(key)) return { value_state: 'masked' };
+  if (key === 'certificate_uploaded') return { value_state: 'visible', preview: value === true ? '成功' : '失败' };
   if (field?.result_display === 'basename' || PATH_KEY.test(key)) return { value_state: 'visible', preview: basename(value) };
   if (field?.sensitivity === 'restricted' || field?.result_display === 'definition_endpoint' || RESTRICTED_KEY.test(key)) return { value_state: 'restricted' };
-  if (URL_KEY.test(key)) return { value_state: 'visible', preview: safeUrl(value) };
-  return { value_state: 'visible', preview: safeText(value) };
+  const text = truncate ? safeText : fullText;
+  if (URL_KEY.test(key)) return { value_state: 'visible', preview: safeUrl(value, truncate) };
+  if (Array.isArray(value)) return { value_state: 'visible', preview: text(value.join(', ')) };
+  return { value_state: 'visible', preview: text(value) };
 }
 
 function inputRole(key, field = null) {
@@ -267,7 +287,8 @@ function summaryFor(actionType) {
   return labels[actionType] || `动作 ${actionType || 'custom'} 执行完成`;
 }
 
-function safeUrl(value) {
+function safeUrl(value, truncate = true) {
+  const text = truncate ? safeText : fullText;
   try {
     const url = new URL(String(value));
     for (const key of [...url.searchParams.keys()]) {
@@ -275,19 +296,34 @@ function safeUrl(value) {
     }
     url.username = '';
     url.password = '';
-    return safeText(url.toString());
+    return text(url.toString());
   } catch {
-    return safeText(value).replace(/([?&](?:token|key|code|password|secret)=[^&]*)/gi, '$1******');
+    return text(value).replace(/([?&](?:token|key|code|password|secret)=[^&]*)/gi, '$1******');
   }
 }
 
 function basename(value) {
-  return String(value).split(/[\\/]/).filter(Boolean).at(-1) || String(value);
+  if (value && typeof value === 'object') {
+    const fileName = value.file_name || value.fileName || value.original_name || value.originalName
+      || value.name || value.path || value.local_path || value.localPath;
+    if (fileName) return basename(fileName);
+    if (value.scope === 'project_environment') {
+      const slot = value.slot_id || value.slotId;
+      return slot ? `环境证书角色（${slot}）` : '环境证书角色';
+    }
+    return safeText(JSON.stringify(value));
+  }
+  const text = String(value);
+  return text.split(/[\\/]/).filter(Boolean).at(-1) || text;
 }
 
 function safeText(value) {
+  return fullText(value).slice(0, 512);
+}
+
+function fullText(value) {
   return String(value == null ? '' : typeof value === 'object' ? JSON.stringify(value) : value)
-    .replace(/[\r\n]+/g, ' ').slice(0, 512);
+    .replace(/[\r\n]+/g, ' ');
 }
 
 function firstText(...values) {

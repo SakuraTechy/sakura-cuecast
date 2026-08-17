@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -6,6 +7,11 @@ import {
   isCuecastCdpAction,
 } from '../modules/canonical-action-registry.js';
 import { PlayerManager } from '../modules/player-manager.js';
+
+const locatorContract = JSON.parse(fs.readFileSync(new URL(
+  './fixtures/locator-contract-v1.json',
+  import.meta.url,
+), 'utf8'));
 
 function createManager() {
   const originalChrome = globalThis.chrome;
@@ -37,6 +43,85 @@ test('元素断言表达式检查真实可见性并按 read_mode 读取值', () 
   assert.match(expression, /Number\(style\.opacity\) <= 0/);
   assert.match(expression, /rect\.width <= 0 \|\| rect\.height <= 0/);
   assert.match(expression, /'value' in el/);
+});
+
+test('括号 XPath 在所有 CDP 表达式中保持原样并复用 locator_meta 候选', () => {
+  const xpath = "(//span[@class='user-title'])[1]";
+  assert.equal(PlayerManager._normalizeXPath(xpath), xpath);
+  assert.equal(PlayerManager._normalizeXPath('.//span[@class="user-title"]'), './/span[@class="user-title"]');
+  assert.equal(PlayerManager._normalizeXPath('html/body/main/span[1]'), '/html/body/main/span[1]');
+
+  const expression = PlayerManager._buildElementAssertionExpr(
+    '',
+    xpath,
+    'text',
+    { candidates: [{ type: 'css_attr_data-qa', value: "[data-qa='user-title']", score: 0.97 }] },
+  );
+  assert.match(expression, /data-qa/);
+  assert.match(expression, /locator_meta|meta-css_attr_data-qa/);
+  assert.doesNotMatch(expression, /\/\(\/\/span/);
+});
+
+test('XPath 校验表达式区分语法错误与非节点结果', () => {
+  const expression = PlayerManager._xpathValidationExpr("(//span[@class='user-title'])[1]");
+  assert.match(expression, /LOCATOR_XPATH_INVALID/);
+  assert.match(expression, /LOCATOR_XPATH_UNSUPPORTED/);
+});
+
+test('CDP Runtime.evaluate 使用当前 iframe execution context', async () => {
+  const manager = createManager();
+  const originalChrome = globalThis.chrome;
+  let sentParams = null;
+  globalThis.chrome = {
+    debugger: {
+      sendCommand(_target, _method, params, callback) {
+        sentParams = params;
+        callback({ result: { value: true } });
+      },
+    },
+    runtime: { lastError: null },
+  };
+  manager._frameContextByTab.set(7, { contextId: 42 });
+  try {
+    await manager._cdpSend(7, 'Runtime.evaluate', { expression: '1 + 1', returnByValue: true });
+    assert.equal(sentParams.contextId, 42);
+    assert.equal(sentParams.expression, '1 + 1');
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test('录制器候选类型在 CDP 点击与断言 resolver 中都有明确处理', () => {
+  const manager = createManager();
+  const candidateTypes = locatorContract.candidates.map((candidate) => candidate.type);
+  assert.deepEqual(candidateTypes, [
+    ...locatorContract.recorder_candidate_types,
+    ...locatorContract.compatibility_candidate_types,
+  ]);
+
+  for (const candidate of locatorContract.candidates) {
+    const meta = { candidates: [candidate] };
+    const clickExpression = manager._buildFindCode('', '', '', false, meta);
+    const assertionExpression = PlayerManager._buildDomTargetResultChain('', '', meta);
+    assert.notEqual(clickExpression, 'null', `click resolver 未处理 ${candidate.type}`);
+    assert.notEqual(assertionExpression, 'null', `assert resolver 未处理 ${candidate.type}`);
+  }
+});
+
+test('CDP 前置校验明确拒绝 jQuery、JS Path 和 testRigor 私有定位器', async () => {
+  const manager = createManager();
+  manager._cdpSend = async () => ({ result: { value: { ok: true } } });
+
+  for (const targetSelector of [
+    "jquery=$('.user-title')",
+    "document.querySelector('.user-title')",
+    'testrigor=click "登录"',
+  ]) {
+    await assert.rejects(
+      () => manager._validateStepXpathsCDP(1, { target_selector: targetSelector }),
+      (error) => error?.code === 'LOCATOR_STRATEGY_UNSUPPORTED',
+    );
+  }
 });
 
 test('统一元素断言复用 CDP 文本断言语义并读取 expect 字段', async () => {

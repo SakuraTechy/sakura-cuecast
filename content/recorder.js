@@ -838,9 +838,9 @@
       }
     }
 
-    // 文本候选：用于按钮、链接、菜单项等语义动作的回退定位
+    // 文本候选：用于按钮、链接、菜单项和通知文本等语义动作的回退定位
     const text = safeText(stepValue || el?.textContent || '');
-    if (text && ['button', 'a', 'li', 'label', 'span', 'div'].includes(tag)) {
+    if (text && ['button', 'a', 'li', 'label', 'span', 'div', 'p'].includes(tag)) {
       pushLocatorCandidate(candidates, {
         type: 'text_exact',
         value: text.slice(0, 120),
@@ -1320,6 +1320,11 @@
     return false;
   }
 
+  function isRecorderOwnedElement(node) {
+    return node?.nodeType === Node.ELEMENT_NODE
+      && String(node.id || '').startsWith('__at_');
+  }
+
   function getXPath(el) {
     // 易变 id 不用 //*[@id=]，否则勾选后重渲染 id 变了永远找不到
     if (el.id && !isVolatileAutoId(el.id)) {
@@ -1441,7 +1446,9 @@
     let reachedRoot = false;
     while (cur && cur.nodeType === Node.ELEMENT_NODE) {
       const tag = cur.tagName.toLowerCase();
-      const siblings = Array.from(cur.parentNode?.children || []).filter(s => s.tagName === cur.tagName);
+      // 录制工具栏/弹窗属于扩展 UI，回放页面不存在，不能参与业务元素下标计算。
+      const siblings = Array.from(cur.parentNode?.children || [])
+        .filter(s => s.tagName === cur.tagName && !isRecorderOwnedElement(s));
       const idx = siblings.indexOf(cur);
       // idx === -1：元素已卸载，兄弟列表中找不到自己，不加位置索引
       parts.unshift(siblings.length > 1 && idx >= 0 ? `${tag}[${idx + 1}]` : tag);

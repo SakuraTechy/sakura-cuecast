@@ -111,6 +111,10 @@ test('v1.2 合并后 bridge 与 background 保持录制协议对称', async () =
     'AT_PLATFORM_RETRY_RECORDING',
     'AT_PLATFORM_SAVE_RECORDING_TRIMMED',
     'AT_PLATFORM_DISCARD_RECORDING_SAVE',
+    'AT_PLATFORM_CDP_CAPABILITIES',
+    'AT_PLATFORM_BEGIN_PLAYBACK_BATCH',
+    'AT_PLATFORM_END_PLAYBACK_BATCH',
+    'AT_PLATFORM_ABORT_PLAYBACK_BATCH',
     'AT_PLATFORM_CHECK_SELECTOR',
   ];
   for (const command of commands) {
@@ -120,6 +124,15 @@ test('v1.2 合并后 bridge 与 background 保持录制协议对称', async () =
   assert.match(background, /recordingImport:\s*message\.recordingImport/);
   assert.match(background, /windowPreference,\s*\n\s*reuseTabId/);
   assert.match(background, /injectBridgeIntoOpenTabs\(\{ force: true \}\)/);
+  assert.match(bridge, /original: data\.type, nonce: data\.nonce/);
+});
+
+test('录制器定位信息不受扩展 UI 干扰并支持通知文本回退', async () => {
+  const recorder = await readFile(projectFile('content/recorder.js'), 'utf8');
+
+  assert.match(recorder, /function isRecorderOwnedElement\(node\)/);
+  assert.match(recorder, /!isRecorderOwnedElement\(s\)/);
+  assert.match(recorder, /\['button', 'a', 'li', 'label', 'span', 'div', 'p'\]\.includes\(tag\)/);
 });
 
 test('录制结束事件携带唯一 eventId，便于中台多实例去重', () => {

@@ -3,6 +3,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   apiBase: 'http://localhost:3000/api',
   authToken: '',
   dashboardUrl: 'https://app.icuecast.com/dashboard',
+  cleanupExecutionFilesOnBatchEnd: true,
 });
 
 const refs = {
@@ -10,6 +11,7 @@ const refs = {
   apiBase: document.getElementById('apiBase'),
   authToken: document.getElementById('authToken'),
   dashboardUrl: document.getElementById('dashboardUrl'),
+  cleanupExecutionFilesOnBatchEnd: document.getElementById('cleanupExecutionFilesOnBatchEnd'),
   reset: document.getElementById('resetSettings'),
   status: document.getElementById('status'),
 };
@@ -24,6 +26,7 @@ function normalizedSettings(raw = {}) {
     apiBase: normalizeUrl(raw.apiBase, DEFAULT_SETTINGS.apiBase),
     authToken: String(raw.authToken ?? '').trim(),
     dashboardUrl: normalizeUrl(raw.dashboardUrl, DEFAULT_SETTINGS.dashboardUrl),
+    cleanupExecutionFilesOnBatchEnd: raw.cleanupExecutionFilesOnBatchEnd !== false,
   };
 }
 
@@ -36,6 +39,7 @@ function fillForm(settings) {
   refs.apiBase.value = settings.apiBase;
   refs.authToken.value = settings.authToken;
   refs.dashboardUrl.value = settings.dashboardUrl;
+  refs.cleanupExecutionFilesOnBatchEnd.checked = settings.cleanupExecutionFilesOnBatchEnd;
 }
 
 async function loadSettings() {
@@ -49,6 +53,7 @@ async function saveSettings(event) {
     apiBase: refs.apiBase.value,
     authToken: refs.authToken.value,
     dashboardUrl: refs.dashboardUrl.value,
+    cleanupExecutionFilesOnBatchEnd: refs.cleanupExecutionFilesOnBatchEnd.checked,
   });
   await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
   fillForm(settings);

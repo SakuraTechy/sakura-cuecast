@@ -19,6 +19,7 @@ import { attachOperationDiagnostic } from './operation-diagnostics.js';
 
 /** 改为 true 后：打开扩展 Service Worker 控制台可看到 AI 步骤的节点数与操作计划 */
 const DEBUG_AI_NATURAL = false;
+const EXECUTION_FILE_DOWNLOADS_KEY = 'cuecastExecutionFileDownloadsByBatch';
 
 /** 与后端/库里的 action_type 对齐（去空格、小写），避免编辑保存时偶发空格导致不走智能分支 */
 function isAiNaturalStep(step) {
@@ -63,6 +64,25 @@ function normalizeLocale(locale) {
 
 function trByLocale(locale, zh, en) {
   return normalizeLocale(locale) === 'en' ? (en || zh) : zh;
+}
+
+/** 执行历史只保存会话决策，不保存 Context、target、tab 或认证状态标识。 */
+function buildSessionTransitionAudit(transition, opts = {}) {
+  const source = transition && typeof transition === 'object' ? transition : {};
+  const requestedMode = String(source.requestedMode || opts.sessionMode || '');
+  const appliedMode = String(source.appliedMode || opts.sessionMode || '');
+  const browserSessionSource = String(source.browserSessionSource || opts.browserSessionSource || '');
+  if (!requestedMode && !appliedMode && !browserSessionSource) return null;
+  return {
+    requestedMode,
+    appliedMode,
+    browserSessionSource,
+    reset: source.reset === true,
+    resetCount: Number(source.resetCount) || 0,
+    resetReason: String(source.resetReason || ''),
+    navigationDecision: String(source.navigationDecision || opts.navigationDecision || ''),
+    authStateCommitted: source.authStateCommitted === true,
+  };
 }
 
 function formatPlatformDateTime(value = new Date()) {
@@ -300,6 +320,7 @@ export function resolvePlaybackRuntimeConfig(testCase, opts = {}, useAdminCase =
       executionConfig: { ...rawEffectiveConfig },
       startUrl: String(rawEffectiveConfig.start_url || '').trim(),
       browserBootstrapMode: browserBootstrap.mode,
+      ignoreHttpsErrors: enabledFlag(rawEffectiveConfig.ignore_https_errors),
       windowSizeMode: rawEffectiveConfig.window_size_mode,
       viewportWidth: rawEffectiveConfig.viewport_width,
       viewportHeight: rawEffectiveConfig.viewport_height,
@@ -314,6 +335,7 @@ export function resolvePlaybackRuntimeConfig(testCase, opts = {}, useAdminCase =
     executionConfig: null,
     startUrl: String(opts.startUrl ?? testCase?.start_url ?? testCase?.startUrl ?? '').trim(),
     browserBootstrapMode: 'launch',
+    ignoreHttpsErrors: enabledFlag(opts.ignoreHttpsErrors ?? testCase?.ignore_https_errors ?? false),
     windowSizeMode: opts.viewportMode ?? testCase?.window_size_mode ?? testCase?.viewport_mode,
     viewportWidth: opts.viewportWidth ?? testCase?.viewport_width,
     viewportHeight: opts.viewportHeight ?? testCase?.viewport_height,
@@ -347,6 +369,8 @@ export class PlayerManager {
     this._playContexts = new Set();
     /** @type {Map<number, number>} */
     this._playTabByCaseId = new Map();
+    /** Admin 执行文件按批次保留到 END/ABORT，避免网页后续提交时文件已被删除。 */
+    this._executionFileDownloadsByBatch = new Map();
     // MV3 Service Worker 生命周期较短；同一 Admin 会话内限频上报，唤醒或换会话后会重新握手。
     this._capabilityHandshake = null;
     // 以下状态按受控 tab 隔离，避免并发回放之间的 iframe、隐式等待和鼠标坐标互相污染。
@@ -383,6 +407,54 @@ export class PlayerManager {
       (m.includes('Cannot access') && m.includes('chrome-extension'))
       || m.includes('different extension')
     );
+  }
+
+  async _registerExecutionFileDownloads(batchId, downloadIds) {
+    const normalizedBatchId = String(batchId || '').trim();
+    const ids = (Array.isArray(downloadIds) ? downloadIds : [])
+      .filter((id) => id != null)
+      .map((id) => Number(id))
+      .filter((id) => Number.isInteger(id) && id > 0);
+    if (!normalizedBatchId || !ids.length) return;
+    const current = this._executionFileDownloadsByBatch.get(normalizedBatchId) || [];
+    const merged = [...new Set([...current, ...ids])];
+    this._executionFileDownloadsByBatch.set(normalizedBatchId, merged);
+    const session = chrome.storage?.session;
+    if (!session?.get || !session?.set) return;
+    const stored = await session.get(EXECUTION_FILE_DOWNLOADS_KEY).catch(() => ({}));
+    const persisted = stored?.[EXECUTION_FILE_DOWNLOADS_KEY] || {};
+    persisted[normalizedBatchId] = [...new Set([...(persisted[normalizedBatchId] || []), ...merged])];
+    await session.set({ [EXECUTION_FILE_DOWNLOADS_KEY]: persisted });
+  }
+
+  async cleanupExecutionFiles(batchId, options = {}) {
+    const normalizedBatchId = String(batchId || '').trim();
+    if (!normalizedBatchId) return;
+    const removeFiles = options.removeFiles !== false;
+    const session = chrome.storage?.session;
+    const stored = session?.get
+      ? await session.get(EXECUTION_FILE_DOWNLOADS_KEY).catch(() => ({}))
+      : {};
+    const persisted = stored?.[EXECUTION_FILE_DOWNLOADS_KEY] || {};
+    const downloadIds = [...new Set([
+      ...(this._executionFileDownloadsByBatch.get(normalizedBatchId) || []),
+      ...(persisted[normalizedBatchId] || []),
+    ])];
+    if (removeFiles && downloadIds.length) {
+      await Promise.all(downloadIds.map((id) => this.api.cleanupExecutionFile(id)));
+    }
+    this._executionFileDownloadsByBatch.delete(normalizedBatchId);
+    if (session?.set) {
+      delete persisted[normalizedBatchId];
+      await session.set({ [EXECUTION_FILE_DOWNLOADS_KEY]: persisted }).catch(() => {});
+    }
+  }
+
+  /** 页面异步重渲染会使 DOM nodeId/objectId 失效，文件上传可重新定位后安全重试。 */
+  static _isCdpStaleFileInputError(err) {
+    const message = String(err?.message || err).toLowerCase();
+    return message.includes('could not find node with given id')
+      || message.includes('could not find object with given id');
   }
 
   /**
@@ -582,6 +654,11 @@ export class PlayerManager {
     const runLocale = normalizeLocale(opts.locale);
     let ctx = null;
     let playTabId = null;
+    let browserSessionFinalized = false;
+    let browserSessionPrepared = false;
+    let sessionTransition = null;
+    let sessionNavigationDecision = '';
+    let sessionErrorCode = '';
     let playbackEndPayload = {
       type: 'AT_PLAYBACK_END',
       testCaseId,
@@ -766,6 +843,7 @@ export class PlayerManager {
         caseDeadline,
         startStepIndex,
         stopAfterStepIndex,
+        batchId: String(opts.batchId || '').trim(),
         keepTabOpenAfterPlayback: opts.keepTabOpenAfterPlayback === true,
         suppressResultSave: opts.suppressResultSave === true,
         playbackPurpose: String(opts.purpose || ''),
@@ -773,6 +851,7 @@ export class PlayerManager {
         managedWindowId: null,
         managedTabIds: new Set(),
         initialManagedTabId: null,
+        ignoreHttpsErrors: runtimeConfig.ignoreHttpsErrors,
         executionCapability: String(opts.executionCapability || ''),
         infrastructureTaskIds: new Set(),
       };
@@ -785,12 +864,30 @@ export class PlayerManager {
 
       let cdpAvailable = false;
       if (browserBootstrap.initializeBrowser) {
-        const reuseTabId = runtimeConfig.frozen
+        const preparedSession = typeof opts.prepareBrowserSession === 'function'
+          ? await opts.prepareBrowserSession({
+              startUrl: targetUrl,
+              ignoreHttpsErrors: runtimeConfig.ignoreHttpsErrors,
+              windowPreference,
+              sessionMode: opts.sessionMode,
+              browserSessionSource: opts.browserSessionSource,
+            })
+          : null;
+        const preparedTabId = preparedSession?.tabId ?? null;
+        const initialNavigationUrl = String(preparedSession?.navigationUrl || targetUrl);
+        const skipInitialNavigation = preparedSession?.skipInitialNavigation === true;
+        browserSessionPrepared = Boolean(preparedSession);
+        sessionNavigationDecision = String(preparedSession?.sessionTransition || '');
+        for (const managedTabId of preparedSession?.managedTabIds || []) {
+          if (Number.isInteger(Number(managedTabId))) ctx.managedTabIds.add(Number(managedTabId));
+        }
+        const reuseTabId = preparedTabId ?? (runtimeConfig.frozen
           ? (browserBootstrap.mode === 'attach' ? opts.reuseTabId ?? null : null)
-          : opts.reuseTabId ?? null;
+          : opts.reuseTabId ?? null);
         if (browserBootstrap.mode === 'attach' && reuseTabId == null) {
           throw new Error('browser_bootstrap_mode=attach 缺少经过授权的受控标签页');
         }
+        if (preparedSession?.keepTabOpenAfterPlayback === true) ctx.keepTabOpenAfterPlayback = true;
 
         broadcastProgress('browser-started', {
           log: { level: 'info', phase: 'browser', message: '正在初始化 CDP 浏览器' },
@@ -798,7 +895,8 @@ export class PlayerManager {
         if (reuseTabId != null) {
           playTabId = reuseTabId;
           ctx.tabId = playTabId;
-          ctx.reusedTab = true;
+          // 受控无痕会话的 tab 属于本批次，可由用例关闭；legacy 复用页仍按用户标签页保护。
+          ctx.reusedTab = preparedTabId == null;
           const reuseTab = await chrome.tabs.get(playTabId).catch(() => null);
           if (!reuseTab) {
             throw new Error(`复用回放标签页不存在：${playTabId}`);
@@ -808,10 +906,10 @@ export class PlayerManager {
           ctx.initialManagedTabId = playTabId;
           ctx.activeTabId = playTabId;
           if (reuseTab.windowId != null) await applyWindowPreference(reuseTab.windowId, windowPreference);
-          await chrome.tabs.update(playTabId, { url: targetUrl, active: true });
         } else {
           const active = opts.backgroundTab !== true;
-          const win = await chrome.windows.create(buildWindowCreateData(targetUrl, active, windowPreference));
+          // 先停留在空白页，确保 CDP 证书策略在首次业务导航前已经生效。
+          const win = await chrome.windows.create(buildWindowCreateData('about:blank', active, windowPreference));
           const tab = win.tabs?.[0];
           if (!tab?.id) throw new Error('创建回放标签页失败');
           playTabId = tab.id;
@@ -823,9 +921,21 @@ export class PlayerManager {
         }
         ctx.tabRegistry.set(0, {
           tabId: playTabId,
-          url: targetUrl,
+          url: skipInitialNavigation
+            ? String((await chrome.tabs.get(playTabId).catch(() => null))?.url || initialNavigationUrl)
+            : initialNavigationUrl,
           openerIndex: null,
         });
+        cdpAvailable = await this._attachDebugger(playTabId, ctx);
+        if (useAdminCase && !cdpAvailable) {
+          // admin 入口定义为扩展 CDP 回放，不能静默降级 DOM 后仍报告成功；旧本地 mock 路径继续保留降级能力。
+          throw new Error(`admin 扩展 CDP 无法初始化回放标签页：${ctx.cdpAttachError || '未知错误'}`);
+        }
+        if (skipInitialNavigation) {
+          await chrome.tabs.update(playTabId, { active: true });
+        } else {
+          await chrome.tabs.update(playTabId, { url: initialNavigationUrl, active: true });
+        }
         const viewportLabel = windowPreference.width && windowPreference.height
           ? `${windowPreference.width}x${windowPreference.height}`
           : windowPreference.mode;
@@ -840,7 +950,13 @@ export class PlayerManager {
           log: { level: 'success', phase: 'live', message: '实时画面已启用，来源=CDP' },
         });
         broadcastProgress('navigation-started', {
-          log: { level: 'info', phase: 'navigation', message: `正在打开用例起始页面：${targetUrl}` },
+          log: {
+            level: 'info',
+            phase: 'navigation',
+            message: preparedSession?.skipInitialNavigation === true
+              ? '正在接管批次受控页面'
+              : `正在打开用例起始页面：${targetUrl}`,
+          },
         });
         await this._bringTabToForeground(playTabId);
         await this._waitForTabLoad(playTabId, tabLoadTimeoutMs);
@@ -863,12 +979,6 @@ export class PlayerManager {
           throw new Error(
             `起始页为浏览器内置协议，无法注入回放脚本：${urlAfterLoad}\n请改为 http(s) 页面。`,
           );
-        }
-
-        cdpAvailable = await this._attachDebugger(playTabId, ctx);
-        if (useAdminCase && !cdpAvailable) {
-          // admin 入口定义为扩展 CDP 回放，不能静默降级 DOM 后仍报告成功；旧本地 mock 路径继续保留降级能力。
-          throw new Error(`admin 扩展 CDP 无法附加到回放标签页：${ctx.cdpAttachError || '未知错误'}`);
         }
 
         try {
@@ -910,9 +1020,27 @@ export class PlayerManager {
       const aiSubtasksByStep = {};
       const stepResults = [];
       const appendStepResult = (step, index, status, startedAt, error = '', locator = null, executorResult = null, stepDetails = {}) => {
+        const definitionStep = PlayerManager._adaptRecordedStep(steps[index] || step);
+        const normalizedStepDetails = stepDetails && typeof stepDetails === 'object' ? stepDetails : {};
+        const { operation_assertion: configuredOperationAssertion, ...persistedStepDetails } = normalizedStepDetails;
+        const operationAssertion = configuredOperationAssertion || locator?.operationAssertion;
+        const operationFacts = locator?.operationFacts && typeof locator.operationFacts === 'object'
+          ? locator.operationFacts
+          : {};
+        const resultLocator = locator && typeof locator === 'object' && locator.source ? locator : null;
+        const durationMs = Math.max(0, Date.now() - startedAt);
+        const cdpLocatorDiagnostics = PlayerManager._buildCdpLocatorDiagnostics(
+          definitionStep,
+          resultLocator,
+          status,
+          durationMs,
+        );
         const details = {
           ...(executorResult?.infrastructure ? { infrastructure: executorResult.infrastructure } : {}),
-          ...(stepDetails && typeof stepDetails === 'object' ? stepDetails : {}),
+          ...persistedStepDetails,
+          ...(cdpLocatorDiagnostics && !persistedStepDetails.locator_diagnostics
+            ? { locator_diagnostics: cdpLocatorDiagnostics }
+            : {}),
         };
         let result = {
           step_id: step?.id ?? '',
@@ -922,13 +1050,15 @@ export class PlayerManager {
           target_selector: step?.target_selector || '',
           target_xpath: step?.target_xpath || '',
           status,
-          duration_ms: Math.max(0, Date.now() - startedAt),
-          ...(locator ? {
-            locator_source: locator.source || '',
-            locator_type: locator.type || '',
-            locator_value: locator.value || '',
-            matched_count: locator.matchedCount ?? null,
+          duration_ms: durationMs,
+          ...(resultLocator ? {
+            locator_source: resultLocator.source || '',
+            locator_type: resultLocator.type || '',
+            locator_value: resultLocator.value || '',
+            matched_count: resultLocator.matchedCount ?? null,
+            visible_count: resultLocator.visibleCount ?? null,
           } : {}),
+          ...(stepDetails?.error_code ? { error_code: stepDetails.error_code } : {}),
           ...(executorResult ? {
             executor: executorResult.executor || 'infrastructure-service',
             infrastructure_task_id: executorResult.taskId || '',
@@ -936,9 +1066,11 @@ export class PlayerManager {
             affected_rows: executorResult.affectedRows ?? null,
           } : {}),
           ...(error ? { error } : {}),
+          ...operationFacts,
+          ...(operationAssertion && typeof operationAssertion === 'object' ? { operation_assertion: operationAssertion } : {}),
           ...(Object.keys(details).length ? { details } : {}),
         };
-        result = attachOperationDiagnostic(result, step, step, { executor: 'extension-cdp' });
+        result = attachOperationDiagnostic(result, definitionStep, step, { executor: 'extension-cdp' });
         stepResults.push(result);
         broadcastProgress('step-finished', {
           stepIndex: index,
@@ -950,6 +1082,7 @@ export class PlayerManager {
           locatorType: result.locator_type || '',
           locatorValue: result.locator_value || '',
           matchedCount: result.matched_count ?? null,
+          visibleCount: result.visible_count ?? null,
           ...(executorResult ? {
             executor: result.executor,
             taskId: result.infrastructure_task_id,
@@ -978,6 +1111,7 @@ export class PlayerManager {
                 result.locator_type ? `定位类型=${result.locator_type}` : '',
                 result.locator_value ? `定位元素=${result.locator_value}` : '',
                 result.matched_count != null ? `命中=${result.matched_count}` : '',
+                result.visible_count != null ? `可见=${result.visible_count}` : '',
               ].filter(Boolean).join('，'),
               detail: true,
             },
@@ -1113,7 +1247,7 @@ export class PlayerManager {
             const localResult = await this._executeLocalVariableAction(playTabId, executableStep, variableContext);
             if (localResult?.variable) variableResultsByStep[String(i)] = localResult.variable;
             throwIfCaseTimedOut();
-            appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', null, null, {
+            appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', localResult?.locator || null, null, {
               ...(localResult?.variable ? { variable: localResult.variable } : {}),
               ...(runtimeVariableReferences.length ? { variable_references: runtimeVariableReferences } : {}),
             });
@@ -1219,11 +1353,14 @@ export class PlayerManager {
             await this._executeAssertJsonStep(playTabId, executableStep, testCaseId);
           } else if (String(executableStep.action_type || '').trim().toLowerCase() === 'assert_text' && cdpAvailable) {
             // 必须在后台用 CDP 直接断言：依赖 tabs.sendMessage 回包易丢，导致失败被当成成功
-            await this._executeAssertTextStepCDP(playTabId, executableStep);
+            await this._validateStepXpathsCDP(playTabId, executableStep);
+            actualLocator = await this._executeAssertTextStepCDP(playTabId, executableStep);
           } else if (cdpAvailable && this._canUseCDP(executableStep)) {
             try {
               actualLocator = await this._executeStepCDP(playTabId, executableStep, targetUrl, ctx.locale, runtimeNextStep, {
                 beforeActionScreenshot: captureCurrentStep,
+                executionCapability: ctx.executionCapability,
+                executionBatchId: ctx.batchId,
               });
             } catch (cdpErr) {
               if (PlayerManager._isCdpForeignExtensionError(cdpErr) && !useAdminCase) {
@@ -1254,6 +1391,15 @@ export class PlayerManager {
           errorMsg = localizePlaybackError(ctx.locale, enhancedErrMsg);
           errorStep = i;
           const variableExtractionError = err?.variableExtraction || err?.variable_extraction_error || null;
+          const operationAssertion = err?.operationAssertion && typeof err.operationAssertion === 'object'
+            ? err.operationAssertion
+            : null;
+          const assertionLocator = err?.actualLocator && typeof err.actualLocator === 'object'
+            ? err.actualLocator
+            : null;
+          const locatorError = err?.locatorError && typeof err.locatorError === 'object'
+            ? err.locatorError
+            : null;
           if (isAiNaturalStep(runtimeStep) && Array.isArray(err?.aiSubtasks) && err.aiSubtasks.length) {
             aiSubtasksByStep[String(i)] = err.aiSubtasks;
           }
@@ -1284,8 +1430,11 @@ export class PlayerManager {
           } else {
             failureContext = { error_message: errorMsg, error_step_index: i, url: targetUrl, cdp_unavailable: true, runtime_variables: runtimeVariableEvents, variable_resolution: resolvedStepInfo.trace, ...(variableExtractionError ? { variable_extraction_error: variableExtractionError } : {}) };
           }
-          appendStepResult(runtimeStep, i, 'failed', stepStartedAt, errorMsg, null, null, {
+          if (failureContext && locatorError) failureContext.locator_error = locatorError;
+          appendStepResult(runtimeStep, i, 'failed', stepStartedAt, errorMsg, assertionLocator, null, {
             ...(runtimeVariableReferences.length ? { variable_references: runtimeVariableReferences } : {}),
+            ...(locatorError ? { error_code: locatorError.code, locator_error: locatorError } : {}),
+            ...(operationAssertion ? { operation_assertion: operationAssertion } : {}),
           });
           break;
         } finally {
@@ -1319,8 +1468,43 @@ export class PlayerManager {
         0,
       );
       const duration = Date.now() - runStartedAt;
-      const success = !errorMsg;
-      playbackOutcome = { ok: success, duration, error: errorMsg || '' };
+      let success = !errorMsg;
+      if (typeof opts.finalizeBrowserSession === 'function') {
+        const debuggerTabId = ctx.activeTabId ?? playTabId;
+        if (ctx.debuggerAttached && debuggerTabId != null) {
+          await this._detachDebugger(debuggerTabId, ctx);
+        }
+        const managedTabs = await this._refreshManagedTabs(ctx).catch(() => []);
+        const finalTab = await chrome.tabs.get(playTabId).catch(() => null);
+        try {
+          sessionTransition = await opts.finalizeBrowserSession({
+            success,
+            finalActiveTabId: ctx.activeTabId ?? playTabId,
+            managedTabIds: managedTabs.map((tab) => tab.id),
+            finalUrl: finalTab?.url || '',
+            navigationDecision: sessionNavigationDecision,
+            browserSessionPrepared,
+          });
+        } catch (sessionError) {
+          success = false;
+          sessionErrorCode = String(sessionError?.code || 'CDP_SESSION_COMMIT_FAILED');
+          sessionTransition = sessionError?.sessionTransition || sessionTransition;
+          errorMsg = `CDP 批次会话提交失败：${sessionError?.message || String(sessionError)}`;
+          failureContext = {
+            ...(failureContext || {}),
+            session_transition_error: errorMsg,
+            ...(sessionError?.code ? { session_transition_error_code: sessionError.code } : {}),
+          };
+        } finally {
+          browserSessionFinalized = true;
+        }
+      }
+      const sessionTransitionAudit = buildSessionTransitionAudit(sessionTransition, {
+        sessionMode: opts.sessionMode,
+        browserSessionSource: opts.browserSessionSource,
+        navigationDecision: sessionNavigationDecision,
+      });
+      playbackOutcome = { ok: success, duration, error: errorMsg || '', sessionTransition };
       const executedStepIndexes = stepResults
         .filter((item) => item.status !== 'skipped')
         .map((item) => item.step_index);
@@ -1357,6 +1541,7 @@ export class PlayerManager {
         runtime_step_targets: runtimeStepTargets,
         ...(failureContext?.variable_extraction_error ? { variable_extraction_error: failureContext.variable_extraction_error } : {}),
         ...(failureContext ? { failure_context: failureContext } : {}),
+        ...(sessionTransitionAudit ? { session_transition: sessionTransitionAudit } : {}),
       };
       broadcastProgress('case-finished', {
         status: success ? 'passed' : 'failed',
@@ -1391,11 +1576,13 @@ export class PlayerManager {
               duration_ms: duration,
               step_duration_ms: stepDuration,
               failed_step_index: errorStep,
+              ...(sessionErrorCode ? { error_code: sessionErrorCode } : {}),
               error: errorMsg || '',
               case_result: caseResult,
               detail: resultDetail,
               execution_config: executionSnapshot,
               execution_logs: progressLogs,
+              ...(sessionTransitionAudit ? { session_transition: sessionTransitionAudit } : {}),
             },
           }, opts.executionCapability);
         } else {
@@ -1431,21 +1618,50 @@ export class PlayerManager {
         duration,
         error: errorMsg || '',
         errorStep,
+        ...(sessionErrorCode ? { errorCode: sessionErrorCode } : {}),
+        finalActiveTabId: ctx.activeTabId ?? playTabId,
+        ...(sessionTransition ? { sessionTransition } : {}),
         purpose: ctx.playbackPurpose,
       };
       return playbackOutcome;
     } catch (err) {
       const rawMsg = err && err.message ? err.message : String(err);
-      const msg = localizePlaybackError(ctx?.locale ?? runLocale, rawMsg);
+      let msg = localizePlaybackError(ctx?.locale ?? runLocale, rawMsg);
+      if (typeof opts.finalizeBrowserSession === 'function' && !browserSessionFinalized) {
+        try {
+          sessionTransition = await opts.finalizeBrowserSession({
+            success: false,
+            finalActiveTabId: ctx?.activeTabId ?? playTabId,
+            managedTabIds: ctx?.managedTabIds ? [...ctx.managedTabIds] : [],
+            finalUrl: '',
+            navigationDecision: sessionNavigationDecision,
+            browserSessionPrepared,
+          });
+        } catch (sessionError) {
+          sessionErrorCode = String(sessionError?.code || 'CDP_SESSION_CLEANUP_FAILED');
+          sessionTransition = sessionError?.sessionTransition || sessionTransition;
+          msg = `${msg}；CDP 批次会话回滚失败：${sessionError?.message || String(sessionError)}`;
+        } finally {
+          browserSessionFinalized = true;
+        }
+      }
       playbackOutcome = { ok: false, error: msg };
       const finishedAt = Date.now();
       const quotaDetails = err?.quotaDetails || err?.apiData?.data || err?.response?.data?.data || null;
+      const sessionTransitionAudit = buildSessionTransitionAudit(sessionTransition, {
+        sessionMode: opts.sessionMode,
+        browserSessionSource: opts.browserSessionSource,
+        navigationDecision: sessionNavigationDecision,
+      });
       playbackEndPayload = {
         type: 'AT_PLAYBACK_END',
         testCaseId,
         tabId: playTabId,
         ok: false,
         error: msg,
+        finalActiveTabId: ctx?.activeTabId ?? playTabId,
+        ...(sessionTransition ? { sessionTransition } : {}),
+        ...(sessionErrorCode || err?.code ? { errorCode: sessionErrorCode || err.code } : {}),
         ...(quotaDetails && typeof quotaDetails === 'object' && quotaDetails.resource ? { quotaDetails } : {}),
         purpose: ctx?.playbackPurpose || String(opts.purpose || ''),
       };
@@ -1478,9 +1694,11 @@ export class PlayerManager {
             status: 'failed',
             success: false,
             startup_failure: true,
+            ...(sessionErrorCode || err?.code ? { error_code: sessionErrorCode || err.code } : {}),
             error: msg,
             execution_config: executionSnapshot,
             execution_logs: progressLogs,
+            ...(sessionTransitionAudit ? { session_transition: sessionTransitionAudit } : {}),
           },
         }, opts.executionCapability).catch(() => {});
       }
@@ -1741,7 +1959,7 @@ export class PlayerManager {
       cdpAvailable = await this._attachDebugger(tabId, ctx);
     }
     if (options.useAdminCase && !cdpAvailable) {
-      throw new Error(`admin 扩展 CDP 无法附加到切换后的标签页：${ctx.cdpAttachError || '未知错误'}`);
+      throw new Error(`admin 扩展 CDP 无法初始化切换后的标签页：${ctx.cdpAttachError || '未知错误'}`);
     }
     await this._ensurePlayerScript(tabId);
     return { tabId, cdpAvailable };
@@ -2010,17 +2228,22 @@ export class PlayerManager {
     if (tabId == null) throw new Error('从页面元素读取变量需要受控浏览器标签页');
     const mode = String(step?.read_mode || 'text').trim().toLowerCase();
     if (mode.startsWith('attribute:')) {
-      return this._waitForTargetAttributeCDP(tabId, step, mode.slice('attribute:'.length));
+      return {
+        value: await this._waitForTargetAttributeCDP(tabId, step, mode.slice('attribute:'.length)),
+        locator: PlayerManager._actualLocatorFromVia(step, step.target_selector ? 'css' : 'xpath'),
+      };
     }
-    const raw = await this._waitForDomTextRawCDP(
-      tabId,
-      step.target_selector,
-      step.target_xpath,
-      10000,
-      true,
-    );
-    if (raw == null) throw new Error('从页面元素读取变量失败：找不到目标元素');
-    return raw;
+    const result = await this._waitForVariableValueCDP(tabId, step, 8000, true);
+    if (!result) throw new Error('从页面元素读取变量失败：找不到目标元素');
+    return {
+      value: result.value,
+      locator: PlayerManager._actualLocatorFromVia(
+        step,
+        result.via,
+        result.matched_count,
+        result.visible_count,
+      ),
+    };
   }
 
   static _remoteResultValue(remoteResult) {
@@ -2036,10 +2259,13 @@ export class PlayerManager {
       const name = String(step?.variable_name || '').trim();
       const source = PlayerManager._normalizeVariableSourceType(step?.source_type ?? step?.source ?? 'literal');
       let value;
+      let locator = null;
       if (source === 'literal') {
         value = step?.value ?? '';
       } else if (source === 'locator') {
-        value = await this._readVariableFromLocatorCDP(tabId, step);
+        const captured = await this._readVariableFromLocatorCDP(tabId, step);
+        value = captured.value;
+        locator = captured.locator;
       } else if (source === 'script') {
         if (tabId == null) throw new Error('从页面脚本读取变量需要受控浏览器标签页');
         const result = await this._evaluatePageScriptCDP(tabId, step?.script ?? step?.value);
@@ -2056,7 +2282,7 @@ export class PlayerManager {
           source,
         },
       );
-      return { variable };
+      return { variable, ...(locator ? { locator } : {}) };
     }
 
     if (actionType === 'global_variable_date') {
@@ -2133,15 +2359,39 @@ export class PlayerManager {
   }
 
   async _attachDebugger(tabId, ctx) {
+    let attachError = null;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      try {
+        await chrome.debugger.attach({ tabId }, '1.3');
+        ctx.debuggerAttached = true;
+        attachError = null;
+        break;
+      } catch (error) {
+        attachError = error;
+        const retryable = /Cannot attach to this target|No tab with given id/i
+          .test(String(error?.message || error));
+        if (!retryable || attempt >= 3) break;
+        // 新建 about:blank 标签页的 debugger target 可能晚于 tabs/windows API 返回，短暂等待后重试。
+        await this._sleep(150 * (attempt + 1));
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        if (!tab) break;
+      }
+    }
+    if (!ctx.debuggerAttached) {
+      ctx.cdpAttachError = attachError?.message || String(attachError || '未知错误');
+      console.warn('[Player] CDP attach 失败，降级为 DOM 模式:', ctx.cdpAttachError);
+      return false;
+    }
+
     try {
-      await chrome.debugger.attach({ tabId }, '1.3');
-      ctx.debuggerAttached = true;
+      await this._configureCertificateErrors(tabId, ctx);
       // 开启 Page 域以接收 javascriptDialogOpening；即使该订阅失败，后续仍会直接尝试 handleJavaScriptDialog。
       await this._cdpSend(tabId, 'Page.enable').catch(() => {});
       return true;
     } catch (e) {
-      ctx.cdpAttachError = e?.message || String(e);
-      console.warn('[Player] CDP attach 失败，降级为 DOM 模式:', ctx.cdpAttachError);
+      ctx.cdpAttachError = `CDP 初始化失败：${e?.message || String(e)}`;
+      console.warn('[Player] CDP 初始化失败，降级为 DOM 模式:', ctx.cdpAttachError);
+      await chrome.debugger.detach({ tabId }).catch(() => {});
       ctx.debuggerAttached = false;
       return false;
     }
@@ -2149,10 +2399,49 @@ export class PlayerManager {
 
   async _detachDebugger(tabId, ctx) {
     if (!ctx.debuggerAttached) return;
+    if (ctx.certificateErrorListener) {
+      chrome.debugger.onEvent.removeListener(ctx.certificateErrorListener);
+      ctx.certificateErrorListener = null;
+    }
     try {
       await chrome.debugger.detach({ tabId });
     } catch (e) {}
     ctx.debuggerAttached = false;
+  }
+
+  async _configureCertificateErrors(tabId, ctx) {
+    const ignore = ctx.ignoreHttpsErrors === true;
+    ctx.certificateErrorMode = ignore ? 'direct' : 'disabled';
+    try {
+      // 新版协议支持该命令时，必须在业务页面首次导航前调用。
+      await this._cdpSend(tabId, 'Security.setIgnoreCertificateErrors', { ignore });
+      return;
+    } catch (error) {
+      const unsupported = /wasn't found|not found/i.test(String(error?.message || error));
+      if (!unsupported) throw error;
+      if (!ignore) return;
+    }
+
+    // 部分 Chrome 的扩展 debugger 不暴露 setIgnoreCertificateErrors，使用旧版事件协议兜底。
+    try {
+      await this._cdpSend(tabId, 'Security.setOverrideCertificateErrors', { override: true });
+    } catch (error) {
+      if (!/wasn't found|not found/i.test(String(error?.message || error))) throw error;
+      // 证书拦截页会变成扩展不可调试目标，不能用键盘序列规避；直接提示可执行的替代方案。
+      throw new Error(
+        '当前 Chrome 不允许扩展忽略 HTTPS 证书错误，请关闭该选项后重试，或改用 Playwright Runner/安装受信任证书',
+      );
+    }
+    ctx.certificateErrorMode = 'event-override';
+    const listener = (source, method, params) => {
+      if (source?.tabId !== tabId || method !== 'Security.certificateError') return;
+      void this._cdpSend(tabId, 'Security.handleCertificateError', {
+        eventId: params?.eventId,
+        action: 'continue',
+      }).catch((error) => console.warn('[Player] 处理 HTTPS 证书错误失败:', error?.message || error));
+    };
+    chrome.debugger.onEvent.addListener(listener);
+    ctx.certificateErrorListener = listener;
   }
 
   _extractTabContext(step) {
@@ -2260,7 +2549,8 @@ export class PlayerManager {
         settled = true;
         reject(new Error(`CDP 命令超时：${method}`));
       }, CDP_COMMAND_TIMEOUT_MS);
-      chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
+      // Runtime.evaluate 可能需要绑定当前 iframe 的 execution context；必须发送预处理后的参数。
+      chrome.debugger.sendCommand({ tabId }, method, effectiveParams, (result) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -2346,12 +2636,8 @@ export class PlayerManager {
 
   static _buildSimpleTargetElementExpr(selector, xpath) {
     let safeSelector = String(selector || '').trim();
-    let safeXpath = String(xpath || '').trim();
+    const safeXpath = PlayerManager._normalizeXPath(xpath);
     if (PlayerManager._isVolatileRcCss(safeSelector) || /:\w+-of-type\(0\)/.test(safeSelector)) safeSelector = '';
-    if (PlayerManager._isVolatileRcXPath(safeXpath)) safeXpath = '';
-    if (safeXpath && !safeXpath.startsWith('//') && !safeXpath.startsWith('/html') && !safeXpath.startsWith('/*')) {
-      safeXpath = `/${safeXpath}`;
-    }
     const expressions = [];
     if (safeXpath) {
       expressions.push(`document.evaluate(${JSON.stringify(safeXpath)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue`);
@@ -2628,36 +2914,112 @@ export class PlayerManager {
    * Chrome Debugger 协议支持 DOM.setFileInputFiles。文件路径只能来自显式 file_ref/certificate_ref，
    * 拒绝变量、相对路径和目录回退，避免扩展把任意页面文本误解释为宿主机文件路径。
    */
-  async _executeFileUploadCDP(tabId, step) {
-    const files = PlayerManager._filePathsFromStep(step);
-    const expression = PlayerManager._buildSimpleTargetElementExpr(step?.target_selector, step?.target_xpath);
-    if (expression === 'null') throw new Error('file_upload 需要文件控件定位');
-    const deadline = Date.now() + this._getEffectiveWaitTimeout(tabId, 8000);
-    let lastError = '';
-    do {
-      const evaluated = await this._cdpSend(tabId, 'Runtime.evaluate', {
-        expression,
-        returnByValue: false,
-      });
-      const objectId = evaluated?.result?.objectId || '';
-      if (objectId) {
-        const described = await this._cdpSend(tabId, 'DOM.describeNode', { objectId });
-        const node = described?.node;
-        const attributes = Array.isArray(node?.attributes) ? node.attributes : [];
-        const typeIndex = attributes.findIndex((value) => String(value).toLowerCase() === 'type');
-        const inputType = typeIndex >= 0 ? String(attributes[typeIndex + 1] || '').toLowerCase() : '';
-        if (String(node?.nodeName || '').toLowerCase() !== 'input' || inputType !== 'file') {
-          throw new Error('目标元素不是 input[type=file]');
+  async _executeFileUploadCDP(tabId, step, executionCapability = '', executionBatchId = '') {
+    const staged = await this._stageFilePathsFromStep(step, executionCapability, executionBatchId);
+    try {
+      const expression = PlayerManager._buildSimpleTargetElementExpr(step?.target_selector, step?.target_xpath);
+      if (expression === 'null') throw new Error('file_upload 需要文件控件定位');
+      const deadline = Date.now() + this._getEffectiveWaitTimeout(tabId, 8000);
+      let lastError = '';
+      do {
+        const evaluated = await this._cdpSend(tabId, 'Runtime.evaluate', {
+          expression,
+          returnByValue: false,
+        });
+        const objectId = evaluated?.result?.objectId || '';
+        if (objectId) {
+          try {
+            const described = await this._cdpSend(tabId, 'DOM.describeNode', { objectId });
+            const node = described?.node;
+            const attributes = Array.isArray(node?.attributes) ? node.attributes : [];
+            const typeIndex = attributes.findIndex((value) => String(value).toLowerCase() === 'type');
+            const inputType = typeIndex >= 0 ? String(attributes[typeIndex + 1] || '').toLowerCase() : '';
+            if (String(node?.nodeName || '').toLowerCase() !== 'input' || inputType !== 'file') {
+              throw new Error('目标元素不是 input[type=file]');
+            }
+            // objectId 与本轮定位结果同生命周期，避免继续使用页面刷新后可能失效的 nodeId。
+            await this._cdpSend(tabId, 'DOM.setFileInputFiles', { objectId, files: staged.files });
+            const fileNames = staged.files.map(PlayerManager._fileNameFromPath);
+            const locator = PlayerManager._actualLocatorFromVia(step, step?.target_xpath ? 'xpath' : 'css');
+            return {
+              ...(locator || {}),
+              operationFacts: {
+                filename: fileNames.length === 1 ? fileNames[0] : fileNames.join(', '),
+                file_count: fileNames.length,
+                upload_status: '上传控件已设置',
+                ...(String(step?.action_type || '').toLowerCase() === 'certificate_upload' ? {
+                  certificate_uploaded: true,
+                  uploaded_certificate_files: fileNames,
+                } : {}),
+              },
+            };
+          } catch (error) {
+            if (!PlayerManager._isCdpStaleFileInputError(error)) throw error;
+            lastError = '文件控件在上传时已刷新，正在重新定位';
+          }
+        } else {
+          lastError = '未找到文件控件';
         }
-        if (node?.nodeId == null) throw new Error('文件控件未返回 DOM nodeId');
-        await this._cdpSend(tabId, 'DOM.setFileInputFiles', { nodeId: node.nodeId, files });
-        return PlayerManager._actualLocatorFromVia(step, step?.target_xpath ? 'xpath' : 'css');
+        if (Date.now() >= deadline) break;
+        await this._sleep(250);
+      } while (Date.now() < deadline);
+      throw new Error(`设置上传文件失败：${lastError || '未找到文件控件'}`);
+    } finally {
+      await Promise.all(staged.downloadIds.map((id) => this.api.cleanupExecutionFile(id)));
+    }
+  }
+
+  async _stageFilePathsFromStep(step, executionCapability = '', executionBatchId = '') {
+    const actionType = String(step?.action_type || '').trim().toLowerCase();
+    const source = actionType === 'certificate_upload'
+      ? (step?.certificate_ref ?? step?.certificateRef ?? step?.file_ref ?? step?.fileRef)
+      : (step?.file_ref ?? step?.fileRef ?? step?.files ?? step?.file);
+    const candidates = Array.isArray(source) ? source : [source];
+    const localCandidates = [];
+    const downloadIds = [];
+    try {
+      for (const rawCandidate of candidates) {
+        const candidate = PlayerManager._parseFileReference(rawCandidate);
+        if (candidate && typeof candidate === 'object' && candidate.download_path) {
+          const downloaded = await this.api.downloadExecutionFile(candidate, executionCapability, executionBatchId);
+          downloadIds.push(downloaded.downloadId);
+          localCandidates.push(downloaded.localPath);
+        } else if (candidate && typeof candidate === 'object'
+          && candidate.scope === 'project_environment') {
+          throw new Error(`${actionType || 'file_upload'} 的环境文件引用未由 Admin 物化为下载引用`);
+        } else {
+          localCandidates.push(candidate);
+        }
       }
-      lastError = '未找到文件控件';
-      if (Date.now() >= deadline) break;
-      await this._sleep(250);
-    } while (Date.now() < deadline);
-    throw new Error(`设置上传文件失败：${lastError || '未找到文件控件'}`);
+      const files = PlayerManager._filePathsFromStep({
+          ...step,
+          ...(actionType === 'certificate_upload' ? { certificate_ref: localCandidates } : { file_ref: localCandidates }),
+        });
+      if (String(executionBatchId || '').trim()) {
+        await this._registerExecutionFileDownloads(executionBatchId, downloadIds);
+        return { files, downloadIds: [] };
+      }
+      return { files, downloadIds };
+    } catch (error) {
+      await Promise.all(downloadIds.map((id) => this.api.cleanupExecutionFile(id)));
+      throw error;
+    }
+  }
+
+  static _parseFileReference(value) {
+    if (typeof value !== 'string') return value;
+    const text = value.trim();
+    if (!text.startsWith('{') || !text.endsWith('}')) return value;
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      return value;
+    }
+  }
+
+  static _fileNameFromPath(value) {
+    const text = String(value || '');
+    return text.split(/[\\/]/).filter(Boolean).at(-1) || text;
   }
 
   static _filePathsFromStep(step) {
@@ -2899,6 +3261,7 @@ export class PlayerManager {
       step.target_xpath,
       10000,
       true,
+      step.locator_meta,
     );
     if (actual == null) throw new Error('断言失败：找不到目标元素');
     const operator = String(step?.operator || step?.match || 'not_contains').trim().toLowerCase();
@@ -2921,6 +3284,7 @@ export class PlayerManager {
       step.target_xpath,
       10000,
       true,
+      step.locator_meta,
     );
     if (actual == null) throw new Error('断言失败：找不到目标元素');
     if (!regex.test(actual)) throw new Error('断言失败：元素内容不匹配正则表达式');
@@ -3571,6 +3935,107 @@ export class PlayerManager {
     return typeof xp === 'string' && /\/\/\*\[@id\s*=\s*['"]rc_[^'"]+['"]\]/.test(xp);
   }
 
+  /**
+   * XPath 必须原样交给浏览器。仅兼容旧数据中的 html/...、body/... 裸绝对路径，
+   * 不能给括号 XPath、.// 相对 XPath或函数表达式擅自补斜杠。
+   */
+  static _normalizeXPath(xpath) {
+    let normalized = String(xpath || '').trim();
+    if (/^xpath\s*=/i.test(normalized)) normalized = normalized.replace(/^xpath\s*=\s*/i, '').trim();
+    if (!normalized || PlayerManager._isVolatileRcXPath(normalized)) return '';
+    return /^(?:html|body)\//i.test(normalized) ? `/${normalized}` : normalized;
+  }
+
+  static _locatorError(code, message, details = {}) {
+    const error = new Error(`[${code}] ${message}`);
+    error.code = code;
+    error.locatorError = { code, message, ...details };
+    return error;
+  }
+
+  static _unsupportedLocatorStrategy(value) {
+    const raw = String(value || '').trim();
+    const prefixed = /^(jquery|js(?:_path)?|jspath|testrigor)\s*=/i.exec(raw);
+    if (prefixed) return prefixed[1].toLowerCase();
+    if (/^\$\s*\(/.test(raw)) return 'jquery';
+    if (/^(?:document|window)\s*\.\s*(?:querySelector|querySelectorAll)\s*\(/i.test(raw)) return 'js';
+    return '';
+  }
+
+  static _xpathValidationExpr(xpath) {
+    return `(function(){
+      try {
+        var result = document.evaluate(${JSON.stringify(xpath)}, document, null, XPathResult.ANY_TYPE, null);
+        var nodeResultTypes = [
+          XPathResult.UNORDERED_NODE_ITERATOR_TYPE,
+          XPathResult.ORDERED_NODE_ITERATOR_TYPE,
+          XPathResult.UNORDERED_NODE_SNAPSHOT_TYPE,
+          XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
+          XPathResult.ANY_UNORDERED_NODE_TYPE,
+          XPathResult.FIRST_ORDERED_NODE_TYPE
+        ];
+        if (nodeResultTypes.indexOf(result.resultType) < 0) {
+          return { ok: false, code: 'LOCATOR_XPATH_UNSUPPORTED', message: 'XPath result is not a node set' };
+        }
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, code: 'LOCATOR_XPATH_INVALID', message: String(e && e.message || e || 'XPath evaluation failed') };
+      }
+    })()`;
+  }
+
+  async _validateStepXpathsCDP(tabId, step) {
+    const allCandidates = PlayerManager._normalizeLocatorMetaCandidates(step?.locator_meta);
+    const locatorValues = [
+      { value: step?.target_selector, source: 'target_selector' },
+      { value: step?.target_xpath, source: 'target_xpath' },
+      ...allCandidates.map((candidate) => ({
+        value: candidate?.value,
+        source: `locator_meta.${String(candidate?.type || 'unknown')}`,
+        type: String(candidate?.type || '').trim().toLowerCase(),
+      })),
+    ];
+    const privateTypes = new Set(['jquery', 'js', 'js_path', 'jspath', 'testrigor']);
+    for (const item of locatorValues) {
+      const strategy = privateTypes.has(item.type)
+        ? item.type
+        : PlayerManager._unsupportedLocatorStrategy(item.value);
+      if (!strategy) continue;
+      throw PlayerManager._locatorError(
+        'LOCATOR_STRATEGY_UNSUPPORTED',
+        `Unsupported locator strategy: ${strategy}`,
+        { source: item.source, strategy },
+      );
+    }
+
+    const candidates = allCandidates
+      .filter((candidate) => ['xpath_fallback', 'table_cell_xpath'].includes(String(candidate.type || '')));
+    const values = [
+      { raw: String(step?.target_xpath || '').trim(), source: 'target_xpath' },
+      ...candidates.map((candidate) => ({ raw: String(candidate.value || '').trim(), source: `locator_meta.${candidate.type}` })),
+    ];
+    const seen = new Set();
+    for (const item of values) {
+      const normalized = PlayerManager._normalizeXPath(item.raw);
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      const response = await this._cdpSend(tabId, 'Runtime.evaluate', {
+        expression: PlayerManager._xpathValidationExpr(normalized),
+        returnByValue: true,
+      });
+      const result = response?.result?.value;
+      if (result?.ok) continue;
+      const code = result?.code === 'LOCATOR_XPATH_UNSUPPORTED'
+        ? 'LOCATOR_XPATH_UNSUPPORTED'
+        : 'LOCATOR_XPATH_INVALID';
+      throw PlayerManager._locatorError(code, result?.message || 'XPath evaluation failed', {
+        source: item.source,
+        raw_xpath: item.raw,
+        normalized_xpath: normalized,
+      });
+    }
+  }
+
   /** 页面上仅有一个可见的 Ant Select 搜索框时的兜底（兼容旧录制数据） */
   static _antSelectSearchInputFallbackExpr() {
     return `(function(){
@@ -4143,12 +4608,15 @@ export class PlayerManager {
       && action !== 'captcha_ocr';
   }
 
-  static _actualLocatorFromVia(step, via, matchedCount = 1) {
+  static _actualLocatorFromVia(step, via, matchedCount = 1, visibleCount = null) {
     const source = String(via || '').trim();
     if (!source) return null;
     const candidates = PlayerManager._normalizeLocatorMetaCandidates(step?.locator_meta);
+    const locatorMeta = PlayerManager._parseLocatorMetaObject(step?.locator_meta);
+    const recordedCandidates = Array.isArray(locatorMeta?.candidates) ? locatorMeta.candidates : [];
     let type = '';
     let value = '';
+    let recordedCandidate = null;
     if (source.startsWith('meta-')) {
       const sourceType = source.slice(5);
       const candidate = sourceType === 'xpath'
@@ -4158,6 +4626,10 @@ export class PlayerManager {
           : candidates.find((item) => String(item?.type || '') === sourceType);
       type = String(candidate?.type || sourceType);
       value = String(candidate?.value || '');
+      const candidateIndex = recordedCandidates.findIndex((item) => (
+        String(item?.type || '') === type && String(item?.value || '') === value
+      ));
+      if (candidateIndex >= 0) recordedCandidate = { ...recordedCandidates[candidateIndex], index: candidateIndex };
     } else if (source === 'css') {
       type = 'css';
       value = String(step?.target_selector || '');
@@ -4171,7 +4643,55 @@ export class PlayerManager {
       type = source;
       value = String(step?.target_selector || step?.target_xpath || step?.value || '');
     }
-    return { source: `cdp:${source}`, type, value, matchedCount };
+    const canonicalSource = recordedCandidate
+      ? `locator_meta.candidates[${recordedCandidate.index}]`
+      : source === 'css'
+        ? 'target_selector'
+        : source === 'xpath'
+          ? 'target_xpath'
+          : `cdp:${source}`;
+    const recordingScore = Number(recordedCandidate?.score);
+    return {
+      source: canonicalSource,
+      executionSource: `cdp:${source}`,
+      type,
+      value,
+      matchedCount,
+      ...(visibleCount != null ? { visibleCount } : {}),
+      ...(Number.isFinite(recordingScore) ? { recordingScore } : {}),
+    };
+  }
+
+  static _buildCdpLocatorDiagnostics(step, actualLocator, status, durationMs) {
+    if (!actualLocator?.source) return null;
+    const configuredLocators = PlayerManager._normalizeLocatorMetaCandidates(step?.locator_meta);
+    [
+      { type: 'css', value: step?.target_selector },
+      { type: 'xpath', value: step?.target_xpath },
+    ].forEach((candidate) => {
+      const value = String(candidate.value || '').trim();
+      if (value && !configuredLocators.some((item) => item.type === candidate.type && item.value === value)) {
+        configuredLocators.push({ type: candidate.type, value });
+      }
+    });
+    return {
+      version: 1,
+      mode: 'cdp-ordered-candidate',
+      outcome: status === 'passed' ? 'resolved' : 'action-failed',
+      configured_candidate_count: configuredLocators.length,
+      selected: {
+        source: actualLocator.source || '',
+        execution_source: actualLocator.executionSource || '',
+        type: actualLocator.type || '',
+        value: actualLocator.value || '',
+        decision: 'ordered-first-match',
+        ...(Number.isFinite(actualLocator.recordingScore)
+          ? { score: actualLocator.recordingScore, score_kind: 'recording_candidate' }
+          : {}),
+      },
+      // CDP 当前只返回步骤总耗时，不能伪装成 Playwright 的语义定位等待耗时。
+      wait: { wall_ms: Math.max(0, Number(durationMs) || 0), measurement: 'step_total' },
+    };
   }
 
   static _parseLocatorMetaObject(locatorMeta) {
@@ -4927,6 +5447,31 @@ export class PlayerManager {
     })()`;
   }
 
+  static _textExactPickExpr(rawValue) {
+    const text = String(rawValue || '').trim().replace(/\s+/g, ' ');
+    if (!text) return 'null';
+    return `(function(){
+      var targetText = ${JSON.stringify(text)};
+      var normalizeText = function(value) { return String(value || '').trim().replace(/\\s+/g, ' '); };
+      var owner = function(element) {
+        return element && element.closest && element.closest(
+          'button,a,label,[role="button"],[role="menuitem"],li,option,[role="option"],.ivu-btn,.ant-btn,.el-button,.arco-btn,.n-button'
+        );
+      };
+      var primary = document.querySelectorAll(
+        'button,a,label,[role="button"],[role="menuitem"],li,option,[role="option"],.ivu-btn,.ant-btn,.el-button,.arco-btn,.n-button'
+      );
+      for (var i = 0; i < primary.length; i++) {
+        if (normalizeText(primary[i].textContent) === targetText) return primary[i];
+      }
+      var fallback = document.querySelectorAll('span,[class*="btn"],[class*="button"]');
+      for (var j = 0; j < fallback.length; j++) {
+        if (normalizeText(fallback[j].textContent) === targetText) return owner(fallback[j]) || fallback[j];
+      }
+      return null;
+    })()`;
+  }
+
   static _treeNodeTextPickExpr(rawValue) {
     let cfg = null;
     try { cfg = JSON.parse(String(rawValue || '')); } catch { cfg = null; }
@@ -5273,12 +5818,7 @@ export class PlayerManager {
     let safeSel = sel && !/:\w+-of-type\(0\)/.test(sel) ? sel : '';
     if (PlayerManager._isVolatileRcCss(safeSel)) safeSel = '';
 
-    let safeXp = xp || '';
-    if (PlayerManager._isVolatileRcXPath(safeXp)) safeXp = '';
-
-    if (safeXp && !safeXp.startsWith('//') && !safeXp.startsWith('/html') && !safeXp.startsWith('/*')) {
-      safeXp = '/' + safeXp;
-    }
+    const safeXp = PlayerManager._normalizeXPath(xp);
 
     // 易变 rc id 不要用「先试 #id」策略；稳定 #id 才优先 CSS
     const cssIsStableId = Boolean(
@@ -5326,11 +5866,8 @@ export class PlayerManager {
       }
 
       if (type === 'table_cell_xpath' || type === 'xpath_fallback') {
-        if (PlayerManager._isVolatileRcXPath(value)) continue;
-        let safeMetaXp = value;
-        if (!safeMetaXp.startsWith('//') && !safeMetaXp.startsWith('/html') && !safeMetaXp.startsWith('/*')) {
-          safeMetaXp = `/${safeMetaXp}`;
-        }
+        const safeMetaXp = PlayerManager._normalizeXPath(value);
+        if (!safeMetaXp) continue;
         metaParts.push(wrap(
           PlayerManager._contextAwarePickExpr(PlayerManager._xpathSnapshotNodesExpr(safeMetaXp), locatorContextJson),
           `meta-${type}`,
@@ -5339,16 +5876,7 @@ export class PlayerManager {
       }
 
       if (type === 'text_exact' && !skipDisabledCheck) {
-        metaParts.push(wrap(
-          `(function(){const t=${JSON.stringify(value.trim().replace(/\s+/g, ' '))};` +
-          `const n=e=>String((e&&e.textContent)||'').trim().replace(/\\s+/g,' ');` +
-          `const owner=e=>e&&e.closest&&e.closest('button,a,label,[role="button"],[role="menuitem"],li,option,[role="option"],.ivu-btn,.ant-btn,.el-button,.arco-btn,.n-button');` +
-          `for(const e of document.querySelectorAll('button,a,label,[role="button"],[role="menuitem"],li,option,[role="option"],.ivu-btn,.ant-btn,.el-button,.arco-btn,.n-button'))` +
-          `{if(n(e)===t)return e;}` +
-          `for(const e of document.querySelectorAll('span,[class*="btn"],[class*="button"]'))` +
-          `{if(n(e)===t)return owner(e)||e;}return null;})()`,
-          'meta-text'
-        ));
+        metaParts.push(wrap(PlayerManager._textExactPickExpr(value), 'meta-text'));
         continue;
       }
 
@@ -5364,7 +5892,7 @@ export class PlayerManager {
         continue;
       }
 
-      if (type === 'tree_node_text') {
+      if (type === 'tree_node_text' || type === 'tree_item_text') {
         const expr = PlayerManager._treeNodeTextPickExpr(value);
         if (expr !== 'null') metaParts.push(wrap(expr, 'meta-tree-node-text'));
       }
@@ -5400,41 +5928,89 @@ export class PlayerManager {
   }
 
   /**
-   * 统一构造 CDP 元素定位链，保证变量读取和元素断言沿用同一套 CSS/XPath 回退顺序。
+   * 统一构造 CDP 元素解析结果。候选顺序与点击/输入保持一致：locator_meta、稳定 id、XPath、CSS。
    */
-  static _buildDomTargetChain(selector, xpath) {
+  static _buildDomTargetResultChain(selector, xpath, locatorMeta = null) {
     let safeSel = selector && !/:\w+-of-type\(0\)/.test(selector) ? selector : '';
     if (PlayerManager._isVolatileRcCss(safeSel)) safeSel = '';
-
-    let safeXp = xpath || '';
-    if (PlayerManager._isVolatileRcXPath(safeXp)) safeXp = '';
-
-    if (safeXp && !safeXp.startsWith('//') && !safeXp.startsWith('/html') && !safeXp.startsWith('/*')) {
-      safeXp = `/${safeXp}`;
-    }
-
+    const safeXp = PlayerManager._normalizeXPath(xpath);
+    const locatorContextJson = JSON.stringify(PlayerManager._parseLocatorMetaObject(locatorMeta)?.context || null);
     const cssIsStableId = Boolean(
       safeSel && /^#[\w-]+$/.test(safeSel) && !PlayerManager._isVolatileRcCss(selector)
     );
+    const candidates = [];
+    const addCandidate = (expr, via, matchedCountExpr = '1') => {
+      candidates.push(`(function(){
+        try {
+          var resolvedElement = ${expr};
+          if (!resolvedElement) return null;
+          return { el: resolvedElement, via: ${JSON.stringify(via)}, matched_count: Number(${matchedCountExpr}) || 1 };
+        } catch (e) { return null; }
+      })()`);
+    };
+    const addCss = (value, via) => {
+      if (!value || /:\w+-of-type\(0\)/.test(value) || PlayerManager._isVolatileRcCss(value)) return;
+      const selectorJson = JSON.stringify(value);
+      const stableId = /^#[\w-]+$/.test(value);
+      const expression = stableId
+        ? `document.querySelector(${selectorJson})`
+        : PlayerManager._contextAwarePickExpr(`document.querySelectorAll(${selectorJson})`, locatorContextJson);
+      addCandidate(expression, via, `document.querySelectorAll(${selectorJson}).length`);
+    };
+    const addXpath = (value, via) => {
+      const normalized = PlayerManager._normalizeXPath(value);
+      if (!normalized) return;
+      const nodesExpr = PlayerManager._xpathSnapshotNodesExpr(normalized);
+      addCandidate(
+        PlayerManager._contextAwarePickExpr(nodesExpr, locatorContextJson),
+        via,
+        `${nodesExpr}.length`,
+      );
+    };
 
-    const cssFindOne = safeSel
-      ? (cssIsStableId
-        ? `document.querySelector(${JSON.stringify(safeSel)})`
-        : PlayerManager._modalAwareCssPickExpr(safeSel))
-      : null;
-
-    const elParts = [];
-    if (cssIsStableId && cssFindOne) elParts.push(`(${cssFindOne})`);
-    if (safeXp) elParts.push(PlayerManager._xpathSnapshotPickExpr(safeXp));
-    if (!cssIsStableId && cssFindOne) elParts.push(`(${cssFindOne})`);
-    return elParts.length ? elParts.join(' || ') : 'null';
+    const seen = new Set();
+    for (const candidate of PlayerManager._normalizeLocatorMetaCandidates(locatorMeta)) {
+      const type = String(candidate.type || '');
+      const value = String(candidate.value || '').trim();
+      const key = `${type}::${value}`;
+      if (!type || !value || seen.has(key)) continue;
+      seen.add(key);
+      if (type.startsWith('css_') || type.startsWith('component_root_') || type === 'table_cell_css') {
+        addCss(value, `meta-${type}`);
+      } else if (type === 'xpath_fallback' || type === 'table_cell_xpath') {
+        addXpath(value, `meta-${type}`);
+      } else if (type === 'text_exact') {
+        addCandidate(PlayerManager._textExactPickExpr(value), 'meta-text');
+      } else if (type === 'text_exact_tag') {
+        addCandidate(PlayerManager._textExactTagPickExpr(value), 'meta-text-tag');
+      } else if (type === 'tree_interaction') {
+        addCandidate(PlayerManager._treeInteractionPickExpr(value), 'meta-tree-interaction');
+      } else if (type === 'tree_node_text' || type === 'tree_item_text') {
+        addCandidate(PlayerManager._treeNodeTextPickExpr(value), 'meta-tree-node-text');
+      }
+    }
+    if (cssIsStableId) addCss(safeSel, 'css');
+    addXpath(safeXp, 'xpath');
+    if (!cssIsStableId) addCss(safeSel, 'css');
+    if (!candidates.length) return 'null';
+    return `(function(){
+      var candidate = null;
+      ${candidates.map((candidate) => `candidate = ${candidate}; if (candidate && candidate.el) return candidate;`).join('\n')}
+      return null;
+    })()`;
   }
 
-  static _buildDomTextRawExpr(selector, xpath) {
-    const chain = PlayerManager._buildDomTargetChain(selector, xpath);
+  static _buildDomTargetChain(selector, xpath, locatorMeta = null) {
+    const resultChain = PlayerManager._buildDomTargetResultChain(selector, xpath, locatorMeta);
+    return `(function(){ var resolved = ${resultChain}; return resolved && resolved.el || null; })()`;
+  }
+
+  static _buildDomTextRawExpr(selector, xpath, locatorMeta = null) {
+    const resultChain = PlayerManager._buildDomTargetResultChain(selector, xpath, locatorMeta);
     return `(function(){
       try {
-        var el = ${chain};
+        var resolved = ${resultChain};
+        var el = resolved && resolved.el;
         if (!el) return { ok: false, err: 'not_found' };
         var tag = el.tagName && String(el.tagName).toLowerCase() || '';
         var t = '';
@@ -5451,11 +6027,12 @@ export class PlayerManager {
     })()`;
   }
 
-  static _buildVariableValueExpr(selector, xpath) {
-    const chain = PlayerManager._buildDomTargetChain(selector, xpath);
+  static _buildVariableValueExpr(selector, xpath, locatorMeta = null) {
+    const resultChain = PlayerManager._buildDomTargetResultChain(selector, xpath, locatorMeta);
     return `(function(){
       try {
-        var el = ${chain};
+        var resolved = ${resultChain};
+        var el = resolved && resolved.el;
         if (!el) return { ok: false, err: 'not_found' };
         var tag = el.tagName && String(el.tagName).toLowerCase() || '';
         var value = '';
@@ -5468,19 +6045,26 @@ export class PlayerManager {
           var text = el.innerText != null ? el.innerText : el.textContent;
           value = text != null ? String(text) : '';
         }
-        return { ok: true, value: value };
+        return {
+          ok: true,
+          value: value,
+          via: resolved.via || '',
+          matched_count: Number(resolved.matched_count || 1),
+          visible_count: 1,
+        };
       } catch (e) {
         return { ok: false, err: e && e.message ? String(e.message) : 'error' };
       }
     })()`;
   }
 
-  static _buildElementAssertionExpr(selector, xpath, readMode = 'auto') {
-    const chain = PlayerManager._buildDomTargetChain(selector, xpath);
+  static _buildElementAssertionExpr(selector, xpath, readMode = 'auto', locatorMeta = null) {
+    const resultChain = PlayerManager._buildDomTargetResultChain(selector, xpath, locatorMeta);
     const normalizedReadMode = ['auto', 'text', 'value'].includes(String(readMode)) ? String(readMode) : 'auto';
     return `(function(){
       try {
-        var el = ${chain};
+        var resolved = ${resultChain};
+        var el = resolved && resolved.el;
         if (!el) return { ok: false, err: 'not_found' };
         var visible = true;
         var current = el;
@@ -5504,17 +6088,24 @@ export class PlayerManager {
           var text = el.innerText != null ? el.innerText : el.textContent;
           value = text != null ? String(text) : '';
         }
-        return { ok: true, visible: visible, value: value };
+        return {
+          ok: true,
+          visible: visible,
+          value: value,
+          via: resolved.via || '',
+          matched_count: Number(resolved.matched_count || 1),
+          visible_count: visible ? 1 : 0
+        };
       } catch (e) {
         return { ok: false, err: e && e.message ? String(e.message) : 'error' };
       }
     })()`;
   }
 
-  async _waitForDomTextRawCDP(tabId, selector, xpath, timeout = 8000, skipPageErrorCheck = false) {
+  async _waitForDomTextRawCDP(tabId, selector, xpath, timeout = 8000, skipPageErrorCheck = false, locatorMeta = null) {
     let remaining = this._getEffectiveWaitTimeout(tabId, timeout);
     const wallEnd = Date.now() + PlayerManager.LOADING_WAIT_WALL_MS;
-    const expr = PlayerManager._buildDomTextRawExpr(selector, xpath);
+    const expr = PlayerManager._buildDomTextRawExpr(selector, xpath, locatorMeta);
     while (Date.now() < wallEnd && remaining > 0) {
       if (!skipPageErrorCheck) await this._throwIfPageError(tabId);
       const loading = await this._isPageLoadingUi(tabId);
@@ -5527,16 +6118,16 @@ export class PlayerManager {
     return null;
   }
 
-  async _waitForVariableValueCDP(tabId, step, timeout = 8000) {
+  async _waitForVariableValueCDP(tabId, step, timeout = 8000, returnDetails = false) {
     let remaining = timeout;
     const wallEnd = Date.now() + PlayerManager.LOADING_WAIT_WALL_MS;
-    const expr = PlayerManager._buildVariableValueExpr(step.target_selector, step.target_xpath);
+    const expr = PlayerManager._buildVariableValueExpr(step.target_selector, step.target_xpath, step.locator_meta);
     while (Date.now() < wallEnd && remaining > 0) {
       await this._throwIfPageError(tabId);
       const loading = await this._isPageLoadingUi(tabId);
       const res = await this._cdpSend(tabId, 'Runtime.evaluate', { expression: expr, returnByValue: true });
       const v = res?.result?.value;
-      if (v && v.ok && typeof v.value === 'string') return v.value;
+      if (v && v.ok && typeof v.value === 'string') return returnDetails ? v : v.value;
       await this._sleep(400);
       if (!loading) remaining -= 400;
     }
@@ -5550,6 +6141,7 @@ export class PlayerManager {
       step.target_selector,
       step.target_xpath,
       step.read_mode || 'auto',
+      step.locator_meta,
     );
     let lastMatched = null;
     while (Date.now() < wallEnd && remaining > 0) {
@@ -5627,7 +6219,14 @@ export class PlayerManager {
     if (sid == null || Number.isNaN(Number(sid))) {
       throw new Error('JSON 断言步骤缺少步骤 id，请重新加载用例后重试');
     }
-    const actual = await this._waitForDomTextRawCDP(tabId, step.target_selector, step.target_xpath, 10000);
+    const actual = await this._waitForDomTextRawCDP(
+      tabId,
+      step.target_selector,
+      step.target_xpath,
+      10000,
+      false,
+      step.locator_meta,
+    );
     if (actual == null) {
       const treeDiag = await this._getTreeWaitDiagnosticSuffix(tabId, step.locator_meta);
       throw new Error(
@@ -5771,6 +6370,33 @@ export class PlayerManager {
     ].join('\n  ');
   }
 
+  static _createAssertionFailureError(payload) {
+    const error = new Error(PlayerManager._formatAssertionFailure(payload));
+    // 错误文本用于日志；结构化字段用于报告准确区分期望值和页面实际值。
+    error.operationAssertion = PlayerManager._buildAssertionDiagnostic(payload);
+    if (payload.actualLocator && typeof payload.actualLocator === 'object') {
+      error.actualLocator = payload.actualLocator;
+    }
+    return error;
+  }
+
+  static _buildAssertionDiagnostic(payload) {
+    return {
+      subject: PlayerManager._assertionTargetLabel(payload.target),
+      operator: String(payload.match || 'equals'),
+      expected: { value_state: 'visible', preview: String(payload.expected ?? '') },
+      actual: { value_state: 'visible', preview: String(payload.actual ?? '') },
+      passed: payload.passed === true,
+    };
+  }
+
+  static _createAssertionResult(locator, payload) {
+    return {
+      ...(locator && typeof locator === 'object' ? locator : {}),
+      operationAssertion: PlayerManager._buildAssertionDiagnostic({ ...payload, passed: true }),
+    };
+  }
+
   async _waitForPageErrorTextCDP(tabId, timeout = 10000) {
     const end = Date.now() + timeout;
     let last = '';
@@ -5789,7 +6415,9 @@ export class PlayerManager {
     if (step.wait_before) await this._sleep(step.wait_before);
     const expectedValue = step.expect ?? step.value;
     const expected = expectedValue != null ? String(expectedValue) : '';
-    const hasLocator = String(step.target_selector || '').trim() !== '' || String(step.target_xpath || '').trim() !== '';
+    const hasLocator = String(step.target_selector || '').trim() !== ''
+      || String(step.target_xpath || '').trim() !== ''
+      || PlayerManager._normalizeLocatorMetaCandidates(step.locator_meta).length > 0;
     const assertion = PlayerManager._resolveAssertionConfig(step, hasLocator);
     if (assertion.match !== 'visible' && expected.trim() === '') {
       throw new Error('断言失败：未配置断言文本（「输入值」不能为空或仅空白）');
@@ -5814,16 +6442,21 @@ export class PlayerManager {
         xpath: '',
       });
       if (!hit) {
-        throw new Error(PlayerManager._formatAssertionFailure({
+        throw PlayerManager._createAssertionFailureError({
           target: assertion.target,
           match: assertion.match,
           expected,
           actual,
           css: '',
           xpath: '',
-        }));
+        });
       }
-      return;
+      return PlayerManager._createAssertionResult(null, {
+        target: assertion.target,
+        match: assertion.match,
+        expected,
+        actual,
+      });
     }
 
     if (assertion.target === 'url') {
@@ -5842,16 +6475,21 @@ export class PlayerManager {
         xpath: '',
       });
       if (!hit) {
-        throw new Error(PlayerManager._formatAssertionFailure({
+        throw PlayerManager._createAssertionFailureError({
           target: assertion.target,
           match: assertion.match,
           expected,
           actual,
           css: '',
           xpath: '',
-        }));
+        });
       }
-      return;
+      return PlayerManager._createAssertionResult(null, {
+        target: assertion.target,
+        match: assertion.match,
+        expected,
+        actual,
+      });
     }
 
     if (assertion.target === 'element') {
@@ -5868,17 +6506,37 @@ export class PlayerManager {
         );
       }
       if (assertion.match === 'visible') {
-        if (result.visible === true) return;
-        throw new Error(PlayerManager._formatAssertionFailure({
+        const actualLocator = PlayerManager._actualLocatorFromVia(
+          step,
+          result.via,
+          result.matched_count,
+          result.visible_count,
+        );
+        if (result.visible === true) {
+          return PlayerManager._createAssertionResult(actualLocator, {
+            target: assertion.target,
+            match: assertion.match,
+            expected: 'visible',
+            actual: 'visible',
+          });
+        }
+        throw PlayerManager._createAssertionFailureError({
           target: assertion.target,
           match: assertion.match,
           expected: 'visible',
           actual: 'hidden',
           css: step.target_selector || '',
           xpath: step.target_xpath || '',
-        }));
+          actualLocator,
+        });
       }
       const actual = String(result.value ?? '');
+      const actualLocator = PlayerManager._actualLocatorFromVia(
+        step,
+        result.via,
+        result.matched_count,
+        result.visible_count,
+      );
       const hit = PlayerManager._matchAssertionText(actual, expected, assertion.match);
       this._logAssertTextCdpDebug({
         mode: 'element',
@@ -5889,16 +6547,22 @@ export class PlayerManager {
         xpath: step.target_xpath || '',
       });
       if (!hit) {
-        throw new Error(PlayerManager._formatAssertionFailure({
+        throw PlayerManager._createAssertionFailureError({
           target: assertion.target,
           match: assertion.match,
           expected,
           actual,
           css: step.target_selector || '',
           xpath: step.target_xpath || '',
-        }));
+          actualLocator,
+        });
       }
-      return;
+      return PlayerManager._createAssertionResult(actualLocator, {
+        target: assertion.target,
+        match: assertion.match,
+        expected,
+        actual,
+      });
     }
 
     const expr = `(function(){
@@ -5922,15 +6586,21 @@ export class PlayerManager {
       xpath: '',
     });
     if (!hit) {
-      throw new Error(PlayerManager._formatAssertionFailure({
+      throw PlayerManager._createAssertionFailureError({
         target: assertion.target,
         match: assertion.match,
         expected,
         actual: pageText,
         css: '',
         xpath: '',
-      }));
+      });
     }
+    return PlayerManager._createAssertionResult(null, {
+      target: assertion.target,
+      match: assertion.match,
+      expected,
+      actual: pageText,
+    });
   }
 
   async _isPageLoadingUi(tabId) {
@@ -7971,11 +8641,7 @@ export class PlayerManager {
 
   /** 在页面上下文中查找 input/textarea 并设置 value（兼容 Vue/React 受控组件） */
   async _setInputValueCDP(tabId, selector, xpath, value, locatorMeta = null, autoConfirmAntSelect = true) {
-    let safeXp = xpath || '';
-    if (PlayerManager._isVolatileRcXPath(safeXp)) safeXp = '';
-    if (safeXp && !safeXp.startsWith('//') && !safeXp.startsWith('/html') && !safeXp.startsWith('/*')) {
-      safeXp = `/${safeXp}`;
-    }
+    const safeXp = PlayerManager._normalizeXPath(xpath);
     let safeSel = selector && !/:\w+-of-type\(0\)/.test(selector) ? selector : '';
     if (PlayerManager._isVolatileRcCss(safeSel)) safeSel = '';
     const volatileRc = PlayerManager._isVolatileRcCss(selector) || PlayerManager._isVolatileRcXPath(xpath);
@@ -7984,6 +8650,7 @@ export class PlayerManager {
     );
     const metaCandidates = PlayerManager._normalizeLocatorMetaCandidates(locatorMeta);
     const locatorContext = PlayerManager._parseLocatorMetaObject(locatorMeta)?.context || null;
+    const unifiedTargetExpr = PlayerManager._buildDomTargetChain(safeSel, safeXp, locatorMeta);
 
     const expr = `(function(){
       var sel = ${JSON.stringify(safeSel)};
@@ -8251,8 +8918,8 @@ export class PlayerManager {
           return arr[0];
         } catch (e) { return null; }
       }
-      var el = null;
-      el = findByMeta();
+      var el = ${unifiedTargetExpr};
+      if (!el) el = findByMeta();
       if (!el && ${preferId ? 'true' : 'false'} && sel) el = q(sel);
       if (!el && xp) el = x(xp);
       if (!el && sel) el = pickFromCssMulti(sel, xp);
@@ -8362,11 +9029,7 @@ export class PlayerManager {
   }
 
   async _dispatchKeyOnFocusedCDP(tabId, selector, xpath, key, locatorMeta = null) {
-    let safeXp = xpath || '';
-    if (PlayerManager._isVolatileRcXPath(safeXp)) safeXp = '';
-    if (safeXp && !safeXp.startsWith('//') && !safeXp.startsWith('/html') && !safeXp.startsWith('/*')) {
-      safeXp = `/${safeXp}`;
-    }
+    const safeXp = PlayerManager._normalizeXPath(xpath);
     let safeSel = selector && !/:\w+-of-type\(0\)/.test(selector) ? selector : '';
     if (PlayerManager._isVolatileRcCss(safeSel)) safeSel = '';
     const volatileRc = PlayerManager._isVolatileRcCss(selector) || PlayerManager._isVolatileRcXPath(xpath);
@@ -8375,6 +9038,7 @@ export class PlayerManager {
     );
     const metaCandidates = PlayerManager._normalizeLocatorMetaCandidates(locatorMeta);
     const locatorContext = PlayerManager._parseLocatorMetaObject(locatorMeta)?.context || null;
+    const unifiedTargetExpr = PlayerManager._buildDomTargetChain(safeSel, safeXp, locatorMeta);
     const expr = `(function(){
       var sel = ${JSON.stringify(safeSel)};
       var xp = ${JSON.stringify(safeXp)};
@@ -8616,8 +9280,8 @@ export class PlayerManager {
           return arr[0];
         } catch (e) { return null; }
       }
-      var el = null;
-      el = findByMeta();
+      var el = ${unifiedTargetExpr};
+      if (!el) el = findByMeta();
       if (!el && ${preferId ? 'true' : 'false'} && sel) el = q(sel);
       if (!el && xp) el = x(xp);
       if (!el && sel) el = pickFromCssMulti2(sel, xp);
@@ -8792,6 +9456,7 @@ export class PlayerManager {
     if (step.wait_before) await this._sleep(step.wait_before);
     let actualLocator = null;
     const actionType = String(step.action_type || '').trim().toLowerCase();
+    await this._validateStepXpathsCDP(tabId, step);
     switch (actionType) {
       case 'frame_switch':
       case 'frame_parent':
@@ -8834,17 +9499,17 @@ export class PlayerManager {
 
       case 'file_upload':
       case 'certificate_upload': {
-        actualLocator = await this._executeFileUploadCDP(tabId, step);
+        actualLocator = await this._executeFileUploadCDP(tabId, step, hooks.executionCapability, hooks.executionBatchId);
         break;
       }
 
       case 'assert_text': {
-        await this._executeAssertTextStepCDP(tabId, step);
+        actualLocator = await this._executeAssertTextStepCDP(tabId, step);
         break;
       }
 
       case 'assert_element_match': {
-        await this._executeAssertTextStepCDP(tabId, step);
+        actualLocator = await this._executeAssertTextStepCDP(tabId, step);
         break;
       }
 
@@ -9143,6 +9808,8 @@ export class PlayerManager {
       const errText = (result && result.error) || '步骤执行失败（页面脚本无有效响应，请刷新目标页后重试）';
       console.error('[Player] DOM 步骤失败', step.action_type, result);
       const err = new Error(localizePlaybackError(locale, errText));
+      if (result?.error_code) err.code = result.error_code;
+      if (result?.locator_error) err.locatorError = result.locator_error;
       if (result?.variable_extraction_error) err.variableExtraction = result.variable_extraction_error;
       throw err;
     }

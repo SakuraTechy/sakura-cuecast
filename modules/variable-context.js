@@ -2,7 +2,7 @@
  * CueCast 单次回放变量上下文。
  *
  * 变量仅存在于当前 PlayerManager.start 调用期间；不能写入 extension storage、日志或跨用例 Map。
- * 与 Playwright Runner 共享 ${name}、${object.key}、${list[0]} 的替换契约，但不依赖 Node API。
+ * 新步骤统一使用 {{name}}、{{object.key}}、{{list[0]}}；历史 ${name} 继续兼容，但不依赖 Node API。
  */
 
 const VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_.-]{0,127}$/;

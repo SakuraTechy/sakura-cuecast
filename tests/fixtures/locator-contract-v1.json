@@ -1,0 +1,145 @@
+{
+  "version": 1,
+  "recorder_candidate_types": [
+    "css_attr_data-testid",
+    "css_attr_data-test",
+    "css_attr_data-qa",
+    "css_attr_data-cy",
+    "css_attr_name",
+    "css_attr_aria-label",
+    "css_attr_placeholder",
+    "css_attr_title",
+    "css_attr_role",
+    "css_id",
+    "css_fallback",
+    "xpath_fallback",
+    "component_root_class",
+    "component_root_combo",
+    "component_root_sibling",
+    "table_cell_css",
+    "table_cell_xpath",
+    "tree_interaction",
+    "tree_node_text",
+    "text_exact",
+    "text_exact_tag"
+  ],
+  "compatibility_candidate_types": [
+    "tree_item_text"
+  ],
+  "candidates": [
+    {
+      "type": "css_attr_data-testid",
+      "value": "[data-testid='locator-target']",
+      "score": 1.0
+    },
+    {
+      "type": "css_attr_data-test",
+      "value": "[data-test='locator-target']",
+      "score": 0.98
+    },
+    {
+      "type": "css_attr_data-qa",
+      "value": "[data-qa='locator-target']",
+      "score": 0.97
+    },
+    {
+      "type": "css_attr_data-cy",
+      "value": "[data-cy='locator-target']",
+      "score": 0.97
+    },
+    {
+      "type": "css_attr_name",
+      "value": "[name='locator-target']",
+      "score": 0.92
+    },
+    {
+      "type": "css_attr_aria-label",
+      "value": "[aria-label='定位目标']",
+      "score": 0.9
+    },
+    {
+      "type": "css_attr_placeholder",
+      "value": "[placeholder='定位目标']",
+      "score": 0.82
+    },
+    {
+      "type": "css_attr_title",
+      "value": "[title='定位目标']",
+      "score": 0.8
+    },
+    {
+      "type": "css_attr_role",
+      "value": "[role='button']",
+      "score": 0.76
+    },
+    {
+      "type": "css_id",
+      "value": "#locator-target",
+      "score": 0.88
+    },
+    {
+      "type": "css_fallback",
+      "value": "#locator-target",
+      "score": 0.72
+    },
+    {
+      "type": "xpath_fallback",
+      "value": "(//span[@class='user-title'])[1]",
+      "score": 0.42
+    },
+    {
+      "type": "component_root_class",
+      "value": "#locator-target",
+      "score": 0.8
+    },
+    {
+      "type": "component_root_combo",
+      "value": "span#locator-target",
+      "score": 0.82
+    },
+    {
+      "type": "component_root_sibling",
+      "value": "#locator-target",
+      "score": 0.78
+    },
+    {
+      "type": "table_cell_css",
+      "value": "#locator-target",
+      "score": 0.93
+    },
+    {
+      "type": "table_cell_xpath",
+      "value": "//*[@id='locator-target']",
+      "score": 0.94
+    },
+    {
+      "type": "tree_interaction",
+      "value": "{\"framework\":\"ant\",\"kind\":\"node_content\",\"title\":\"系统管理\"}",
+      "score": 0.98
+    },
+    {
+      "type": "tree_node_text",
+      "value": "{\"title\":\"系统管理\",\"sameTitleIndex\":0}",
+      "score": 0.95
+    },
+    {
+      "type": "text_exact",
+      "value": "统一定位目标",
+      "score": 0.66
+    },
+    {
+      "type": "text_exact_tag",
+      "value": "span::统一定位目标",
+      "score": 0.70
+    },
+    {
+      "type": "tree_item_text",
+      "value": "{\"title\":\"系统管理\",\"sameTitleIndex\":0}",
+      "score": 0.95
+    }
+  ],
+  "context": {
+    "control_kind": "text",
+    "label_text": ""
+  }
+}

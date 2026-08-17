@@ -6,6 +6,8 @@
 import { RecorderManager } from './modules/recorder-manager.js';
 import { PlayerManager } from './modules/player-manager.js';
 import { ApiClient } from './modules/api-client.js';
+import { CdpBatchSessionManager } from './modules/cdp-batch-session-manager.js';
+import { CurrentProfileBatchSessionManager } from './modules/current-profile-batch-session-manager.js';
 
 const state = {
   mode: 'idle',       // idle | recording（回放中仅用 activePlayCount 表示，见 AT_GET_STATE）
@@ -31,6 +33,7 @@ const state = {
   recordingSessionHealthy: false,
   pendingQuotaSave: null,
   activePlayCount: 0,
+  cleanupExecutionFilesOnBatchEnd: true,
 };
 
 const EXTENSION_SETTINGS_KEY = 'cuecastSettings';
@@ -38,6 +41,7 @@ const DEFAULT_EXTENSION_SETTINGS = Object.freeze({
   apiBase: 'http://localhost:3000/api',
   authToken: '',
   dashboardUrl: 'https://app.icuecast.com/dashboard',
+  cleanupExecutionFilesOnBatchEnd: true,
 });
 
 function normalizeApiBase(value) {
@@ -48,6 +52,7 @@ function normalizeApiBase(value) {
 function applyExtensionSettings(settings = {}) {
   state.apiBase = normalizeApiBase(settings.apiBase);
   state.authToken = String(settings.authToken ?? '').trim();
+  state.cleanupExecutionFilesOnBatchEnd = settings.cleanupExecutionFilesOnBatchEnd !== false;
 }
 
 async function restoreExtensionSettings() {
@@ -58,7 +63,20 @@ async function restoreExtensionSettings() {
 const api = new ApiClient(() => state.apiBase, () => state.authToken);
 const recorder = new RecorderManager(state, api);
 const player = new PlayerManager(state, api);
+const cdpBatchSessions = new CdpBatchSessionManager(chrome);
+const currentProfileBatchSessions = new CurrentProfileBatchSessionManager(chrome);
 const RECORDING_KEEPALIVE_ALARM = 'cc-recording-keepalive';
+
+function finishPlaybackBatch(batchManager, method, message, sourceTabId) {
+  return batchManager[method](message.batchId, message.executionCapability, sourceTabId)
+    .then(async (response) => {
+      // 网页可能在步骤结束后才真正提交文件，必须等批次成功结束再删除下载文件。
+      await player.cleanupExecutionFiles(message.batchId, {
+        removeFiles: state.cleanupExecutionFilesOnBatchEnd,
+      });
+      return response;
+    });
+}
 
 function armRecordingKeepalive() {
   chrome.alarms.create(RECORDING_KEEPALIVE_ALARM, { periodInMinutes: 1 });
@@ -76,6 +94,9 @@ void restoreExtensionSettings()
     }
   })
   .catch(() => {});
+// MV3 Service Worker 重启后不恢复无法证明归属的敏感会话，只清理遗留 Context 与快照。
+void cdpBatchSessions.recoverOrCleanup().catch(() => {});
+void currentProfileBatchSessions.recoverOrCleanup().catch(() => {});
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== 'local' || !changes[EXTENSION_SETTINGS_KEY]) return;
@@ -434,10 +455,60 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         .catch((e) => sendResponse({ ok: false, error: e.message || String(e) }));
       return true;
 
+    case 'AT_PLATFORM_CDP_CAPABILITIES':
+      cdpBatchSessions.probeCapabilities(tabId, sender.tab?.url)
+        .then(sendResponse)
+        .catch((e) => sendResponse({
+          ok: false,
+          managedBrowserContext: false,
+          managedSessionStrategy: 'exclusive-incognito',
+          supportedSessionModes: ['legacy-profile'],
+          errorCode: e.code,
+          error: e.message || String(e),
+        }));
+      return true;
+
+    case 'AT_PLATFORM_BEGIN_PLAYBACK_BATCH':
+      (message.browserSessionSource === 'current-profile'
+        ? currentProfileBatchSessions
+        : cdpBatchSessions).beginBatch({
+        batchId: message.batchId,
+        sessionMode: message.sessionMode,
+        browserSessionSource: message.browserSessionSource,
+        sourceTabId: tabId,
+        sourceUrl: sender.tab?.url,
+        executionCapability: message.executionCapability,
+      })
+        .then(sendResponse)
+        .catch((e) => sendResponse({ ok: false, errorCode: e.code, error: e.message || String(e) }));
+      return true;
+
+    case 'AT_PLATFORM_END_PLAYBACK_BATCH':
+      finishPlaybackBatch(message.browserSessionSource === 'current-profile'
+        ? currentProfileBatchSessions
+        : cdpBatchSessions, 'endBatch', message, tabId)
+        .then(sendResponse)
+        .catch((e) => sendResponse({ ok: false, errorCode: e.code, error: e.message || String(e) }));
+      return true;
+
+    case 'AT_PLATFORM_ABORT_PLAYBACK_BATCH':
+      finishPlaybackBatch(message.browserSessionSource === 'current-profile'
+        ? currentProfileBatchSessions
+        : cdpBatchSessions, 'abortBatch', message, tabId)
+        .then(sendResponse)
+        .catch((e) => sendResponse({ ok: false, errorCode: e.code, error: e.message || String(e) }));
+      return true;
+
     // 来自中台或弹窗：开始回放（必须在短时间内 sendResponse，否则 MV3 消息通道会关闭，表现为点击无反应）
-    case 'AT_PLATFORM_PLAY':
+    case 'AT_PLATFORM_PLAY': {
       state.apiBase = message.apiBase || state.apiBase;
       state.authToken = message.authToken || state.authToken;
+      const batchSessionManager = message.browserSessionSource === 'managed-context'
+        ? cdpBatchSessions
+        : message.browserSessionSource === 'current-profile' && message.sessionMode === 'legacy-profile'
+          && currentProfileBatchSessions.ownsBatch(message.batchId)
+          ? currentProfileBatchSessions
+          : null;
       void player.start(message.testCaseId, message.startUrl, {
         adminCaseKey: message.adminCaseKey || message.caseKey,
         batchId: message.batchId,
@@ -458,9 +529,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         viewportHeight: message.viewportHeight,
         pageErrorCheckEnabled: message.pageErrorCheckEnabled,
         sourceWindowId: sender.tab?.windowId,
+        sessionMode: message.sessionMode,
+        browserSessionSource: message.browserSessionSource,
+        ...(batchSessionManager ? {
+          prepareBrowserSession: ({ startUrl, ignoreHttpsErrors }) => batchSessionManager.prepareCase({
+            batchId: message.batchId,
+            sessionMode: message.sessionMode,
+            browserSessionSource: message.browserSessionSource,
+            executionCapability: message.executionCapability,
+            startUrl,
+            ignoreHttpsErrors,
+          }),
+          finalizeBrowserSession: (result) => batchSessionManager.finalizeCase({
+            batchId: message.batchId,
+            ...result,
+          }),
+        } : {}),
       });
       sendResponse({ ok: true, accepted: true });
       return false;
+    }
 
     // 计划批量执行：提前开好一个窗口，返回 tabId 供后续复用
     case 'AT_PLATFORM_OPEN_PLAY_TAB':
@@ -713,6 +801,8 @@ chrome.tabs.onActivated.addListener(({ tabId }) => {
 });
 
 chrome.tabs.onCreated.addListener((tab) => {
+  cdpBatchSessions.handleTabCreated(tab);
+  currentProfileBatchSessions.handleTabCreated(tab);
   void recorder.handleRecordingTabCreated(tab).catch(() => {});
 });
 
@@ -750,6 +840,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // 标签页关闭时清理状态
 // =========================================================
 chrome.tabs.onRemoved.addListener((tabId) => {
+  currentProfileBatchSessions.handleTabRemoved(tabId);
   if (state.mode === 'recording') {
     recorder.handleRecordingTabClosed(tabId).catch(() => {});
     return;

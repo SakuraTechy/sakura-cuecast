@@ -66,7 +66,7 @@
         { type: 'AT_PLATFORM_FOCUS_PLAY_TAB', testCaseId: data.testCaseId },
         (response) => {
           window.postMessage(
-            { type: 'AT_PLATFORM_ACK', original: data.type, response, testCaseId: data.testCaseId },
+            { type: 'AT_PLATFORM_ACK', original: data.type, nonce: data.nonce, response, testCaseId: data.testCaseId },
             '*',
           );
         },
@@ -86,13 +86,17 @@
       || data.type === 'AT_PLATFORM_DISCARD_RECORDING_SAVE'
       || data.type === 'AT_PLATFORM_OPEN_PLAY_TAB'
       || data.type === 'AT_PLATFORM_CLOSE_PLAY_TAB'
+      || data.type === 'AT_PLATFORM_CDP_CAPABILITIES'
+      || data.type === 'AT_PLATFORM_BEGIN_PLAYBACK_BATCH'
+      || data.type === 'AT_PLATFORM_END_PLAYBACK_BATCH'
+      || data.type === 'AT_PLATFORM_ABORT_PLAYBACK_BATCH'
       || data.type === 'AT_PLATFORM_CHECK_SELECTOR'
     ) {
       // 统一在此注入 auth token，前端和 background 均无需感知 token 来源
       const authToken = localStorage.getItem('cc_auth_token') || '';
       safeSend({ ...data, authToken }, (response) => {
         window.postMessage(
-          { type: 'AT_PLATFORM_ACK', original: data.type, response, testCaseId: data.testCaseId, purpose: data.purpose || '' },
+          { type: 'AT_PLATFORM_ACK', original: data.type, nonce: data.nonce, response, testCaseId: data.testCaseId, purpose: data.purpose || '' },
           '*',
         );
       });

@@ -34,6 +34,14 @@
         <input id="dashboardUrl" name="dashboardUrl" type="url" required placeholder="https://app.icuecast.com/dashboard" autocomplete="url">
       </label>
 
+      <label class="checkbox-setting">
+        <input id="cleanupExecutionFilesOnBatchEnd" name="cleanupExecutionFilesOnBatchEnd" type="checkbox">
+        <span>
+          <strong>批次结束后自动清理证书临时文件</strong>
+          <small>关闭后，文件保留在 Chrome 下载目录的 <code>sakura-cuecast/execution-files/&lt;batchId&gt;</code> 中。</small>
+        </span>
+      </label>
+
       <div class="actions">
         <button type="submit" class="primary">保存配置</button>
         <button type="button" id="resetSettings" class="secondary">恢复默认</button>

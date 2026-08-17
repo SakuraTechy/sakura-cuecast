@@ -1,5 +1,6 @@
 {
   "manifest_version": 3,
+  "minimum_chrome_version": "125",
   "name": "CueCast",
   "version": "1.2.0",
   "description": "Record and replay web UI test cases with CueCast.",
@@ -9,6 +10,7 @@
     "windows",
     "scripting",
     "debugger",
+    "downloads",
     "notifications",
     "alarms",
     "storage"

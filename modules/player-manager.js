@@ -288,6 +288,11 @@ function enabledFlag(value) {
   return value === true || value === 1 || String(value ?? '').trim().toLowerCase() === 'true';
 }
 
+function continueOnFailureEnabled(step) {
+  if (!step || typeof step !== 'object') return false;
+  return enabledFlag(step.continue_on_failure ?? step.continueOnFailure);
+}
+
 export function resolvePlaybackBrowserBootstrap(value) {
   const mode = String(value || 'launch').trim().toLowerCase();
   if (!['launch', 'attach', 'none'].includes(mode)) {
@@ -1015,6 +1020,7 @@ export class PlayerManager {
 
       let errorStep = null;
       let errorMsg = null;
+      let blockingStepFailure = false;
       let failureContext = null;
       const playbackScreenshots = new Array(steps.length).fill('');
       const aiSubtasksByStep = {};
@@ -1037,6 +1043,7 @@ export class PlayerManager {
         );
         const details = {
           ...(executorResult?.infrastructure ? { infrastructure: executorResult.infrastructure } : {}),
+          ...(executorResult?.taskId ? { infrastructure_task_id: executorResult.taskId } : {}),
           ...persistedStepDetails,
           ...(cdpLocatorDiagnostics && !persistedStepDetails.locator_diagnostics
             ? { locator_diagnostics: cdpLocatorDiagnostics }
@@ -1066,6 +1073,7 @@ export class PlayerManager {
             affected_rows: executorResult.affectedRows ?? null,
           } : {}),
           ...(error ? { error } : {}),
+          ...(continueOnFailureEnabled(step) ? { continue_on_failure: true } : {}),
           ...operationFacts,
           ...(operationAssertion && typeof operationAssertion === 'object' ? { operation_assertion: operationAssertion } : {}),
           ...(Object.keys(details).length ? { details } : {}),
@@ -1130,6 +1138,7 @@ export class PlayerManager {
             ? trByLocale(ctx.locale, '回放标签页已全部关闭', 'All playback tabs have been closed')
             : trByLocale(ctx.locale, '用户手动停止', 'Stopped by user');
           errorStep = i;
+          blockingStepFailure = true;
           appendStepResult(PlayerManager._adaptRecordedStep(steps[i]), i, 'skipped', stepStartedAt, errorMsg);
           break;
         }
@@ -1385,11 +1394,14 @@ export class PlayerManager {
             ...(runtimeVariableReferences.length ? { variable_references: runtimeVariableReferences } : {}),
           });
         } catch (err) {
-          stepTimingStatus = 'failed';
+          const shouldContinue = continueOnFailureEnabled(runtimeStep)
+            || continueOnFailureEnabled(executableDefinitionStep);
+          stepTimingStatus = shouldContinue ? 'skipped' : 'failed';
           const rawErrMsg = err && err.message ? err.message : String(err);
           const enhancedErrMsg = PlayerManager._appendVariableResolutionToError(rawErrMsg, resolvedStepInfo.trace);
-          errorMsg = localizePlaybackError(ctx.locale, enhancedErrMsg);
-          errorStep = i;
+          const stepErrorMsg = localizePlaybackError(ctx.locale, enhancedErrMsg);
+          if (!errorMsg) errorMsg = stepErrorMsg;
+          if (errorStep == null) errorStep = i;
           const variableExtractionError = err?.variableExtraction || err?.variable_extraction_error || null;
           const operationAssertion = err?.operationAssertion && typeof err.operationAssertion === 'object'
             ? err.operationAssertion
@@ -1403,39 +1415,53 @@ export class PlayerManager {
           if (isAiNaturalStep(runtimeStep) && Array.isArray(err?.aiSubtasks) && err.aiSubtasks.length) {
             aiSubtasksByStep[String(i)] = err.aiSubtasks;
           }
-          if (ctx.suppressResultSave && ctx.playbackPurpose === 'record_context_prepare') {
-            failureContext = {
-              error_message: errorMsg,
-              error_step_index: i,
-              url: targetUrl,
-              runtime_variables: runtimeVariableEvents,
-              variable_resolution: resolvedStepInfo.trace,
-              ...(variableExtractionError ? { variable_extraction_error: variableExtractionError } : {}),
-            };
-          } else if (cdpAvailable && playTabId != null) {
-            try {
-              const failShot = await this._capturePlaybackScreenshot(playTabId, screenshotMode);
-              if (failShot) playbackScreenshots[i] = failShot;
-            } catch {
-              /* ignore */
+          if (!failureContext) {
+            if (ctx.suppressResultSave && ctx.playbackPurpose === 'record_context_prepare') {
+              failureContext = {
+                error_message: errorMsg,
+                error_step_index: i,
+                url: targetUrl,
+                runtime_variables: runtimeVariableEvents,
+                variable_resolution: resolvedStepInfo.trace,
+                ...(variableExtractionError ? { variable_extraction_error: variableExtractionError } : {}),
+              };
+            } else if (cdpAvailable && playTabId != null) {
+              try {
+                const failShot = await this._capturePlaybackScreenshot(playTabId, screenshotMode);
+                if (failShot) playbackScreenshots[i] = failShot;
+              } catch {
+                /* ignore */
+              }
+              try {
+                failureContext = await this._collectFailureContext(playTabId, i, stepErrorMsg);
+                failureContext.runtime_variables = runtimeVariableEvents;
+                failureContext.variable_resolution = resolvedStepInfo.trace;
+                if (variableExtractionError) failureContext.variable_extraction_error = variableExtractionError;
+              } catch {
+                failureContext = { error_message: stepErrorMsg, error_step_index: i, url: targetUrl, runtime_variables: runtimeVariableEvents, variable_resolution: resolvedStepInfo.trace, ...(variableExtractionError ? { variable_extraction_error: variableExtractionError } : {}) };
+              }
+            } else {
+              failureContext = { error_message: stepErrorMsg, error_step_index: i, url: targetUrl, cdp_unavailable: true, runtime_variables: runtimeVariableEvents, variable_resolution: resolvedStepInfo.trace, ...(variableExtractionError ? { variable_extraction_error: variableExtractionError } : {}) };
             }
-            try {
-              failureContext = await this._collectFailureContext(playTabId, i, errorMsg);
-              failureContext.runtime_variables = runtimeVariableEvents;
-              failureContext.variable_resolution = resolvedStepInfo.trace;
-              if (variableExtractionError) failureContext.variable_extraction_error = variableExtractionError;
-            } catch {
-              failureContext = { error_message: errorMsg, error_step_index: i, url: targetUrl, runtime_variables: runtimeVariableEvents, variable_resolution: resolvedStepInfo.trace, ...(variableExtractionError ? { variable_extraction_error: variableExtractionError } : {}) };
-            }
-          } else {
-            failureContext = { error_message: errorMsg, error_step_index: i, url: targetUrl, cdp_unavailable: true, runtime_variables: runtimeVariableEvents, variable_resolution: resolvedStepInfo.trace, ...(variableExtractionError ? { variable_extraction_error: variableExtractionError } : {}) };
           }
           if (failureContext && locatorError) failureContext.locator_error = locatorError;
-          appendStepResult(runtimeStep, i, 'failed', stepStartedAt, errorMsg, assertionLocator, null, {
+          appendStepResult(runtimeStep, i, shouldContinue ? 'skipped' : 'failed', stepStartedAt, stepErrorMsg, assertionLocator, null, {
             ...(runtimeVariableReferences.length ? { variable_references: runtimeVariableReferences } : {}),
+            ...(err?.infrastructureTaskId ? { infrastructure_task_id: err.infrastructureTaskId } : {}),
             ...(locatorError ? { error_code: locatorError.code, locator_error: locatorError } : {}),
             ...(operationAssertion ? { operation_assertion: operationAssertion } : {}),
           });
+          if (shouldContinue) {
+            broadcastProgress('log', {
+              log: {
+                level: 'warning',
+                phase: 'step',
+                message: `步骤 ${i + 1}: ${runtimeStep.description || runtimeStep.action_type || ''} 执行失败，已跳过并继续执行`,
+              },
+            });
+            continue;
+          }
+          blockingStepFailure = true;
           break;
         } finally {
           stepEndedAt = Date.now();
@@ -1468,7 +1494,8 @@ export class PlayerManager {
         0,
       );
       const duration = Date.now() - runStartedAt;
-      let success = !errorMsg;
+      // 失败后继续的步骤只记录为 skipped，不阻断用例最终通过；其他步骤失败仍判定用例失败。
+      let success = !blockingStepFailure;
       if (typeof opts.finalizeBrowserSession === 'function') {
         const debuggerTabId = ctx.activeTabId ?? playTabId;
         if (ctx.debuggerAttached && debuggerTabId != null) {
@@ -1504,7 +1531,10 @@ export class PlayerManager {
         browserSessionSource: opts.browserSessionSource,
         navigationDecision: sessionNavigationDecision,
       });
-      playbackOutcome = { ok: success, duration, error: errorMsg || '', sessionTransition };
+      // 可继续失败只保留在步骤明细和 failure_context 中，成功的用例不应带有用例级错误。
+      const resultError = success ? '' : errorMsg || '';
+      const resultErrorStep = success ? null : errorStep;
+      playbackOutcome = { ok: success, duration, error: resultError, sessionTransition };
       const executedStepIndexes = stepResults
         .filter((item) => item.status !== 'skipped')
         .map((item) => item.step_index);
@@ -1547,11 +1577,11 @@ export class PlayerManager {
         status: success ? 'passed' : 'failed',
         durationMs: duration,
         stepDurationMs: stepDuration,
-        ...(errorMsg ? { error: errorMsg } : {}),
+        ...(resultError ? { error: resultError } : {}),
         log: {
           level: success ? 'success' : 'error',
           phase: 'runner',
-          message: `CDP 执行${success ? '完成' : '失败'}，耗时 ${duration}ms${errorMsg ? `：${errorMsg}` : ''}`,
+          message: `CDP 执行${success ? '完成' : '失败'}，耗时 ${duration}ms${resultError ? `：${resultError}` : ''}`,
         },
       });
       progressFinished = true;
@@ -1562,7 +1592,7 @@ export class PlayerManager {
             status: success ? 'passed' : 'failed',
             success,
             duration_ms: duration,
-            error: errorMsg || '',
+            error: resultError,
             raw: {
               executor: 'extension-cdp',
               batch_id: opts.batchId || '',
@@ -1575,9 +1605,9 @@ export class PlayerManager {
               success,
               duration_ms: duration,
               step_duration_ms: stepDuration,
-              failed_step_index: errorStep,
+              failed_step_index: resultErrorStep,
               ...(sessionErrorCode ? { error_code: sessionErrorCode } : {}),
-              error: errorMsg || '',
+              error: resultError,
               case_result: caseResult,
               detail: resultDetail,
               execution_config: executionSnapshot,
@@ -1589,8 +1619,8 @@ export class PlayerManager {
           await this.api.saveResult(testCaseId, {
             status: success ? 'success' : 'failed',
             duration,
-            error_message: errorMsg || '',
-            error_step: errorStep,
+            error_message: resultError,
+            error_step: resultErrorStep,
             detail: resultDetail,
           });
         }
@@ -1616,8 +1646,8 @@ export class PlayerManager {
         tabId: playTabId,
         ok: success,
         duration,
-        error: errorMsg || '',
-        errorStep,
+        error: resultError,
+        errorStep: resultErrorStep,
         ...(sessionErrorCode ? { errorCode: sessionErrorCode } : {}),
         finalActiveTabId: ctx.activeTabId ?? playTabId,
         ...(sessionTransition ? { sessionTransition } : {}),
@@ -2174,7 +2204,9 @@ export class PlayerManager {
       }
       const status = String(task.status || '').trim().toLowerCase();
       if (status !== 'passed') {
-        throw new Error(task.errorMessage || task.error || `基础设施任务执行失败：${status}`);
+        const error = new Error(task.errorMessage || task.error || `基础设施任务执行失败：${status}`);
+        error.infrastructureTaskId = taskId;
+        throw error;
       }
       return {
         executor: task.executor || 'infrastructure-service',

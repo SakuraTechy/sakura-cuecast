@@ -1,3 +1,167 @@
+# 2026-08-21 修复 CDP SQL 参数缺少任务定义快照
+
+## 涉及文件
+
+- modules/player-manager.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+CDP 基础设施步骤的任务 ID仅写在步骤结果顶层，历史分层详情在部分载荷路径中无法稳定恢复该 ID，导致 Admin 无法请求 SQL 定义快照，执行参数一直显示为“需通过定义快照查看”。
+
+## 变更内容
+
+1. 基础设施步骤诊断 `details` 同步保存 `infrastructure_task_id`，与顶层任务 ID保持兼容。
+2. Admin 历史详情可从步骤诊断、嵌套 details 和顶层结果兼容恢复任务 ID，再读取受控 SQL 定义快照。
+3. SQL 任务执行失败时也把已创建任务 ID附加到错误结果，确保开启失败后继续的失败步骤仍可读取 SQL 定义。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --test tests/*.test.js`：99/99 通过。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
+         const details = {
+           ...(executorResult?.infrastructure ? { infrastructure: executorResult.infrastructure } : {}),
++          ...(executorResult?.taskId ? { infrastructure_task_id: executorResult.taskId } : {}),
+           ...persistedStepDetails,
+```
+
+### modules/player-manager.js（失败任务）
+
+```diff
+@@
+       if (status !== 'passed') {
+-        throw new Error(task.errorMessage || task.error || `基础设施任务执行失败：${status}`);
++        const error = new Error(task.errorMessage || task.error || `基础设施任务执行失败：${status}`);
++        error.infrastructureTaskId = taskId;
++        throw error;
+       }
+```
+
+# 2026-08-21 CDP 失败后继续按通过结果汇总
+
+## 涉及文件
+
+- modules/player-manager.js
+- tests/effective-execution-config.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+步骤开启“失败后继续”后，CueCast 虽然执行了后续步骤，但仍因保留错误消息把整个用例和批次汇总为失败，与 Playwright Runner 的继续执行语义不一致。
+
+## 变更内容
+
+1. 区分阻断性步骤失败与已配置跳过的步骤失败；只有阻断性失败、手动停止或会话提交失败才会使 CDP 用例失败。
+2. 继续执行的失败步骤保持 `skipped` 明细和错误诊断，但用例、批次最终结果可以正常汇总为通过。
+3. 更新 CDP 契约测试，验证继续执行后用例结果为通过且跳过步骤仍保留。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --test tests/effective-execution-config.test.js --test-name-pattern="CDP 播放步骤开启失败后继续"`：通过。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
++      let blockingStepFailure = false;
+@@
+-      let success = !errorMsg;
++      // 失败后继续的步骤只记录为 skipped，不阻断用例最终通过；其他步骤失败仍判定用例失败。
++      let success = !blockingStepFailure;
+```
+
+### tests/effective-execution-config.test.js
+
+```diff
+@@
+-    assert.equal(result.ok, false);
++    assert.equal(result.ok, true);
+@@
+-    assert.equal(savedResult.status, 'failed');
++    assert.equal(savedResult.status, 'passed');
+```
+
+# 2026-08-21 CDP 回放支持步骤失败后继续
+
+## 涉及文件
+
+- modules/player-manager.js
+- tests/effective-execution-config.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+Admin 已保存步骤级“失败后继续”配置，但 CueCast CDP 回放仍会在第一个失败步骤后中断，导致后续步骤无法执行。
+
+## 变更内容
+
+1. CDP 回放统一识别 `continue_on_failure` 和 `continueOnFailure` 两种字段格式，覆盖所有经过 `PlayerManager.start()` 的操作类型。
+2. 开启配置的步骤失败后记录为 `skipped` 并保留错误信息，广播“已跳过并继续”日志，然后继续执行后续步骤。
+3. 用例最终仍按失败处理，保留首个失败步骤索引，避免把“失败后继续”误报为成功；步骤结果附带 `continue_on_failure` 标记。
+4. 增加 CDP 基础设施步骤契约测试，验证失败步骤跳过、后续步骤执行和用例最终失败状态。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --test tests/effective-execution-config.test.js --test-name-pattern="CDP 播放步骤开启失败后继续"`：通过。
+- `node --test tests/effective-execution-config.test.js`：11/11 通过。
+- `node --test tests/*.test.js`：99/99 通过。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
++function continueOnFailureEnabled(step) {
++  if (!step || typeof step !== 'object') return false;
++  return enabledFlag(step.continue_on_failure ?? step.continueOnFailure);
++}
+@@
+-          appendStepResult(runtimeStep, i, 'failed', stepStartedAt, errorMsg, assertionLocator, null, {
++          appendStepResult(runtimeStep, i, shouldContinue ? 'skipped' : 'failed', stepStartedAt, stepErrorMsg, assertionLocator, null, {
+@@
++          if (shouldContinue) {
++            broadcastProgress('log', {
++              log: {
++                level: 'warning',
++                phase: 'step',
++                message: `步骤 ${i + 1}: ${runtimeStep.description || runtimeStep.action_type || ''} 执行失败，已跳过并继续执行`,
++              },
++            });
++            continue;
++          }
+           break;
+```
+
+### tests/effective-execution-config.test.js
+
+```diff
+@@
++test('CDP 播放步骤开启失败后继续时跳过当前步骤并执行后续步骤', async () => {
++  assert.equal(result.ok, false);
++  assert.equal(executionCount, 2);
++  assert.equal(savedResult.status, 'failed');
++  assert.deepEqual(
++    savedResult.raw.case_result.steps.map((step) => [step.step_id, step.status]),
++    [['STEP_FAIL', 'skipped'], ['STEP_PASS', 'passed']],
++  );
++  assert.equal(savedResult.raw.case_result.step_fail, 0);
++  assert.equal(savedResult.raw.case_result.step_skip, 1);
++  assert.equal(savedResult.raw.failed_step_index, 0);
++});
+```
+
 # 2026-08-17 统一变量引用语法并回传 CDP 保存变量定位器
 
 ## 涉及文件

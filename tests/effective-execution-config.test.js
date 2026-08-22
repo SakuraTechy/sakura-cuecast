@@ -360,3 +360,84 @@ test('pure infrastructure playback completes without creating a browser session'
     globalThis.chrome = originalChrome;
   }
 });
+
+test('CDP 播放步骤开启失败后继续时跳过当前步骤并执行后续步骤', async () => {
+  const originalChrome = globalThis.chrome;
+  let savedResult;
+  globalThis.chrome = {
+    runtime: {
+      id: 'cuecast-test-extension',
+      getManifest() { return { version: 'test' }; },
+      sendMessage() { return Promise.resolve(); },
+    },
+    notifications: { create() { return Promise.resolve(); } },
+  };
+  const api = {
+    registerOperationCapabilities() { return Promise.resolve({}); },
+    getAdminPlaywrightCase() {
+      return Promise.resolve({
+        data: {
+          case_id: 'CASE_CONTINUE',
+          name: '失败后继续用例',
+          effectiveExecutionConfig: {
+            browser_bootstrap_mode: 'none',
+            window_size_mode: 'maximized',
+            page_error_check_enabled: false,
+            screenshot_mode: 'standard',
+            step_timeout_ms: 5000,
+            case_timeout_ms: 60000,
+          },
+          steps: [
+            { id: 'STEP_FAIL', action_type: 'server_command', description: '允许失败', continue_on_failure: true },
+            { id: 'STEP_PASS', action_type: 'server_command', description: '继续执行' },
+          ],
+        },
+      });
+    },
+    saveAdminPlaywrightResult(_caseKey, result) {
+      savedResult = result;
+      return Promise.resolve({});
+    },
+  };
+  try {
+    const player = new PlayerManager({ mode: 'idle', activePlayCount: 0, authToken: 'token' }, api);
+    let executionCount = 0;
+    player._executeInfrastructureStep = async () => {
+      executionCount += 1;
+      if (executionCount === 1) throw new Error('受控步骤失败');
+      return {
+        executor: 'infrastructure-service',
+        taskId: 'TASK_PASS',
+        exitCode: 0,
+        affectedRows: null,
+        infrastructure: { schemaVersion: 2 },
+        variables: {},
+      };
+    };
+    player._broadcastPlayback = () => {};
+    player._notifyPopup = () => {};
+    player._showNotification = () => {};
+
+    const result = await player.start('CASE_CONTINUE', '', {
+      adminCaseKey: 'SCENE:CASE_CONTINUE',
+      batchId: 'BATCH_CONTINUE',
+      executionId: 'EXEC_CONTINUE',
+      executionCapability: 'capability',
+      dataSource: 'admin',
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(executionCount, 2);
+    assert.equal(savedResult.status, 'passed');
+    assert.equal(savedResult.error, '');
+    assert.deepEqual(
+      savedResult.raw.case_result.steps.map((step) => [step.step_id, step.status]),
+      [['STEP_FAIL', 'skipped'], ['STEP_PASS', 'passed']],
+    );
+    assert.equal(savedResult.raw.case_result.step_fail, 0);
+    assert.equal(savedResult.raw.case_result.step_skip, 1);
+    assert.equal(savedResult.raw.failed_step_index, null);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});

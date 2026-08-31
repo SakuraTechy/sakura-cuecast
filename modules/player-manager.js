@@ -1194,6 +1194,7 @@ export class PlayerManager {
           if (waitBefore) await this._sleep(waitBefore);
           const executableStep = waitBefore ? { ...runtimeStep, wait_before: 0 } : runtimeStep;
           const actionType = String(executableStep.action_type || '').trim().toLowerCase();
+          let stepExecutionResult = null;
 
           if (isInfrastructureStep(executableStep)) {
             const infrastructureResult = await this._executeInfrastructureStep(sourceCaseKey, executableStep, {
@@ -1366,11 +1367,17 @@ export class PlayerManager {
             actualLocator = await this._executeAssertTextStepCDP(playTabId, executableStep);
           } else if (cdpAvailable && this._canUseCDP(executableStep)) {
             try {
-              actualLocator = await this._executeStepCDP(playTabId, executableStep, targetUrl, ctx.locale, runtimeNextStep, {
+              const cdpResult = await this._executeStepCDP(playTabId, executableStep, targetUrl, ctx.locale, runtimeNextStep, {
                 beforeActionScreenshot: captureCurrentStep,
                 executionCapability: ctx.executionCapability,
                 executionBatchId: ctx.batchId,
               });
+              if (cdpResult?.__cdpStepResult === true) {
+                stepExecutionResult = cdpResult;
+                actualLocator = cdpResult.locator || null;
+              } else {
+                actualLocator = cdpResult;
+              }
             } catch (cdpErr) {
               if (PlayerManager._isCdpForeignExtensionError(cdpErr) && !useAdminCase) {
                 await this._detachDebugger(playTabId, ctx);
@@ -1386,11 +1393,14 @@ export class PlayerManager {
 
           await this._sleep(300);
 
-          if (playTabId != null && ['click', 'navigate', 'ai_natural', 'reload', 'switch_page'].includes(actionType)) {
+          const executionStatus = stepExecutionResult?.status || 'passed';
+          if (executionStatus !== 'skipped' && playTabId != null && ['click', 'navigate', 'ai_natural', 'reload', 'switch_page'].includes(actionType)) {
             await this._waitForTabLoad(playTabId, tabLoadTimeoutMs);
           }
           throwIfCaseTimedOut();
-          appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', actualLocator, null, {
+          stepTimingStatus = executionStatus === 'skipped' ? 'skipped' : 'success';
+          appendStepResult(runtimeStep, i, executionStatus, stepStartedAt, '', actualLocator, null, {
+            ...(stepExecutionResult?.details && typeof stepExecutionResult.details === 'object' ? stepExecutionResult.details : {}),
             ...(runtimeVariableReferences.length ? { variable_references: runtimeVariableReferences } : {}),
           });
         } catch (err) {
@@ -4694,6 +4704,147 @@ export class PlayerManager {
     };
   }
 
+  static _normalizeClickWhen(value) {
+    const normalized = String(value ?? '').trim().toLowerCase();
+    if (!normalized || ['always', 'any', 'none', 'no_check'].includes(normalized)) return 'always';
+    if (['off', 'unchecked', 'closed', 'inactive', 'false', '0', '关闭', '未选中', '未开启'].includes(normalized)) return 'off';
+    if (['on', 'checked', 'opened', 'active', 'true', '1', '开启', '已选中', '已开启'].includes(normalized)) return 'on';
+    if (['element_exists', 'exists', 'present', 'element_present', 'if_exists'].includes(normalized)) return 'element_exists';
+    return normalized;
+  }
+
+  static _clickConditionLocatorFields(step) {
+    const ref = step?.click_condition_ref;
+    const selector = String(step?.click_condition_selector || '').trim();
+    const xpath = String(step?.click_condition_xpath || '').trim();
+    if (selector || xpath) return { selector, xpath };
+    if (ref && typeof ref === 'object' && !Array.isArray(ref)) {
+      const strategy = String(ref.strategy || ref.type || '').trim().toLowerCase();
+      const value = String(ref.value || ref.locator_value || ref.locatorValue || '').trim();
+      return {
+        selector: strategy === 'css' ? value : String(ref.target_selector || ref.selector || '').trim(),
+        xpath: strategy === 'xpath' ? value : String(ref.target_xpath || ref.xpath || '').trim(),
+      };
+    }
+    const raw = String(ref || '').trim();
+    if (/^xpath\s*=/i.test(raw)) return { selector: '', xpath: raw.replace(/^xpath\s*=\s*/i, '').trim() };
+    if (/^css\s*=/i.test(raw)) return { selector: raw.replace(/^css\s*=\s*/i, '').trim(), xpath: '' };
+    if (raw.startsWith('/') || raw.startsWith('(') || raw.startsWith('.//')) return { selector: '', xpath: raw };
+    return { selector: raw, xpath: '' };
+  }
+
+  static _buildClickStateExpr(selector, xpath, text = '', locatorMeta = null) {
+    const targetChain = PlayerManager._buildDomTargetResultChain(selector, xpath, locatorMeta);
+    const textJson = JSON.stringify(String(text || '').replace(/\s+/g, ' ').trim());
+    return `(function(){
+      try {
+        var resolved = ${targetChain};
+        var el = resolved && resolved.el;
+        var needle = ${textJson};
+        function norm(v) { return String(v || '').replace(/\\s+/g, ' ').trim(); }
+        if (!el && needle) {
+          var textNodes = Array.from(document.querySelectorAll('button,a,input,label,[role="button"],[role="checkbox"],[role="switch"],[aria-pressed],[aria-checked"]'));
+          el = textNodes.find(function(node) { return norm(node.innerText || node.textContent) === needle; }) || null;
+        }
+        if (!el) return { ok: false, state: 'unknown', source: 'not_found', reason: 'not_found' };
+
+        var nodes = [];
+        function addNode(node) {
+          if (node && nodes.indexOf(node) < 0) nodes.push(node);
+        }
+        addNode(el);
+        try {
+          if (el.matches && el.matches('input[type="checkbox"],input[type="radio"]')) addNode(el);
+          var inner = el.querySelector && el.querySelector('input[type="checkbox"],input[type="radio"]');
+          addNode(inner);
+          var control = el.closest && el.closest('label');
+          if (control && control.control) addNode(control.control);
+          addNode(el.closest && el.closest('button,[role="checkbox"],[role="switch"],[role="button"],label'));
+        } catch (e1) {}
+
+        function stateFromValue(value) {
+          var valueText = String(value == null ? '' : value).trim().toLowerCase();
+          if (['true', '1', 'on', 'yes', 'checked', 'active', 'open', 'opened', 'enabled', 'selected', '开启', '打开', '启用', '已选中'].includes(valueText)) return 'on';
+          if (['false', '0', 'off', 'no', 'unchecked', 'inactive', 'closed', 'disabled', 'unselected', '关闭', '关闭状态', '未选中', '未开启'].includes(valueText)) return 'off';
+          return '';
+        }
+        function readAttribute(node, name) {
+          try {
+            if (!node || !node.getAttribute) return '';
+            return stateFromValue(node.getAttribute(name));
+          } catch (e2) { return ''; }
+        }
+        for (var i = 0; i < nodes.length; i++) {
+          var node = nodes[i];
+          if (typeof node.checked === 'boolean') return { ok: true, state: node.checked ? 'on' : 'off', source: 'checked' };
+          var attrs = ['aria-checked', 'aria-pressed', 'data-state', 'data-checked', 'data-on', 'data-active', 'data-status'];
+          for (var j = 0; j < attrs.length; j++) {
+            var attrState = readAttribute(node, attrs[j]);
+            if (attrState) return { ok: true, state: attrState, source: attrs[j] };
+          }
+        }
+        for (var k = 0; k < nodes.length; k++) {
+          var classText = String(nodes[k].className || '').toLowerCase();
+          var classState = classText.match(/(?:^|[-_\s])(on|off|open|opened|closed|active|inactive|checked|unchecked|enabled|disabled)(?=$|[-_\s])/);
+          if (classState) {
+            var normalizedClassState = stateFromValue(classState[1]);
+            if (normalizedClassState) return { ok: true, state: normalizedClassState, source: 'class' };
+          }
+        }
+        for (var m = 0; m < nodes.length; m++) {
+          var nodeText = norm(nodes[m].innerText || nodes[m].textContent).toLowerCase();
+          if (/(^|\s)(on|open|opened|active|enabled|checked|开启|打开|启用|已选中)(?=$|\s)/.test(nodeText)) return { ok: true, state: 'on', source: 'text' };
+          if (/(^|\s)(off|closed|inactive|disabled|unchecked|关闭|未选中|未开启)(?=$|\s)/.test(nodeText)) return { ok: true, state: 'off', source: 'text' };
+        }
+        return { ok: true, state: 'unknown', source: 'unknown' };
+      } catch (e) {
+        return { ok: false, state: 'unknown', source: 'lookup_error', reason: String(e && e.message || e) };
+      }
+    })()`;
+  }
+
+  static _buildElementExistsExpr(selector, xpath, locatorMeta = null) {
+    const targetChain = PlayerManager._buildDomTargetResultChain(selector, xpath, locatorMeta);
+    return `(function(){
+      try {
+        var resolved = ${targetChain};
+        var el = resolved && resolved.el;
+        return { ok: true, exists: Boolean(el), source: resolved && resolved.via || 'condition_locator' };
+      } catch (e) {
+        return { ok: false, exists: false, source: 'lookup_error', reason: String(e && e.message || e) };
+      }
+    })()`;
+  }
+
+  async _readClickStateCDP(tabId, step) {
+    const result = await this._cdpSend(tabId, 'Runtime.evaluate', {
+      expression: PlayerManager._buildClickStateExpr(
+        step?.target_selector || '',
+        step?.target_xpath || '',
+        step?.value || '',
+        step?.locator_meta,
+      ),
+      returnByValue: true,
+    });
+    return result?.result?.value || { ok: false, state: 'unknown', source: 'lookup_error', reason: 'empty_result' };
+  }
+
+  async _readClickConditionExistsCDP(tabId, step) {
+    const conditionLocator = PlayerManager._clickConditionLocatorFields(step);
+    if (!conditionLocator.selector && !conditionLocator.xpath) {
+      return { ok: false, exists: false, source: 'condition_locator_missing', reason: 'condition_locator_missing' };
+    }
+    const result = await this._cdpSend(tabId, 'Runtime.evaluate', {
+      expression: PlayerManager._buildElementExistsExpr(
+        conditionLocator.selector,
+        conditionLocator.xpath,
+        step?.click_condition_locator_meta,
+      ),
+      returnByValue: true,
+    });
+    return result?.result?.value || { ok: false, exists: false, source: 'lookup_error', reason: 'empty_result' };
+  }
+
   static _buildCdpLocatorDiagnostics(step, actualLocator, status, durationMs) {
     if (!actualLocator?.source) return null;
     const configuredLocators = PlayerManager._normalizeLocatorMetaCandidates(step?.locator_meta);
@@ -4709,7 +4860,7 @@ export class PlayerManager {
     return {
       version: 1,
       mode: 'cdp-ordered-candidate',
-      outcome: status === 'passed' ? 'resolved' : 'action-failed',
+      outcome: status === 'passed' ? 'resolved' : status === 'skipped' ? 'skipped' : 'action-failed',
       configured_candidate_count: configuredLocators.length,
       selected: {
         source: actualLocator.source || '',
@@ -5725,6 +5876,16 @@ export class PlayerManager {
               const r2 = w.getBoundingClientRect();
               if (r2.width > 0 || r2.height > 0) { target = w; r = r2; }
             }
+            if (r.width === 0 && r.height === 0 && el.id) {
+              // 部分 Element UI 页面把原生 input 与 label[for] 作为同级节点，不能只查祖先包装器。
+              const labels = document.getElementsByTagName('label');
+              for (let i = 0; i < labels.length; i++) {
+                const label = labels[i];
+                if (label.getAttribute('for') !== el.id) continue;
+                const r2 = label.getBoundingClientRect();
+                if (r2.width > 0 || r2.height > 0) { target = label; r = r2; break; }
+              }
+            }
           }
         }
         target.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
@@ -6701,7 +6862,16 @@ export class PlayerManager {
 
   // 通过 CSS/XPath/文本内容 查找元素坐标，带超时重试（页面处于 loading 时不扣减剩余时间）
   // skipDisabledCheck=true 用于浮层选项（选项本身不会 disabled）
-  async _getElementBoxResult(tabId, selector, xpath, textFallback = '', timeout = 5000, skipDisabledCheck = false, locatorMeta = null) {
+  async _getElementBoxResult(
+    tabId,
+    selector,
+    xpath,
+    textFallback = '',
+    timeout = 5000,
+    skipDisabledCheck = false,
+    locatorMeta = null,
+    requireHitTest = false,
+  ) {
     let remaining = this._getEffectiveWaitTimeout(tabId, timeout);
     const wallEnd = Date.now() + PlayerManager.LOADING_WAIT_WALL_MS;
     let lastStatus = null;
@@ -6713,6 +6883,13 @@ export class PlayerManager {
         returnByValue: true,
       });
       const box = res?.result?.value;
+      if (box && requireHitTest && box.hitOk === false) {
+        // 元素已渲染但仍被 loading mask/浮层挡住时，继续等待真正可点击。
+        lastStatus = { ok: false, reason: 'covered', covered: box.hit };
+        await this._sleep(120);
+        if (!loading) remaining -= 120;
+        continue;
+      }
       if (box) return { ok: true, box };
 
       const statusRes = await this._cdpSend(tabId, 'Runtime.evaluate', {
@@ -6867,6 +7044,10 @@ export class PlayerManager {
     }
     if (reason === 'hidden') {
       return `目标元素已找到，但不可见或尺寸为 0（等待超时）${treeDiag}\n  CSS: ${css}\n  XPath: ${xp}`;
+    }
+    if (reason === 'covered') {
+      const covered = result?.covered ? `\n  遮挡元素: ${result.covered}` : '';
+      return `目标不可点击：视口中心点在等待超时后仍被其它元素遮挡${covered}${treeDiag}\n  CSS: ${css}\n  XPath: ${xp}`;
     }
     if (reason === 'lookup_error') {
       return `查找目标元素时发生错误：${result?.message || 'unknown'}${treeDiag}\n  CSS: ${css}\n  XPath: ${xp}`;
@@ -9602,7 +9783,7 @@ export class PlayerManager {
         } else {
           // 普通点击：检查 disabled 状态，等待组件就绪（级联 Select 场景）
           const boxResult = await this._getElementBoxResult(
-            tabId, step.target_selector, step.target_xpath, step.value || '', 6000, false, step.locator_meta
+            tabId, step.target_selector, step.target_xpath, step.value || '', 6000, false, step.locator_meta, true
           );
           box = boxResult && boxResult.ok ? boxResult.box : null;
           const virtualBox = await this._findVirtualScrollTargetBoxCDP(tabId, step, { overlayOnly: false });
@@ -9634,6 +9815,7 @@ export class PlayerManager {
               2500,
               false,
               step.locator_meta,
+              true,
             );
             if (!freshResult || !freshResult.ok || !freshResult.box) {
               throw new Error(this._formatElementWaitFailure(freshResult, step.target_selector, step.target_xpath));
@@ -9651,6 +9833,48 @@ export class PlayerManager {
           }
           const treeDiag = await this._getTreeWaitDiagnosticSuffix(tabId, step.locator_meta);
           throw new Error(`${base}${treeDiag}\n  CSS: ${step.target_selector}\n  XPath: ${step.target_xpath}`);
+        }
+
+        const clickWhen = PlayerManager._normalizeClickWhen(step.click_when ?? step.details?.click_when);
+        if (!['always', 'off', 'on', 'element_exists'].includes(clickWhen)) {
+          throw new Error(`click_when 配置不支持: ${clickWhen}`);
+        }
+        if (clickWhen === 'element_exists') {
+          const conditionResult = await this._readClickConditionExistsCDP(tabId, step);
+          if (conditionResult?.exists !== true) {
+            const conditionLocator = PlayerManager._clickConditionLocatorFields(step);
+            return {
+              __cdpStepResult: true,
+              status: 'skipped',
+              locator: actualLocator,
+              details: {
+                click_condition: clickWhen,
+                condition_locator: conditionLocator.xpath || conditionLocator.selector,
+                actual_state: 'not_exists',
+                state_source: conditionResult?.source || 'condition_locator',
+                skip_reason: conditionResult?.reason === 'condition_locator_missing'
+                  ? 'condition_locator_missing'
+                  : 'condition_element_not_found',
+              },
+            };
+          }
+        } else if (clickWhen !== 'always') {
+          // 条件点击必须先确认状态；无法识别时跳过，避免再次切换开关到错误状态。
+          const stateResult = await this._readClickStateCDP(tabId, step);
+          const actualState = String(stateResult?.state || 'unknown');
+          if (actualState !== clickWhen) {
+            return {
+              __cdpStepResult: true,
+              status: 'skipped',
+              locator: actualLocator,
+              details: {
+                click_condition: clickWhen,
+                actual_state: actualState,
+                state_source: stateResult?.source || 'unknown',
+                skip_reason: actualState === 'unknown' ? 'element_state_unknown' : 'click_condition_not_met',
+              },
+            };
+          }
         }
 
         if (typeof hooks.beforeActionScreenshot === 'function') {

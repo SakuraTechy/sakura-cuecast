@@ -1,3 +1,277 @@
+# 2026-08-31 扩展 CDP 条件点击为指定元素存在判断
+
+## 涉及文件
+
+- modules/player-manager.js
+- tests/cuecast-recording-compatibility.test.js
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+普通 CDP 点击此前只按坐标直接发送鼠标事件，除了开关状态判断外，还无法根据页面上的状态标记元素是否存在来决定是否点击。
+
+## 变更内容
+
+1. CDP 普通点击支持 `click_when=off/on/element_exists`，读取开关状态或检查独立条件元素是否存在。
+2. `element_exists` 支持配置 XPath/CSS 条件元素，例如 `xpath=(//span[contains(text(),'OFF')])[2]`。
+3. 条件不满足或状态无法识别时返回 `skipped`，不发送 `_cdpClick`，并保存条件、实际状态、状态来源和跳过原因。
+4. 无条件点击保持原有行为；条件匹配时继续使用原有 CDP 坐标点击和定位诊断。
+5. 增加 CDP 条件点击回归测试，覆盖状态匹配点击、状态不匹配跳过、未知状态跳过和条件元素存在判断。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --input-type=module -e "...PlayerManager._buildClickStateExpr..."`：通过，状态读取表达式可编译。
+- `node --test tests/cuecast-recording-compatibility.test.js`：11/11 通过。
+- `node --test tests/*.test.js`：100/100 通过。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
+-              actualLocator = await this._executeStepCDP(playTabId, executableStep, targetUrl, ctx.locale, runtimeNextStep, {
++              const cdpResult = await this._executeStepCDP(playTabId, executableStep, targetUrl, ctx.locale, runtimeNextStep, {
+@@
++              if (cdpResult?.__cdpStepResult === true) {
++                stepExecutionResult = cdpResult;
++                actualLocator = cdpResult.locator || null;
++              } else {
++                actualLocator = cdpResult;
++              }
+@@
++        const clickWhen = PlayerManager._normalizeClickWhen(step.click_when ?? step.details?.click_when);
++        if (clickWhen === 'element_exists') {
++          const conditionResult = await this._readClickConditionExistsCDP(tabId, step);
++          if (conditionResult?.exists !== true) {
++            const conditionLocator = PlayerManager._clickConditionLocatorFields(step);
++            return {
++              __cdpStepResult: true,
++              status: 'skipped',
++              locator: actualLocator,
++              details: {
++                click_condition: clickWhen,
++                condition_locator: conditionLocator.xpath || conditionLocator.selector,
++                actual_state: 'not_exists',
++                state_source: conditionResult?.source || 'condition_locator',
++                skip_reason: conditionResult?.reason === 'condition_locator_missing'
++                  ? 'condition_locator_missing'
++                  : 'condition_element_not_found',
++              },
++            };
++          }
++        } else if (clickWhen !== 'always') {
++          // 条件点击必须先确认状态；无法识别时跳过，避免再次切换开关到错误状态。
++          const stateResult = await this._readClickStateCDP(tabId, step);
++          const actualState = String(stateResult?.state || 'unknown');
++          if (actualState !== clickWhen) {
++            return {
++              __cdpStepResult: true,
++              status: 'skipped',
++              locator: actualLocator,
++              details: {
++                click_condition: clickWhen,
++                actual_state: actualState,
++                state_source: stateResult?.source || 'unknown',
++                skip_reason: actualState === 'unknown' ? 'element_state_unknown' : 'click_condition_not_met',
++              },
++            };
++          }
++        }
+```
+
+### tests/cuecast-recording-compatibility.test.js
+
+```diff
+@@
++test('CDP 条件点击仅在目标状态匹配时发送鼠标事件', async () => {
++  assert.equal(PlayerManager._normalizeClickWhen('关闭'), 'off');
++  assert.equal(PlayerManager._normalizeClickWhen('checked'), 'on');
++  const stateExpression = PlayerManager._buildClickStateExpr('#toggle', '', '', null);
++  assert.match(stateExpression, /aria-checked/);
++  assert.match(stateExpression, /data-state/);
++
++  const matched = createClickManager('off');
++  const matchedResult = await matched.manager._executeStepCDP(1, {
++    action_type: 'click',
++    click_when: 'off',
++    target_selector: '#toggle',
++  });
++  assert.equal(matched.getClickCount(), 1);
++  assert.equal(matchedResult.source, 'target_selector');
++
++  for (const state of ['on', 'unknown']) {
++    const skipped = createClickManager(state);
++    const skippedResult = await skipped.manager._executeStepCDP(1, {
++      action_type: 'click',
++      click_when: 'off',
++      target_selector: '#toggle',
++    });
++    assert.equal(skipped.getClickCount(), 0);
++    assert.equal(skippedResult.status, 'skipped');
++  }
++});
+```
+
+### tests/operation-contract.test.js
+
+```diff
+@@
+-  assert.equal(fieldCount, 125);
++  assert.equal(fieldCount, 127);
+```
+
+# 2026-08-31 修复 CDP 点击等待遮挡状态
+
+## 涉及文件
+
+- modules/player-manager.js
+- ../sakura-playwright/tests/integration/semantic-locator.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+页面异步加载期间，CDP 已经找到目标元素并取得尺寸，但视口中心点仍被 loading mask、过渡层或其它浮层遮挡。原有等待逻辑只对“找不到元素”重试，拿到 `hitOk=false` 后立即执行点击并失败。
+
+## 变更内容
+
+1. 普通 CDP 点击在目标存在但命中检测失败时，以 120ms 间隔继续等待目标真正可点击。
+2. 遮挡期间如果页面仍处于已识别的 loading UI，暂停逻辑超时计时；超时后保留遮挡元素信息，返回明确的不可点击诊断。
+3. 增加临时遮罩消失后继续点击的真实 CDP 回归测试。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --test tests/cuecast-recording-compatibility.test.js`：通过。
+- `npm run check`：通过。
+- `node --test tests/integration/semantic-locator.test.js --test-name-pattern="CueCast CDP click waits for a temporary covering mask|CueCast CDP click promotes a same-level label"`：20/20 通过。
+- `node --test tests/*.test.js`：98/99，通过；剩余 1 条为既有 `operation-contract.test.js` 的 `125` 与 `126` 计数波动，不涉及本次修改。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
+-  async _getElementBoxResult(tabId, selector, xpath, textFallback = '', timeout = 5000, skipDisabledCheck = false, locatorMeta = null) {
++  async _getElementBoxResult(
++    tabId,
++    selector,
++    xpath,
++    textFallback = '',
++    timeout = 5000,
++    skipDisabledCheck = false,
++    locatorMeta = null,
++    requireHitTest = false,
++  ) {
+@@
+       const box = res?.result?.value;
++      if (box && requireHitTest && box.hitOk === false) {
++        // 元素已渲染但仍被 loading mask/浮层挡住时，继续等待真正可点击。
++        lastStatus = { ok: false, reason: 'covered', covered: box.hit };
++        await this._sleep(120);
++        if (!loading) remaining -= 120;
++        continue;
++      }
+@@
+-            step.target_selector, step.target_xpath, step.value || '', 6000, false, step.locator_meta
++            step.target_selector, step.target_xpath, step.value || '', 6000, false, step.locator_meta, true
+@@
+               step.locator_meta,
++              true,
+@@
++    if (reason === 'covered') {
++      const covered = result?.covered ? `\n  遮挡元素: ${result.covered}` : '';
++      return `目标不可点击：视口中心点在等待超时后仍被其它元素遮挡${covered}${treeDiag}\n  CSS: ${css}\n  XPath: ${xp}`;
++    }
+```
+
+### ../sakura-playwright/tests/integration/semantic-locator.test.js
+
+```diff
+@@
++test('CueCast CDP click waits for a temporary covering mask to disappear', async () => {
++  const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
++  await page.setContent(`
++    <button id="target">扩展配置</button><div id="cover"></div>
++    <script>setTimeout(() => document.getElementById('cover').remove(), 220);</script>
++  `);
++  const result = await PlayerManager.prototype._getElementBoxResult.call({
++    _buildFindCode: PlayerManager.prototype._buildFindCode.bind({}),
++    _sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
++    _cdpSend: (_tabId, method, params) => cdpSession.send(method, params),
++  }, 1, '#target', '', '', 1000, false, null, true);
++  assert.equal(result.ok, true);
++  assert.equal(result.box.hitOk, true);
++});
+```
+
+# 2026-08-31 修复 CDP 隐藏表头复选框点击
+
+## 涉及文件
+
+- modules/player-manager.js
+- ../sakura-playwright/tests/integration/semantic-locator.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+Element UI 表格表头的全选控件将原生 `input` 设置为 `display: none`，并把可点击的 `label[for]` 作为同级节点渲染。CueCast CDP 定位只检查隐藏 input 的祖先包装器，无法取得可见坐标，导致步骤报为“目标元素已找到，但不可见或尺寸为 0”。
+
+## 变更内容
+
+1. 隐藏 checkbox/radio 没有可见祖先包装器时，按 input `id` 查找同级关联 `label[for]`，使用可见 label 的矩形和命中检测执行 CDP 点击。
+2. 增加真实表格表头 DOM 回归测试，验证同级关联 label 可被 CDP 坐标点击并切换原生 checkbox 状态。
+
+## 验证
+
+- `node --check modules/player-manager.js`：通过。
+- `node --test tests/*.test.js`：99/99 通过。
+- `npm run check`：通过。
+- `node --test tests/integration/semantic-locator.test.js --test-name-pattern="CueCast CDP click promotes a same-level label"`：19/19 通过。
+
+## 具体代码改动
+
+### modules/player-manager.js
+
+```diff
+@@
+             if (w) {
+               const r2 = w.getBoundingClientRect();
+               if (r2.width > 0 || r2.height > 0) { target = w; r = r2; }
+             }
++            if (r.width === 0 && r.height === 0 && el.id) {
++              // 部分 Element UI 页面把原生 input 与 label[for] 作为同级节点，不能只查祖先包装器。
++              const labels = document.getElementsByTagName('label');
++              for (let i = 0; i < labels.length; i++) {
++                const label = labels[i];
++                if (label.getAttribute('for') !== el.id) continue;
++                const r2 = label.getBoundingClientRect();
++                if (r2.width > 0 || r2.height > 0) { target = label; r = r2; break; }
++              }
++            }
+           }
+```
+
+### ../sakura-playwright/tests/integration/semantic-locator.test.js
+
+```diff
+@@
+ test('hidden Element-style checkbox is promoted to its visible label', async () => {
+@@
+ });
++
++test('CueCast CDP click promotes a same-level label for hidden table checkbox', async () => {
++  const expression = PlayerManager.prototype._buildFindCode.call({}, selector, '//*[@id="1-select-all"]');
++  const box = await page.evaluate(expression);
++  assert.equal(box.hitOk, true);
++  await page.mouse.click(box.x, box.y);
++  assert.equal(await checkbox.isChecked(), true);
++});
+```
+
 # 2026-08-21 修复 CDP SQL 参数缺少任务定义快照
 
 ## 涉及文件

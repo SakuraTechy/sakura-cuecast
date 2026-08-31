@@ -168,3 +168,84 @@ test('非法正则在 CueCast CDP 执行前返回明确错误', async () => {
     expect: '[invalid',
   }), /正则表达式不合法/);
 });
+
+test('CDP 条件点击仅在目标状态匹配时发送鼠标事件', async () => {
+  assert.equal(PlayerManager._normalizeClickWhen('关闭'), 'off');
+  assert.equal(PlayerManager._normalizeClickWhen('checked'), 'on');
+  const stateExpression = PlayerManager._buildClickStateExpr('#toggle', '', '', null);
+  assert.match(stateExpression, /aria-checked/);
+  assert.match(stateExpression, /data-state/);
+  const existsExpression = PlayerManager._buildElementExistsExpr('', "(//span[contains(text(),'OFF')])[2]", null);
+  new Function(`return ${existsExpression}`);
+  assert.deepEqual(PlayerManager._clickConditionLocatorFields({
+    click_condition_ref: { strategy: 'xpath', value: "(//span[contains(text(),'OFF')])[2]" },
+  }), { selector: '', xpath: "(//span[contains(text(),'OFF')])[2]" });
+
+  const createClickManager = (state) => {
+    const manager = createManager();
+    let clickCount = 0;
+    manager._validateStepXpathsCDP = async () => {};
+    manager._getElementBoxResult = async () => ({
+      ok: true,
+      box: { x: 10, y: 20, via: 'css', hitOk: true },
+    });
+    manager._findVirtualScrollTargetBoxCDP = async () => null;
+    manager._readClickStateCDP = async () => ({ ok: true, state, source: 'aria-pressed' });
+    manager._cdpClick = async () => { clickCount += 1; };
+    manager._sleep = async () => {};
+    return { manager, getClickCount: () => clickCount };
+  };
+
+  const matched = createClickManager('off');
+  const matchedResult = await matched.manager._executeStepCDP(1, {
+    action_type: 'click',
+    click_when: 'off',
+    target_selector: '#toggle',
+  });
+  assert.equal(matched.getClickCount(), 1);
+  assert.equal(matchedResult.source, 'target_selector');
+
+  for (const state of ['on', 'unknown']) {
+    const skipped = createClickManager(state);
+    const skippedResult = await skipped.manager._executeStepCDP(1, {
+      action_type: 'click',
+      click_when: 'off',
+      target_selector: '#toggle',
+    });
+    assert.equal(skipped.getClickCount(), 0);
+    assert.equal(skippedResult.__cdpStepResult, true);
+    assert.equal(skippedResult.status, 'skipped');
+    assert.equal(skippedResult.details.actual_state, state);
+  }
+
+  const exists = createClickManager('unknown');
+  exists.manager._readClickConditionExistsCDP = async () => ({
+    ok: true,
+    exists: true,
+    source: 'xpath',
+  });
+  const existsResult = await exists.manager._executeStepCDP(1, {
+    action_type: 'click',
+    click_when: 'element_exists',
+    click_condition_ref: { strategy: 'xpath', value: "(//span[contains(text(),'OFF')])[2]" },
+    target_selector: '#toggle',
+  });
+  assert.equal(exists.getClickCount(), 1);
+  assert.equal(existsResult.source, 'target_selector');
+
+  const missing = createClickManager('unknown');
+  missing.manager._readClickConditionExistsCDP = async () => ({
+    ok: true,
+    exists: false,
+    source: 'xpath',
+  });
+  const missingResult = await missing.manager._executeStepCDP(1, {
+    action_type: 'click',
+    click_when: 'element_exists',
+    click_condition_ref: { strategy: 'xpath', value: "(//span[contains(text(),'OFF')])[2]" },
+    target_selector: '#toggle',
+  });
+  assert.equal(missing.getClickCount(), 0);
+  assert.equal(missingResult.status, 'skipped');
+  assert.equal(missingResult.details.actual_state, 'not_exists');
+});

@@ -200,17 +200,17 @@ export class ApiClient {
   aiStepPlan(body, opts = {}) {
     const q = opts.debug ? '?debug=1' : '';
     const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 100000;
-    return this.request('POST', `/ai/step-plan${q}`, body, { timeoutMs });
+    return this.request('POST', `/automation/ai/step-plan${q}`, body, { timeoutMs });
   }
 
   aiVariableExtractRule(body, opts = {}) {
-    const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 60000;
-    return this.request('POST', '/ai/variable-extract-rule', body, { timeoutMs });
+    const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 100000;
+    return this.request('POST', '/automation/ai/variable-extract-rule', body, { timeoutMs });
   }
 
   aiVisionRecognize(body, opts = {}) {
-    const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 60000;
-    return this.request('POST', '/ai/vision-recognize', body, { timeoutMs });
+    const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 100000;
+    return this.request('POST', '/automation/ai/vision-recognize', body, { timeoutMs });
   }
 
   /**

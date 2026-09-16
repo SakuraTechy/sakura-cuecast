@@ -1827,7 +1827,34 @@
   }
 
   function getAssertionSourceValue(el) {
-    return getVariableSourceValue(el);
+    return getAssertionReadValue(el, 'auto').value;
+  }
+
+  function normalizeAssertionReadMode(input) {
+    const mode = String(input || '').trim().toLowerCase();
+    return ['auto', 'text', 'attribute', 'value'].includes(mode) ? mode : 'auto';
+  }
+
+  function getAssertionReadValue(el, rawReadMode = 'auto', rawAttribute = '') {
+    const readMode = normalizeAssertionReadMode(rawReadMode);
+    const attribute = String(rawAttribute || '').trim();
+    if (readMode === 'attribute') {
+      if (!attribute) return { ok: false, value: '', attributeMissing: true, attribute };
+      if (!el?.hasAttribute?.(attribute)) return { ok: false, value: '', attributeMissing: true, attribute };
+      return { ok: true, value: String(el.getAttribute(attribute) ?? ''), attribute };
+    }
+    if (readMode === 'value') {
+      return { ok: true, value: 'value' in (el || {}) ? String(el.value ?? '') : '' };
+    }
+    if (readMode === 'auto') return { ok: true, value: getVariableSourceValue(el) };
+    return { ok: true, value: String(el?.innerText ?? el?.textContent ?? '') };
+  }
+
+  function assertionReadModeLabel(mode) {
+    if (mode === 'text') return '元素文本';
+    if (mode === 'attribute') return '元素属性';
+    if (mode === 'value') return '输入值';
+    return '自动';
   }
 
   function defaultAssertionMatchFromElement(el) {
@@ -1989,10 +2016,13 @@
     };
   }
 
-  function buildAssertionStep(el, target, match, expectedValue) {
+  function buildAssertionStep(el, target, match, expectedValue, rawReadMode = 'auto', rawAttribute = '') {
     const assertionTarget = normalizeAssertionTarget(target);
     const assertionMatch = normalizeAssertionMatch(match, assertionTarget);
     const usesElement = assertionTarget === 'element';
+    const readMode = usesElement && assertionMatch !== 'visible' ? normalizeAssertionReadMode(rawReadMode) : 'auto';
+    const attribute = readMode === 'attribute' ? String(rawAttribute || '').trim() : '';
+    if (readMode === 'attribute' && !attribute) return null;
     const targetSelector = usesElement ? ensureUniqueSelector(el, getUniqueSelector(el)) : '';
     const targetXpath = usesElement ? getXPath(el) : '';
     const expected = assertionMatch === 'visible' ? '' : String(expectedValue ?? '');
@@ -2004,8 +2034,10 @@
     meta.context.assertion = {
       target: assertionTarget,
       match: assertionMatch,
-      source: usesElement ? getVariableSourceKind(el) : assertionTarget,
-      preview: String(expectedValue ?? '').trim().replace(/\s+/g, ' ').slice(0, 200),
+      source: usesElement ? readMode : assertionTarget,
+      ...(attribute ? { attribute } : {}),
+      // 定位元数据会作为执行定义回传，不能截断 data URL 等断言期望值。
+      preview: String(expectedValue ?? '').trim().replace(/\s+/g, ' '),
     };
     const targetLabel = assertionTargetLabel(assertionTarget);
     const matchLabel = assertionMatchLabel(assertionMatch);
@@ -2015,6 +2047,7 @@
       target_xpath: targetXpath,
       value: expected,
       value_text: expected,
+      ...(usesElement ? { read_mode: readMode, ...(attribute ? { attribute } : {}) } : {}),
       url: location.href,
       description: assertionMatch === 'visible'
         ? `断言${targetLabel}可见`
@@ -2336,8 +2369,28 @@
         </div>
         <div class="__at_var_preview__ __at_assert_preview__">
           <span class="__at_var_label__">当前值</span>
-          <code>${escapeHtml(preview || '(empty)')}</code>
+          <code id="__at_assert_current_value__">${escapeHtml(preview || '(empty)')}</code>
         </div>
+        <div class="__at_var_field__" id="__at_assert_read_mode_wrap__">
+          <span class="__at_var_label__">读取方式</span>
+          <input id="__at_assert_read_mode__" type="hidden" value="auto" />
+          <div class="__at_select__" id="__at_assert_read_mode_select__">
+            <button type="button" class="__at_select_trigger__" id="__at_assert_read_mode_trigger__" aria-haspopup="listbox" aria-expanded="false">
+              <span id="__at_assert_read_mode_label__">自动</span>
+              <span class="__at_select_chevron__">⌄</span>
+            </button>
+            <div class="__at_select_menu__" id="__at_assert_read_mode_menu__" role="listbox" hidden>
+              <button type="button" class="__at_select_option__" data-assert-read-mode="auto" role="option">自动</button>
+              <button type="button" class="__at_select_option__" data-assert-read-mode="text" role="option">元素文本</button>
+              <button type="button" class="__at_select_option__" data-assert-read-mode="attribute" role="option">元素属性</button>
+              <button type="button" class="__at_select_option__" data-assert-read-mode="value" role="option">输入值</button>
+            </div>
+          </div>
+        </div>
+        <label class="__at_var_field__" id="__at_assert_attribute_wrap__" hidden>
+          <span class="__at_var_label__">属性名</span>
+          <input id="__at_assert_attribute__" value="" autocomplete="off" spellcheck="false" placeholder="例如：class" />
+        </label>
         <div class="__at_var_field__">
           <span class="__at_var_label__">匹配方式</span>
           <input id="__at_assert_match__" type="hidden" value="${escapeHtml(defaultMatch)}" />
@@ -2382,9 +2435,45 @@
     const expectedWrap = overlay.querySelector('#__at_assert_expected_wrap__');
     const expectedInput = overlay.querySelector('#__at_assert_expected__');
     const error = overlay.querySelector('#__at_assert_error__');
+    const currentValue = overlay.querySelector('#__at_assert_current_value__');
+    const readModeWrap = overlay.querySelector('#__at_assert_read_mode_wrap__');
+    const readModeInput = overlay.querySelector('#__at_assert_read_mode__');
+    const readModeSelectRoot = overlay.querySelector('#__at_assert_read_mode_select__');
+    const readModeTrigger = overlay.querySelector('#__at_assert_read_mode_trigger__');
+    const readModeLabel = overlay.querySelector('#__at_assert_read_mode_label__');
+    const readModeMenu = overlay.querySelector('#__at_assert_read_mode_menu__');
+    const readModeButtons = Array.from(overlay.querySelectorAll('[data-assert-read-mode]'));
+    const attributeWrap = overlay.querySelector('#__at_assert_attribute_wrap__');
+    const attributeInput = overlay.querySelector('#__at_assert_attribute__');
+    let expectedTouched = false;
     const closeMatchSelect = () => {
       matchMenu.hidden = true;
       matchTrigger.setAttribute('aria-expanded', 'false');
+    };
+    const closeReadModeSelect = () => {
+      readModeMenu.hidden = true;
+      readModeTrigger.setAttribute('aria-expanded', 'false');
+    };
+    const refreshReadValue = () => {
+      const target = pendingAssertionTarget;
+      const result = getAssertionReadValue(target?.el, readModeInput.value, attributeInput.value);
+      if (currentValue) currentValue.textContent = result.ok ? (result.value || '(empty)') : (result.attributeMissing ? '属性不存在' : '读取失败');
+      if (!expectedTouched && expectedInput && result.ok) expectedInput.value = result.value;
+      if (!result.ok && result.attributeMissing && readModeInput.value === 'attribute') {
+        error.textContent = attributeInput.value.trim() ? `目标元素不存在属性“${attributeInput.value.trim()}”。` : '请输入属性名。';
+      }
+    };
+    const updateReadMode = (mode) => {
+      const normalizedMode = normalizeAssertionReadMode(mode);
+      readModeInput.value = normalizedMode;
+      readModeLabel.textContent = assertionReadModeLabel(normalizedMode);
+      readModeButtons.forEach((btn) => {
+        const selected = btn.dataset.assertReadMode === normalizedMode;
+        btn.classList.toggle('__at_selected__', selected);
+        btn.setAttribute('aria-selected', selected ? 'true' : 'false');
+      });
+      attributeWrap.hidden = normalizedMode !== 'attribute' || matchInput.value === 'visible';
+      refreshReadValue();
     };
     const updateMatch = (match) => {
       const normalizedMatch = normalizeAssertionMatch(match, 'element');
@@ -2396,8 +2485,24 @@
         btn.setAttribute('aria-selected', selected ? 'true' : 'false');
       });
       expectedWrap.hidden = normalizedMatch === 'visible';
+      readModeWrap.hidden = normalizedMatch === 'visible';
+      attributeWrap.hidden = readModeInput.value !== 'attribute' || normalizedMatch === 'visible';
       error.textContent = '';
+      if (normalizedMatch !== 'visible') refreshReadValue();
     };
+    readModeTrigger.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const open = readModeMenu.hidden;
+      readModeMenu.hidden = !open;
+      readModeTrigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+    readModeButtons.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        updateReadMode(btn.dataset.assertReadMode || 'auto');
+        closeReadModeSelect();
+      });
+    });
     matchTrigger.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -2413,6 +2518,13 @@
     });
     overlay.addEventListener('click', (event) => {
       if (!matchSelectRoot.contains(event.target)) closeMatchSelect();
+      if (!readModeSelectRoot.contains(event.target)) closeReadModeSelect();
+    });
+    attributeInput.addEventListener('input', () => {
+      refreshReadValue();
+    });
+    expectedInput.addEventListener('input', () => {
+      expectedTouched = true;
     });
     expectedInput.addEventListener('keydown', (event) => {
       if (event.key === 'Enter') {
@@ -2430,6 +2542,13 @@
       const targetName = 'element';
       const match = normalizeAssertionMatch(matchInput.value, targetName);
       const expected = String(expectedInput.value || '');
+      const readMode = normalizeAssertionReadMode(readModeInput.value);
+      const attribute = String(attributeInput.value || '').trim();
+      if (readMode === 'attribute' && !attribute) {
+        error.textContent = '请输入属性名。';
+        attributeInput.focus();
+        return;
+      }
       if (match !== 'visible' && expected.trim() === '') {
         error.textContent = '请输入期望值，或改用元素可见断言。';
         expectedInput.focus();
@@ -2437,8 +2556,9 @@
       }
       const target = pendingAssertionTarget;
       closeAssertionDialog();
-      if (target?.el) createAssertionStepFromTarget(target.el, targetName, match, expected);
+      if (target?.el) createAssertionStepFromTarget(target.el, targetName, match, expected, readMode, attribute);
     });
+    updateReadMode('auto');
     updateMatch(defaultMatch);
     setTimeout(() => {
       if (!expectedWrap.hidden) {
@@ -2450,8 +2570,9 @@
     }, 0);
   }
 
-  function createAssertionStepFromTarget(el, target, match, expectedValue) {
-    const step = buildAssertionStep(el, target, match, expectedValue);
+  function createAssertionStepFromTarget(el, target, match, expectedValue, readMode = 'auto', attribute = '') {
+    const step = buildAssertionStep(el, target, match, expectedValue, readMode, attribute);
+    if (!step) return;
     const visualEl = resolveVisualHighlightForFormControl(el) || el;
     const crop = getThumbCropRect(visualEl);
     const r = visualEl.getBoundingClientRect();

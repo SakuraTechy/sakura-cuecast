@@ -45,6 +45,15 @@ test('元素断言表达式检查真实可见性并按 read_mode 读取值', () 
   assert.match(expression, /'value' in el/);
 });
 
+test('元素断言表达式按属性读取当前 DOM 属性并区分属性缺失', () => {
+  const expression = PlayerManager._buildElementAssertionExpr('#state', '', 'attribute', null, 'class');
+
+  assert.match(expression, /hasAttribute/);
+  assert.match(expression, /getAttribute/);
+  assert.match(expression, /attribute_present: false/);
+  assert.match(expression, /"class"/);
+});
+
 test('括号 XPath 在所有 CDP 表达式中保持原样并复用 locator_meta 候选', () => {
   const xpath = "(//span[@class='user-title'])[1]";
   assert.equal(PlayerManager._normalizeXPath(xpath), xpath);
@@ -167,6 +176,48 @@ test('非法正则在 CueCast CDP 执行前返回明确错误', async () => {
     match_mode: 'regex',
     expect: '[invalid',
   }), /正则表达式不合法/);
+});
+
+test('统一元素断言按属性模式使用原始字符串匹配', async () => {
+  const manager = createManager();
+  manager._waitForElementAssertionCDP = async () => ({
+    ok: true,
+    visible: true,
+    value: 'icon-inner  running',
+    attribute_present: true,
+    via: 'css',
+    matched_count: 1,
+    visible_count: 1,
+  });
+  manager._logAssertTextCdpDebug = () => {};
+
+  const result = await manager._executeAssertTextStepCDP(5, {
+    action_type: 'assert_element_match',
+    target_selector: '#state',
+    read_mode: 'attribute',
+    attribute: 'class',
+    match_mode: 'equals',
+    expect: 'icon-inner  running',
+  });
+  assert.equal(result.operationAssertion.subject, '元素属性 class');
+
+  manager._waitForElementAssertionCDP = async () => ({
+    ok: true,
+    visible: true,
+    value: '',
+    attribute_present: false,
+    via: 'css',
+    matched_count: 1,
+    visible_count: 1,
+  });
+  await assert.rejects(() => manager._executeAssertTextStepCDP(5, {
+    action_type: 'assert_element_match',
+    target_selector: '#state',
+    read_mode: 'attribute',
+    attribute: 'data-status',
+    match_mode: 'not_contains',
+    expect: 'running',
+  }), /属性名|属性不存在/);
 });
 
 test('CDP 条件点击仅在目标状态匹配时发送鼠标事件', async () => {

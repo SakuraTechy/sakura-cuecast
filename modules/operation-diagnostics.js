@@ -111,6 +111,7 @@ export function buildOperationDiagnostic(definitionStep = {}, runtimeStep = {}, 
     definitionStep.diagnostic_profile || definitionStep.diagnosticProfile || ACTION_PROFILES[actionType] || 'generic',
   );
   const assertion = result.operation_assertion ? safeAssertion(result.operation_assertion) : null;
+  const summary = summaryFor(actionType, result.status);
   const operation = {
     schema_version: 1,
     ...(firstText(definitionStep.catalog_version, runtimeStep.catalog_version)
@@ -128,13 +129,13 @@ export function buildOperationDiagnostic(definitionStep = {}, runtimeStep = {}, 
         ? { method_label: firstText(definitionStep.method_label, definitionStep.methodLabel) } : {}),
       action_type: actionType || 'custom',
     },
-    summary: summaryFor(actionType),
+    summary,
     // 断言的执行值是页面实际读取结果，不能继续把期望值误当成执行值。
     inputs: applyAssertionActual(collectInputs(definitionStep, runtimeStep), profile, assertion),
     outcome: {
       kind: profile,
       status: result.status || 'unknown',
-      summary: summaryFor(actionType),
+      summary,
       facts: collectFacts(result),
       ...(assertion ? { assertion } : {}),
     },
@@ -235,7 +236,8 @@ function safeAssertion(assertion) {
     if (!value || typeof value !== 'object') continue;
     const state = String(value.value_state || 'visible');
     output[key] = state === 'visible' || state === 'truncated'
-      ? { value_state: state, ...(value.preview != null ? { preview: safeText(value.preview) } : {}) }
+      // 断言值是判定依据，data URL 等长文本必须与配置值、执行值保持一致。
+      ? { value_state: state, ...(value.preview != null ? { preview: fullText(value.preview) } : {}) }
       : { value_state: state };
   }
   return output;
@@ -277,14 +279,20 @@ function readValue(step, key) {
   return aliases.reduce((value, name) => value === undefined ? step[name] : value, undefined);
 }
 
-function summaryFor(actionType) {
+function summaryFor(actionType, status) {
   const labels = {
     navigate: '页面导航完成', click: '点击完成', input: '输入完成', select_option: '选项选择完成',
     wait: '固定等待完成', assert_text: '文本检查通过', assert_attribute: '属性检查通过',
     global_variable_set: '全局变量设置完成', evaluate: '脚本执行完成', server_command: '服务器命令执行完成',
     database_sql: '数据库操作完成',
   };
-  return labels[actionType] || `动作 ${actionType || 'custom'} 执行完成`;
+  const summary = labels[actionType] || `动作 ${actionType || 'custom'} 执行完成`;
+  if (normalize(status) === 'passed') return summary;
+  // 摘要与实际状态保持一致，定位失败、跳过或取消都不能显示为“检查通过”。
+  const ending = {
+    failed: '失败', skipped: '已跳过', cancelled: '已取消', canceled: '已取消', timeout: '超时',
+  }[normalize(status)] || '状态未知';
+  return summary.replace(/(?:通过|完成)$/, ending);
 }
 
 function safeUrl(value, truncate = true) {

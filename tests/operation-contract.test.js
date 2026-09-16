@@ -23,6 +23,22 @@ const catalog = JSON.parse(fs.readFileSync(new URL(
 const profileByMethod = Object.fromEntries(Object.entries(catalog.diagnostic_profiles)
   .flatMap(([profile, methods]) => methods.map((methodCode) => [methodCode, profile])));
 
+test('CueCast 执行摘要遵循实际状态，失败和跳过不会写成通过', () => {
+  const expectedSummaries = {
+    passed: '属性检查通过', failed: '属性检查失败', skipped: '属性检查已跳过',
+    cancelled: '属性检查已取消', canceled: '属性检查已取消', timeout: '属性检查超时',
+    unknown: '属性检查状态未知',
+  };
+  for (const [status, summary] of Object.entries(expectedSummaries)) {
+    const result = attachOperationDiagnostic({ action_type: 'assert_attribute', status }, { action_type: 'assert_attribute' });
+    assert.equal(result.details.operation.summary, summary);
+    assert.equal(result.details.operation.outcome.summary, summary);
+    assert.equal(result.details.operation.outcome.status, status);
+  }
+  const failedClick = attachOperationDiagnostic({ action_type: 'click', status: 'failed' });
+  assert.equal(failedClick.details.operation.summary, '点击失败');
+});
+
 test('CueCast registry covers every canonical action in the 63-method fixture', () => {
   assert.equal(fixture.catalog_version, OPERATION_CATALOG_VERSION);
   assert.equal(fixture.methods.length, 63);
@@ -129,7 +145,7 @@ test('所有目录 form_schema 字段都进入 CueCast 执行详情', () => {
       fieldCount += method.form_schema.length;
     }
   }
-  assert.equal(fieldCount, 127);
+  assert.equal(fieldCount, 137);
 });
 
 test('CueCast 变量引用详情只输出脱敏预览并保留来源', () => {
@@ -201,6 +217,22 @@ test('CueCast 录制动作只在运行副本中转换为 canonical action', () =
   assert.deepEqual(assertion.locator_meta, assertionLocatorMeta);
 });
 
+test('CueCast 属性断言优先使用 expect 并兼容录制元数据预览', () => {
+  const dataUrl = `data:image/jpg;base64,${'a'.repeat(2048)}`;
+  const step = {
+    action_type: 'assert_text',
+    expect: dataUrl,
+    value: '',
+    locator_meta: {
+      assertion: { target: 'element', match: 'contains' },
+      context: { assertion: { target: 'element', match: 'contains', source: 'attribute', attribute: 'src', preview: dataUrl } },
+    },
+  };
+
+  assert.equal(PlayerManager._adaptRecordedStep(step).expect, dataUrl);
+  assert.equal(PlayerManager._resolveAssertionExpectedValue({ ...step, expect: '' }), dataUrl);
+});
+
 test('CueCast CDP 定位诊断可以从真实 via 生成定位摘要', () => {
   assert.deepEqual(PlayerManager._actualLocatorFromVia({ target_selector: '#login' }, 'css'), {
     source: 'target_selector',
@@ -254,6 +286,40 @@ test('CueCast 五种元素断言匹配方式保持实际值对期望值的比较
     PlayerManager._resolveAssertionConfig({ action_type: 'assert_element_match', match_mode: 'visible' }, true),
     { target: 'element', match: 'visible', readMode: 'auto' },
   );
+});
+
+test('CueCast CDP 属性断言可读取由 DOM 属性设置的图片 src', () => {
+  const imageSrc = 'data:image/jpg;base64,encoded-image';
+  const element = {
+    nodeType: 1,
+    tagName: 'IMG',
+    hidden: false,
+    parentElement: null,
+    currentSrc: imageSrc,
+    src: imageSrc,
+    hasAttribute: () => false,
+    getAttribute: () => null,
+    getBoundingClientRect: () => ({ width: 120, height: 120 }),
+    getClientRects: () => [{ width: 120, height: 120 }],
+  };
+  const document = {
+    querySelectorAll: () => [element],
+  };
+  const window = {
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+  };
+  const expression = PlayerManager._buildElementAssertionExpr(
+    'img.weixin-icon',
+    '',
+    'attribute',
+    { candidates: [{ type: 'css_fallback', value: 'img.weixin-icon' }] },
+    'src',
+  );
+  const result = new Function('document', 'window', `return ${expression}`)(document, window);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.attribute_present, true);
+  assert.equal(result.value, imageSrc);
 });
 
 test('CueCast CDP 元素断言失败仍保留实际命中的候选定位器', async () => {
@@ -347,6 +413,31 @@ test('CueCast 变量断言区分配置值、解析后的期望值和页面实际
   assert.equal(expectedInput.effective.preview, '防统方系统 - 系统管理平台1');
   assert.deepEqual(expectedInput.actual, { value_state: 'visible', preview: '防统方系统 - 系统管理平台' });
   assert.deepEqual(expectedInput.source, { code: 'variable_reference', label: '引用变量：test' });
+});
+
+test('CueCast 断言诊断完整保留 data URL 的期望值和实际值', () => {
+  const dataUrl = `data:image/jpg;base64,${'a'.repeat(2048)}`;
+  const result = attachOperationDiagnostic(
+    {
+      action_type: 'assert_element_match',
+      status: 'passed',
+      operation_assertion: {
+        subject: '元素属性 src',
+        operator: 'contains',
+        expected: { value_state: 'visible', preview: dataUrl },
+        actual: { value_state: 'visible', preview: dataUrl },
+        passed: true,
+      },
+    },
+    { action_type: 'assert_element_match', expect: dataUrl },
+  );
+
+  const assertion = result.details.operation.outcome.assertion;
+  const expectedInput = result.details.operation.inputs.find((item) => item.key === 'expect');
+  assert.equal(assertion.expected.preview, dataUrl);
+  assert.equal(assertion.actual.preview, dataUrl);
+  assert.equal(expectedInput.configured.preview, dataUrl);
+  assert.equal(expectedInput.actual.preview, dataUrl);
 });
 
 test('CueCast 证书角色显示文件名并输出上传交互结果', () => {

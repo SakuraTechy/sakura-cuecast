@@ -16,6 +16,7 @@ import {
   toBoolean,
 } from './variable-context.js';
 import { attachOperationDiagnostic } from './operation-diagnostics.js';
+import { isPdfViewerAttributeTarget, readPdfViewerAttribute } from './cdp-pdf-viewer.js';
 
 /** 改为 true 后：打开扩展 Service Worker 控制台可看到 AI 步骤的节点数与操作计划 */
 const DEBUG_AI_NATURAL = false;
@@ -664,6 +665,7 @@ export class PlayerManager {
     let sessionTransition = null;
     let sessionNavigationDecision = '';
     let sessionErrorCode = '';
+    let batchVariableSession = null;
     let playbackEndPayload = {
       type: 'AT_PLAYBACK_END',
       testCaseId,
@@ -756,10 +758,16 @@ export class PlayerManager {
         this._pageErrorCheckEnabledByTab = this._pageErrorCheckEnabledByTab || new Map();
         this._pageErrorCheckEnabledByTab.set(tabId, runtimeConfig.pageErrorCheckEnabled);
       };
-      // 每次回放独立创建变量上下文，不能复用扩展进程状态或将值写入 chrome.storage。
-      const variableContext = new CuecastVariableContext(
-        opts.initialVariables ?? testCase.initial_variables ?? testCase.initialVariables ?? {},
-      );
+      const initialVariables = opts.initialVariables ?? testCase.initial_variables ?? testCase.initialVariables ?? {};
+      // 先验证 Admin case 与批次能力，再从后台受控批次恢复变量，不能接受网页传来的执行原文。
+      if (useAdminCase && opts.batchId && typeof opts.prepareVariableContext === 'function') {
+        batchVariableSession = await opts.prepareVariableContext({
+          sceneKey: sourceCaseKey.split(':')[0],
+          projectEnvironmentId: resolvedProjectEnvironmentId,
+          initialVariables,
+        });
+      }
+      const variableContext = batchVariableSession?.context || new CuecastVariableContext(initialVariables);
       const variableResultsByStep = {};
       progressStepTotal = steps.length;
       broadcastProgress('case-loaded', {
@@ -815,7 +823,9 @@ export class PlayerManager {
       if (stopAfterStepIndex < startStepIndex) {
         throw new Error(trByLocale(runLocale, '停止步骤早于起始步骤', 'Stop step is before the start step'));
       }
-      const variablePrecheck = PlayerManager._validateVariableReferencesForPlayback(steps, startStepIndex, stopAfterStepIndex);
+      const variablePrecheck = PlayerManager._validateVariableReferencesForPlayback(
+        steps, startStepIndex, stopAfterStepIndex, variableContext.names(),
+      );
       if (!variablePrecheck.ok) {
         throw new Error(PlayerManager._formatVariablePrecheckError(variablePrecheck, runLocale));
       }
@@ -1029,7 +1039,8 @@ export class PlayerManager {
         const definitionStep = PlayerManager._adaptRecordedStep(steps[index] || step);
         const normalizedStepDetails = stepDetails && typeof stepDetails === 'object' ? stepDetails : {};
         const { operation_assertion: configuredOperationAssertion, ...persistedStepDetails } = normalizedStepDetails;
-        const operationAssertion = configuredOperationAssertion || locator?.operationAssertion;
+        // CDP 读取结果包含本次断言的完整实际值，不能被详情中的历史占位对象覆盖。
+        const operationAssertion = locator?.operationAssertion || configuredOperationAssertion;
         const operationFacts = locator?.operationFacts && typeof locator.operationFacts === 'object'
           ? locator.operationFacts
           : {};
@@ -1636,6 +1647,11 @@ export class PlayerManager {
         }
       }
 
+      if (success && !ctx.stopped && !ctx.suppressResultSave && batchVariableSession) {
+        // 结果回传成功后才提交；失败、取消和预览执行均不能污染后续用例。
+        opts.finalizeVariableContext?.(batchVariableSession, true);
+      }
+
       this._notifyPopup(
         success
           ? trByLocale(ctx.locale, `✅ #${testCaseId} 成功（${duration}ms）`, `✅ #${testCaseId} Success (${duration}ms)`)
@@ -1750,6 +1766,7 @@ export class PlayerManager {
       }
       return playbackOutcome;
     } finally {
+      opts.finalizeVariableContext?.(batchVariableSession, false);
       if (!progressFinished && useAdminCase) {
         broadcastProgress('case-finished', {
           status: playbackOutcome?.ok ? 'passed' : 'failed',
@@ -2582,17 +2599,19 @@ export class PlayerManager {
     return { tabId: targetTab.id, cdpAvailable: nextCdpAvailable };
   }
 
-  async _cdpSend(tabId, method, params = {}) {
-    const effectiveParams = await this._prepareCdpCommandParams(tabId, method, params);
+  async _cdpSend(tabId, method, params = {}, options = {}) {
+    // 子调试会话有独立的 execution context，不能混入主会话选中的 iframe contextId。
+    const effectiveParams = options.sessionId ? params : await this._prepareCdpCommandParams(tabId, method, params);
+    const target = options.sessionId ? { tabId, sessionId: options.sessionId } : { tabId };
     return new Promise((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
         reject(new Error(`CDP 命令超时：${method}`));
-      }, CDP_COMMAND_TIMEOUT_MS);
+      }, Math.max(1, Math.min(options.timeoutMs ?? CDP_COMMAND_TIMEOUT_MS, CDP_COMMAND_TIMEOUT_MS)));
       // Runtime.evaluate 可能需要绑定当前 iframe 的 execution context；必须发送预处理后的参数。
-      chrome.debugger.sendCommand({ tabId }, method, effectiveParams, (result) => {
+      chrome.debugger.sendCommand(target, method, effectiveParams, (result) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -2819,6 +2838,16 @@ export class PlayerManager {
   static _firstStepString(step, fields) {
     for (const field of fields) {
       if (step?.[field] != null) return String(step[field]);
+    }
+    return '';
+  }
+
+  static _resolveAssertionExpectedValue(step) {
+    const contextAssertion = PlayerManager._parseLocatorMetaObject(step?.locator_meta)?.context?.assertion;
+    for (const value of [step?.expect, step?.expected, step?.value, contextAssertion?.preview]) {
+      if (value == null) continue;
+      const text = String(value);
+      if (text.trim()) return text;
     }
     return '';
   }
@@ -3279,9 +3308,38 @@ export class PlayerManager {
     const attribute = PlayerManager._firstStepString(step, ['attribute', 'value']).trim();
     const expected = PlayerManager._firstStepString(step, ['expect', 'expected']);
     if (!attribute) throw new Error('assert_attribute 缺少 attribute');
-    const actual = await this._waitForTargetAttributeCDP(tabId, step, attribute);
-    if (actual !== expected) {
-      throw new Error(`断言失败：属性 ${attribute} 的实际值与期望值不一致`);
+    const masked = step.value_masked === true || step.value_masked === 1;
+    const operationAssertion = {
+      subject: `元素属性 ${attribute}`,
+      operator: 'equals',
+      expected: masked ? { value_state: 'masked' } : { value_state: 'visible', preview: expected },
+      actual: { value_state: 'unavailable' },
+      passed: false,
+    };
+    let locator = null;
+    try {
+      // 不修改原始 playwright_step / locator_meta；仅为明确等价的 PDF XPath 补充 CDP 读取路径。
+      const result = isPdfViewerAttributeTarget(step)
+        ? await readPdfViewerAttribute({
+          tabId,
+          attribute,
+          timeoutMs: this._getEffectiveWaitTimeout(tabId, 8000),
+          sendCommand: (method, params, options) => this._cdpSend(tabId, method, params, options),
+        })
+        : { value: await this._waitForTargetAttributeCDP(tabId, step, attribute) };
+      locator = result.locator || null;
+      operationAssertion.actual = masked
+        ? { value_state: 'masked' }
+        : { value_state: 'visible', preview: String(result.value) };
+      operationAssertion.passed = result.value === expected;
+      if (!operationAssertion.passed) {
+        throw new Error(`断言失败：属性 ${attribute} 的实际值与期望值不一致`);
+      }
+      return { ...(locator || {}), operationAssertion };
+    } catch (error) {
+      error.operationAssertion = operationAssertion;
+      if (locator) error.actualLocator = locator;
+      throw error;
     }
   }
 
@@ -4626,15 +4684,35 @@ export class PlayerManager {
       if (!assertion || String(assertion.target || 'element').trim().toLowerCase() !== 'element') return { ...step };
       const matchMode = String(assertion.match || '').trim().toLowerCase();
       if (!['contains', 'equals', 'not_contains', 'regex', 'visible'].includes(matchMode)) return { ...step };
-      const source = String(meta?.context?.assertion?.source || 'auto').trim().toLowerCase();
+      const contextAssertion = meta?.context?.assertion && typeof meta.context.assertion === 'object'
+        ? meta.context.assertion
+        : {};
+      const source = String(contextAssertion.source || 'auto').trim().toLowerCase();
+      const readMode = source === 'contenteditable'
+        ? 'text'
+        : (['auto', 'text', 'attribute', 'value'].includes(source) ? source : 'auto');
+      const attribute = String(step?.attribute || contextAssertion.attribute || assertion.attribute || '').trim();
+      if (readMode === 'attribute' && !attribute) {
+        return {
+          ...step,
+          action_type: 'assert_element_match',
+          original_action_type: 'assert_text',
+          recording_source: 'cuecast-v1.2',
+          read_mode: readMode,
+          match_mode: matchMode,
+          expect: matchMode === 'visible' ? '' : PlayerManager._resolveAssertionExpectedValue(step),
+          attribute_error: '元素属性断言缺少属性名',
+        };
+      }
       return {
         ...step,
         action_type: 'assert_element_match',
         original_action_type: 'assert_text',
         recording_source: 'cuecast-v1.2',
-        read_mode: source === 'contenteditable' ? 'text' : (['auto', 'text', 'value'].includes(source) ? source : 'auto'),
+        read_mode: readMode,
+        ...(readMode === 'attribute' ? { attribute } : {}),
         match_mode: matchMode,
-        expect: matchMode === 'visible' ? '' : String(step.expect ?? step.value ?? ''),
+        expect: matchMode === 'visible' ? '' : PlayerManager._resolveAssertionExpectedValue(step),
       };
     }
     return { ...step };
@@ -5257,7 +5335,7 @@ export class PlayerManager {
     });
   }
 
-  static _validateVariableReferencesForPlayback(steps, startStepIndex = 0, stopAfterStepIndex = null) {
+  static _validateVariableReferencesForPlayback(steps, startStepIndex = 0, stopAfterStepIndex = null, initialVariableNames = []) {
     const list = Array.isArray(steps) ? steps : [];
     const start = Math.max(0, Number(startStepIndex) || 0);
     const stop = stopAfterStepIndex == null || stopAfterStepIndex === ''
@@ -5269,7 +5347,7 @@ export class PlayerManager {
       const name = PlayerManager._stepVariableName(step);
       if (name && !definitions.has(name)) definitions.set(name, start + index);
     });
-    const seen = new Set();
+    const seen = new Set(initialVariableNames);
     const issues = [];
     scoped.forEach((step, relIndex) => {
       const index = start + relIndex;
@@ -6251,9 +6329,10 @@ export class PlayerManager {
     })()`;
   }
 
-  static _buildElementAssertionExpr(selector, xpath, readMode = 'auto', locatorMeta = null) {
+  static _buildElementAssertionExpr(selector, xpath, readMode = 'auto', locatorMeta = null, attribute = '') {
     const resultChain = PlayerManager._buildDomTargetResultChain(selector, xpath, locatorMeta);
-    const normalizedReadMode = ['auto', 'text', 'value'].includes(String(readMode)) ? String(readMode) : 'auto';
+    const normalizedReadMode = ['auto', 'text', 'attribute', 'value'].includes(String(readMode)) ? String(readMode) : 'auto';
+    const normalizedAttribute = String(attribute || '').trim();
     return `(function(){
       try {
         var resolved = ${resultChain};
@@ -6277,6 +6356,50 @@ export class PlayerManager {
         var value = '';
         if (mode === 'value') {
           value = 'value' in el && el.value != null ? String(el.value) : '';
+        } else if (mode === 'attribute') {
+          var attributeName = ${JSON.stringify(normalizedAttribute)};
+          var attributePresent = Boolean(attributeName && el.hasAttribute(attributeName));
+          // DOM 降级策略：当 HTML 属性不存在时，尝试从 DOM 属性或运行时状态读取
+          if (!attributePresent && attributeName) {
+            var attrLower = attributeName.toLowerCase();
+            // 图片/资源地址：优先读取运行时实际加载的地址
+            if (attrLower === 'src') {
+              var domSrc = el.currentSrc || el.src || '';
+              if (domSrc) { value = String(domSrc); attributePresent = true; }
+            } else if (attrLower === 'href') {
+              var domHref = el.href || '';
+              if (domHref) { value = String(domHref); attributePresent = true; }
+            }
+            // 布尔属性：从 DOM 属性或 aria 状态读取
+            else if (attrLower === 'checked') {
+              if (typeof el.checked === 'boolean') { value = el.checked ? 'true' : 'false'; attributePresent = true; }
+            } else if (attrLower === 'disabled') {
+              if (typeof el.disabled === 'boolean') { value = el.disabled ? 'true' : 'false'; attributePresent = true; }
+            } else if (attrLower === 'readonly') {
+              if (typeof el.readOnly === 'boolean') { value = el.readOnly ? 'true' : 'false'; attributePresent = true; }
+            } else if (attrLower === 'selected') {
+              if (typeof el.selected === 'boolean') { value = el.selected ? 'true' : 'false'; attributePresent = true; }
+            }
+            // aria 状态映射
+            else if (attrLower === 'aria-checked' && el.getAttribute('aria-checked')) {
+              value = String(el.getAttribute('aria-checked')); attributePresent = true;
+            } else if (attrLower === 'aria-disabled' && el.getAttribute('aria-disabled')) {
+              value = String(el.getAttribute('aria-disabled')); attributePresent = true;
+            }
+          }
+          if (!attributePresent) {
+            return {
+              ok: true,
+              visible: visible,
+              attribute_present: false,
+              attribute: ${JSON.stringify(normalizedAttribute)},
+              value: '',
+              via: resolved.via || '',
+              matched_count: Number(resolved.matched_count || 1),
+              visible_count: visible ? 1 : 0
+            };
+          }
+          if (!value) value = el.getAttribute(attributeName) || '';
         } else {
           var text = el.innerText != null ? el.innerText : el.textContent;
           value = text != null ? String(text) : '';
@@ -6284,6 +6407,8 @@ export class PlayerManager {
         return {
           ok: true,
           visible: visible,
+          attribute_present: true,
+          attribute: ${JSON.stringify(normalizedAttribute)},
           value: value,
           via: resolved.via || '',
           matched_count: Number(resolved.matched_count || 1),
@@ -6335,6 +6460,7 @@ export class PlayerManager {
       step.target_xpath,
       step.read_mode || 'auto',
       step.locator_meta,
+      step.attribute || '',
     );
     let lastMatched = null;
     while (Date.now() < wallEnd && remaining > 0) {
@@ -6471,7 +6597,7 @@ export class PlayerManager {
     console.log(
       '[AT assert_text] 预期内容:\n' + (expStr.length > PREVIEW_MAX ? expStr.slice(0, PREVIEW_MAX) + '\n…(已截断)' : expStr),
     );
-    if (mode === 'element') {
+    if (mode === 'element' || String(mode || '').startsWith('element_attribute:')) {
       console.log('[AT assert_text] 实际长度:', actStr.length);
       console.log(
         '[AT assert_text] 实际内容:\n' + (actStr.length > PREVIEW_MAX ? actStr.slice(0, PREVIEW_MAX) + '\n…(已截断)' : actStr),
@@ -6482,7 +6608,7 @@ export class PlayerManager {
         '[AT assert_text] 整页 innerText 预览:\n' + (actStr.length > PREVIEW_MAX ? actStr.slice(0, PREVIEW_MAX) + '\n…(已截断)' : actStr),
       );
     }
-    console.log('[AT assert_text] 比对结果:', mode === 'element' ? '全等 ===' : '整页 includes', '=', hit);
+    console.log('[AT assert_text] 比对结果:', mode === 'element' || String(mode || '').startsWith('element_attribute:') ? '元素值匹配' : '整页 includes', '=', hit);
     console.log('[AT assert_text] ==========================================');
   }
 
@@ -6499,8 +6625,9 @@ export class PlayerManager {
     const rawMatch = ['contains', 'equals', 'not_contains', 'regex', 'visible'].includes(String(configuredMatch || '')) ? String(configuredMatch) : (hasLocator ? 'equals' : 'contains');
     const match = rawMatch === 'visible' && target !== 'element' ? 'contains' : rawMatch;
     const source = String(step?.read_mode || contextAssertion.source || 'auto').trim().toLowerCase();
-    const readMode = source === 'contenteditable' ? 'text' : (['auto', 'text', 'value'].includes(source) ? source : 'auto');
-    return { target, match, readMode };
+    const readMode = source === 'contenteditable' ? 'text' : (['auto', 'text', 'attribute', 'value'].includes(source) ? source : 'auto');
+    const attribute = String(step?.attribute || contextAssertion.attribute || '').trim();
+    return attribute ? { target, match, readMode, attribute } : { target, match, readMode };
   }
 
   static _matchAssertionText(actual, expected, mode = 'contains') {
@@ -6517,6 +6644,21 @@ export class PlayerManager {
     const e = PlayerManager._normalizeAssertionText(rawExpected);
     if (mode === 'equals') return a === e;
     if (mode === 'not_contains') return !a.includes(e);
+    return a.includes(e);
+  }
+
+  static _matchRawAssertionText(actual, expected, mode = 'contains') {
+    const a = String(actual ?? '');
+    const e = String(expected ?? '');
+    if (mode === 'equals') return a === e;
+    if (mode === 'not_contains') return !a.includes(e);
+    if (mode === 'regex') {
+      try {
+        return new RegExp(e).test(a);
+      } catch {
+        return false;
+      }
+    }
     return a.includes(e);
   }
 
@@ -6550,10 +6692,11 @@ export class PlayerManager {
     return text.length > max ? `${text.slice(0, max)}…` : text;
   }
 
-  static _formatAssertionFailure({ target, match, expected, actual, css, xpath }) {
+  static _formatAssertionFailure({ target, attribute, match, expected, actual, css, xpath }) {
     return [
       '断言失败：实际值不满足预期',
       `断言目标: ${PlayerManager._assertionTargetLabel(target)}`,
+      ...(attribute ? [`属性名: ${attribute}`] : []),
       `匹配方式: ${PlayerManager._assertionMatchLabel(match)}`,
       `期望值: ${PlayerManager._previewAssertionValue(expected)}`,
       `实际值: ${PlayerManager._previewAssertionValue(actual)}`,
@@ -6575,7 +6718,7 @@ export class PlayerManager {
 
   static _buildAssertionDiagnostic(payload) {
     return {
-      subject: PlayerManager._assertionTargetLabel(payload.target),
+      subject: payload.attribute ? `元素属性 ${payload.attribute}` : PlayerManager._assertionTargetLabel(payload.target),
       operator: String(payload.match || 'equals'),
       expected: { value_state: 'visible', preview: String(payload.expected ?? '') },
       actual: { value_state: 'visible', preview: String(payload.actual ?? '') },
@@ -6606,12 +6749,15 @@ export class PlayerManager {
 
   async _executeAssertTextStepCDP(tabId, step) {
     if (step.wait_before) await this._sleep(step.wait_before);
-    const expectedValue = step.expect ?? step.value;
-    const expected = expectedValue != null ? String(expectedValue) : '';
+    const expected = PlayerManager._resolveAssertionExpectedValue(step);
     const hasLocator = String(step.target_selector || '').trim() !== ''
       || String(step.target_xpath || '').trim() !== ''
       || PlayerManager._normalizeLocatorMetaCandidates(step.locator_meta).length > 0;
     const assertion = PlayerManager._resolveAssertionConfig(step, hasLocator);
+    if (assertion.target === 'element' && assertion.readMode === 'attribute' && !assertion.attribute) {
+      throw new Error('断言失败：元素属性读取方式缺少属性名');
+    }
+    if (step?.attribute_error) throw new Error(`断言失败：${step.attribute_error}`);
     if (assertion.match !== 'visible' && expected.trim() === '') {
       throw new Error('断言失败：未配置断言文本（「输入值」不能为空或仅空白）');
     }
@@ -6688,7 +6834,7 @@ export class PlayerManager {
     if (assertion.target === 'element') {
       const result = await this._waitForElementAssertionCDP(
         tabId,
-        { ...step, read_mode: assertion.readMode },
+        { ...step, read_mode: assertion.readMode, attribute: assertion.attribute },
         10000,
         assertion.match === 'visible',
       );
@@ -6723,16 +6869,30 @@ export class PlayerManager {
           actualLocator,
         });
       }
-      const actual = String(result.value ?? '');
       const actualLocator = PlayerManager._actualLocatorFromVia(
         step,
         result.via,
         result.matched_count,
         result.visible_count,
       );
-      const hit = PlayerManager._matchAssertionText(actual, expected, assertion.match);
+      if (assertion.readMode === 'attribute' && result.attribute_present !== true) {
+        throw PlayerManager._createAssertionFailureError({
+          target: assertion.target,
+          attribute: assertion.attribute,
+          match: assertion.match,
+          expected,
+          actual: '属性不存在',
+          css: step.target_selector || '',
+          xpath: step.target_xpath || '',
+          actualLocator,
+        });
+      }
+      const actual = String(result.value ?? '');
+      const hit = assertion.readMode === 'attribute'
+        ? PlayerManager._matchRawAssertionText(actual, expected, assertion.match)
+        : PlayerManager._matchAssertionText(actual, expected, assertion.match);
       this._logAssertTextCdpDebug({
-        mode: 'element',
+        mode: assertion.readMode === 'attribute' ? `element_attribute:${assertion.attribute}` : 'element',
         expected,
         actual,
         hit,
@@ -6742,6 +6902,7 @@ export class PlayerManager {
       if (!hit) {
         throw PlayerManager._createAssertionFailureError({
           target: assertion.target,
+          attribute: assertion.attribute,
           match: assertion.match,
           expected,
           actual,
@@ -6752,6 +6913,7 @@ export class PlayerManager {
       }
       return PlayerManager._createAssertionResult(actualLocator, {
         target: assertion.target,
+        attribute: assertion.attribute,
         match: assertion.match,
         expected,
         actual,
@@ -9732,7 +9894,7 @@ export class PlayerManager {
       }
 
       case 'assert_attribute': {
-        await this._executeAssertAttributeCDP(tabId, step);
+        actualLocator = await this._executeAssertAttributeCDP(tabId, step);
         break;
       }
 

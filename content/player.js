@@ -92,11 +92,30 @@
   function getElementRawTextForAssert(el) {
     if (!el) return '';
     const tag = el.tagName && String(el.tagName).toLowerCase();
-    if (tag === 'textarea' || tag === 'input') {
+    if (tag === 'textarea' || tag === 'input' || tag === 'select') {
       return el.value != null ? String(el.value) : '';
     }
     const t = el.textContent;
     return t != null ? String(t) : '';
+  }
+
+  function getElementAssertionValue(el, rawReadMode, rawAttribute) {
+    const readMode = String(rawReadMode || 'auto').trim().toLowerCase();
+    const attribute = String(rawAttribute || '').trim();
+    if (!['auto', 'text', 'attribute', 'value'].includes(readMode)) {
+      return { ok: false, error: `不支持的元素断言读取方式：${readMode || '(空)'}` };
+    }
+    if (readMode === 'attribute' && !attribute) {
+      return { ok: false, error: '元素属性断言缺少属性名' };
+    }
+    const tag = String(el?.tagName || '').toLowerCase();
+    const effectiveMode = readMode === 'auto' && ['input', 'textarea', 'select'].includes(tag) ? 'value' : readMode;
+    if (effectiveMode === 'value') return { ok: true, value: 'value' in el ? String(el.value ?? '') : '' };
+    if (effectiveMode === 'attribute') {
+      if (!el.hasAttribute(attribute)) return { ok: false, attributeMissing: true, attribute };
+      return { ok: true, value: el.getAttribute(attribute) ?? '', attribute };
+    }
+    return { ok: true, value: getElementRawTextForAssert(el) };
   }
 
   function getElementValueForVariable(el) {
@@ -630,11 +649,18 @@
 
   function resolveAssertionConfig(step, hasLocator = false) {
     const meta = parseLocatorMeta(step?.locator_meta);
-    const raw = meta?.assertion && typeof meta.assertion === 'object' ? meta.assertion : {};
-    const target = ['page', 'element', 'error', 'url'].includes(String(raw.target || '')) ? String(raw.target) : (hasLocator ? 'element' : 'page');
-    const rawMatch = ['contains', 'equals', 'not_contains', 'regex', 'visible'].includes(String(raw.match || '')) ? String(raw.match) : (hasLocator ? 'equals' : 'contains');
+    const contextAssertion = meta?.context?.assertion && typeof meta.context.assertion === 'object' ? meta.context.assertion : {};
+    const raw = meta?.assertion && typeof meta.assertion === 'object' ? meta.assertion : contextAssertion;
+    const canonical = String(step?.action_type || '').trim().toLowerCase() === 'assert_element_match';
+    const configuredTarget = canonical ? 'element' : raw.target;
+    const configuredMatch = canonical ? step?.match_mode : raw.match;
+    const target = ['page', 'element', 'error', 'url'].includes(String(configuredTarget || '')) ? String(configuredTarget) : (hasLocator ? 'element' : 'page');
+    const rawMatch = ['contains', 'equals', 'not_contains', 'regex', 'visible'].includes(String(configuredMatch || '')) ? String(configuredMatch) : (hasLocator ? 'equals' : 'contains');
     const match = rawMatch === 'visible' && target !== 'element' ? 'contains' : rawMatch;
-    return { target, match };
+    const source = String(step?.read_mode || contextAssertion.source || 'auto').trim().toLowerCase();
+    const readMode = source === 'contenteditable' ? 'text' : (['auto', 'text', 'attribute', 'value'].includes(source) ? source : 'auto');
+    const attribute = String(step?.attribute || contextAssertion.attribute || '').trim();
+    return attribute ? { target, match, readMode, attribute } : { target, match, readMode };
   }
 
   function matchAssertionText(actual, expected, mode = 'contains') {
@@ -648,6 +674,17 @@
       } catch {
         return false;
       }
+    }
+    return a.includes(e);
+  }
+
+  function matchRawAssertionValue(actual, expected, mode = 'contains') {
+    const a = String(actual ?? '');
+    const e = String(expected ?? '');
+    if (mode === 'equals') return a === e;
+    if (mode === 'not_contains') return !a.includes(e);
+    if (mode === 'regex') {
+      try { return new RegExp(e).test(a); } catch { return false; }
     }
     return a.includes(e);
   }
@@ -2336,7 +2373,7 @@
 
       case 'assert_element_match':
       case 'assert_text': {
-        const expected = step.value != null ? String(step.value) : '';
+        const expected = step.expect != null ? String(step.expect) : (step.value != null ? String(step.value) : '');
         const hasLocator = String(step.target_selector || '').trim() !== ''
           || String(step.target_xpath || '').trim() !== ''
           || (Array.isArray(parseLocatorMeta(step.locator_meta)?.candidates)
@@ -2408,8 +2445,17 @@
           if (assertion.match === 'visible') {
             break;
           }
-          const actual = getElementRawTextForAssert(el);
-          const hit = matchAssertionText(actual, expected, assertion.match);
+          const readResult = getElementAssertionValue(el, assertion.readMode, assertion.attribute);
+          if (!readResult.ok) {
+            if (readResult.attributeMissing) {
+              throw new Error(`断言失败：目标元素不存在属性 ${readResult.attribute}`);
+            }
+            throw new Error(`断言失败：${readResult.error}`);
+          }
+          const actual = String(readResult.value ?? '');
+          const hit = assertion.readMode === 'attribute'
+            ? matchRawAssertionValue(actual, expected, assertion.match)
+            : matchAssertionText(actual, expected, assertion.match);
 
           console.log(
             '[AT assert_text] 元素断言 · 完整日志见扩展 Service Worker。预期',
@@ -2432,7 +2478,9 @@
                 hit,
                 css: step.target_selector || '',
                 xpath: step.target_xpath || '',
-                note: '已按 CSS/XPath 定位元素；textarea/input 取 value，其它取 textContent；按断言匹配方式比对',
+                note: assertion.readMode === 'attribute'
+                  ? `已按 CSS/XPath 定位元素；读取属性 ${assertion.attribute}；按原始属性值比对`
+                  : '已按 CSS/XPath 定位元素；textarea/input 取 value，其它取 textContent；按断言匹配方式比对',
               },
             }).catch(() => {});
           } catch (e) {

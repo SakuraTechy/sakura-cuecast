@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>属性断言测试页面</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      padding: 24px;
+      background: #f5f7fb;
+      color: #172033;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      display: grid;
+      gap: 20px;
+    }
+    section {
+      padding: 20px;
+      border: 1px solid #dfe4ee;
+      border-radius: 8px;
+      background: #fff;
+    }
+    h1 { font-size: 22px; margin-bottom: 16px; color: #0f172a; }
+    h2 { font-size: 16px; margin-bottom: 12px; color: #334155; }
+    .test-case {
+      padding: 14px;
+      margin-bottom: 12px;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      background: #f8fafc;
+    }
+    .test-case:last-child { margin-bottom: 0; }
+    .label { font-weight: 700; color: #64748b; margin-bottom: 6px; }
+    .icon {
+      display: inline-block;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+    }
+    .icon-inner {
+      display: block;
+      width: 100%;
+      height: 100%;
+      border-radius: inherit;
+    }
+    .running { background: #22c55e; }
+    .stopped { background: #94a3b8; }
+    .error { background: #ef4444; }
+    button {
+      padding: 8px 14px;
+      border: 1px solid #dfe4ee;
+      border-radius: 6px;
+      background: #2457d6;
+      color: #fff;
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    button:hover { background: #1e40af; }
+    input[type="text"], input[type="password"] {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #dfe4ee;
+      border-radius: 6px;
+      font: inherit;
+    }
+    input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      cursor: pointer;
+    }
+    select {
+      padding: 8px 10px;
+      border: 1px solid #dfe4ee;
+      border-radius: 6px;
+      background: #fff;
+      font: inherit;
+    }
+    .inline { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    code {
+      padding: 2px 6px;
+      border-radius: 3px;
+      background: #f1f5f9;
+      color: #475569;
+      font-family: Consolas, monospace;
+      font-size: 13px;
+    }
+    img { max-width: 100%; height: auto; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <section>
+      <h1>属性断言测试页面</h1>
+      <p>用于验证第三阶段"检查页面元素 - 元素属性"读取模式的录制、回显和执行功能。</p>
+    </section>
+
+    <section>
+      <h2>场景 1：空文本元素 + class 属性</h2>
+      <div class="test-case">
+        <div class="label">状态图标（空文本，class 属性变化）</div>
+        <div class="inline">
+          <span class="icon" data-testid="status-icon-running">
+            <span class="icon-inner running" data-testid="status-inner-running"></span>
+          </span>
+          <code>class="icon-inner running"</code>
+        </div>
+        <p style="margin-top:8px;color:#64748b;font-size:13px;">
+          预期：文本读取为空；属性读取得到完整 class 值 "icon-inner running"
+        </p>
+      </div>
+      <div class="test-case">
+        <div class="label">停止状态（用于失败验证）</div>
+        <div class="inline">
+          <span class="icon" data-testid="status-icon-stopped">
+            <span class="icon-inner stopped" data-testid="status-inner-stopped"></span>
+          </span>
+          <code>class="icon-inner stopped"</code>
+        </div>
+        <button type="button" onclick="toggleStatus()">切换为 stopped</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>场景 2：输入框 DOM value vs HTML value</h2>
+      <div class="test-case">
+        <div class="label">用户名输入框</div>
+        <input type="text" id="username" data-testid="username-input" value="initial-value">
+        <p style="margin-top:8px;color:#64748b;font-size:13px;">
+          HTML value 属性：<code>initial-value</code>（固定）<br>
+          DOM value 属性：动态，当前输入值
+        </p>
+      </div>
+      <div class="test-case">
+        <div class="label">密码输入框（用于敏感值验证）</div>
+        <input type="password" id="password" data-testid="password-input" value="secret123">
+      </div>
+    </section>
+
+    <section>
+      <h2>场景 3：布尔属性（checked / disabled / readonly）</h2>
+      <div class="test-case">
+        <div class="label">记住我复选框</div>
+        <label class="inline">
+          <input type="checkbox" id="remember" data-testid="remember-checkbox" checked>
+          <span>记住登录状态</span>
+        </label>
+        <p style="margin-top:8px;color:#64748b;font-size:13px;">
+          checked 属性存在时为 true，移除后为 false（DOM 降级）
+        </p>
+      </div>
+      <div class="test-case">
+        <div class="label">禁用按钮</div>
+        <button type="button" id="disabledBtn" data-testid="disabled-button" disabled>禁用状态</button>
+        <button type="button" onclick="toggleDisabled()">切换 disabled</button>
+      </div>
+      <div class="test-case">
+        <div class="label">只读输入框</div>
+        <input type="text" id="readonly" data-testid="readonly-input" value="只读内容" readonly>
+      </div>
+    </section>
+
+    <section>
+      <h2>场景 4：select 元素 selected 属性</h2>
+      <div class="test-case">
+        <div class="label">角色选择</div>
+        <select id="role" data-testid="role-select">
+          <option value="qa" data-testid="role-option-qa">QA</option>
+          <option value="dev" data-testid="role-option-dev" selected>Developer</option>
+          <option value="pm" data-testid="role-option-pm">PM</option>
+        </select>
+        <p style="margin-top:8px;color:#64748b;font-size:13px;">
+          第二个 option 的 selected 属性应读取为 "true"
+        </p>
+      </div>
+    </section>
+
+    <section>
+      <h2>场景 5：资源地址 src / href</h2>
+      <div class="test-case">
+        <div class="label">图片 src 属性（DOM 降级：currentSrc）</div>
+        <img id="avatar" data-testid="avatar-image" src="/test-lab/downloads/m5-sample.txt" alt="Avatar" width="80">
+        <p style="margin-top:8px;color:#64748b;font-size:13px;">
+          src 属性应读取运行时实际 URL（可能是绝对路径）
+        </p>
+      </div>
+      <div class="test-case">
+        <div class="label">链接 href 属性</div>
+        <a href="/test-lab/target.html" data-testid="target-link">跳转到 Target</a>
+        <p style="margin-top:8px;color:#64748b;font-size:13px;">
+          href 属性应读取运行时实际 URL（可能是绝对路径）
+        </p>
+      </div>
+    </section>
+
+    <section>
+      <h2>场景 6：ARIA 状态属性</h2>
+      <div class="test-case">
+        <div class="label">ARIA 复选框</div>
+        <div role="checkbox" aria-checked="true" data-testid="aria-checkbox" tabindex="0"
+             style="padding:8px 12px;border:1px solid #dfe4ee;border-radius:6px;cursor:pointer;user-select:none;">
+          <span>启用高级功能</span>
+        </div>
+        <button type="button" onclick="toggleAria()">切换 aria-checked</button>
+      </div>
+      <div class="test-case">
+        <div class="label">ARIA 禁用按钮</div>
+        <button type="button" aria-disabled="false" data-testid="aria-disabled-button">ARIA 按钮</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>场景 7：属性不存在 vs 属性存在但为空</h2>
+      <div class="test-case">
+        <div class="label">无 data-status 属性</div>
+        <div id="noAttr" data-testid="no-attribute-element">没有 data-status 属性</div>
+      </div>
+      <div class="test-case">
+        <div class="label">data-status 属性存在但为空</div>
+        <div id="emptyAttr" data-status="" data-testid="empty-attribute-element">data-status=""</div>
+      </div>
+      <div class="test-case">
+        <div class="label">data-status 属性有值</div>
+        <div id="valueAttr" data-status="active" data-testid="value-attribute-element">data-status="active"</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>场景 8：title 和 placeholder 属性</h2>
+      <div class="test-case">
+        <div class="label">带 title 的按钮</div>
+        <button type="button" title="保存当前配置" data-testid="title-button">保存</button>
+      </div>
+      <div class="test-case">
+        <div class="label">带 placeholder 的输入框</div>
+        <input type="text" placeholder="请输入搜索关键词" data-testid="placeholder-input">
+      </div>
+    </section>
+  </div>
+
+  <script>
+    function toggleStatus() {
+      const icon = document.querySelector('[data-testid="status-inner-running"]');
+      if (icon.classList.contains('running')) {
+        icon.classList.remove('running');
+        icon.classList.add('stopped');
+        icon.closest('.inline').querySelector('code').textContent = 'class="icon-inner stopped"';
+      } else {
+        icon.classList.remove('stopped');
+        icon.classList.add('running');
+        icon.closest('.inline').querySelector('code').textContent = 'class="icon-inner running"';
+      }
+    }
+
+    function toggleDisabled() {
+      const btn = document.getElementById('disabledBtn');
+      btn.disabled = !btn.disabled;
+    }
+
+    function toggleAria() {
+      const checkbox = document.querySelector('[data-testid="aria-checkbox"]');
+      const current = checkbox.getAttribute('aria-checked') === 'true';
+      checkbox.setAttribute('aria-checked', String(!current));
+    }
+
+    // 模拟用户输入改变 DOM value
+    document.getElementById('username').addEventListener('input', (e) => {
+      console.log('DOM value changed:', e.target.value);
+    });
+  </script>
+</body>
+</html>

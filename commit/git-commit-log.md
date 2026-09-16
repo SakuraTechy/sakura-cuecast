@@ -1,3 +1,1773 @@
+# 2026-09-13 修复 AI 变量提取和视觉识别接口超时问题
+
+## 涉及文件
+
+- `modules/api-client.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+用户报告 AI 智能提取变量功能报错。经排查后端日志发现：
+- AI 请求实际成功（HTTP 200），耗时 64.8 秒
+- 前端超时设置为 60 秒，导致前端放弃等待并报超时错误
+- 虽然后端正常返回了结果，但前端已经显示失败
+
+AI 推理时间（尤其是复杂模型如 gpt-5.6-luna）通常需要 60-100 秒，现有 60 秒超时配置不足。
+
+## 变更内容
+
+将 `aiVariableExtractRule` 和 `aiVisionRecognize` 的默认超时从 60 秒增加到 100 秒，与 `aiStepPlan` 保持一致。
+
+## 验证
+
+**验证依据**：
+- 后端日志显示 AI 请求耗时 64.8 秒后成功返回
+- 前端原超时 60 秒不足以等待响应
+- `aiStepPlan` 已使用 100 秒超时且运行正常
+
+**预期结果**：
+- 用户重新触发 AI 变量提取时，前端能够等待足够时间接收后端响应
+- 不再出现超时错误提示
+
+## 具体代码改动
+
+### `modules/api-client.js`
+
+```diff
+@@ 第 206-214 行，增加 AI 接口超时时间 @@
+   aiVariableExtractRule(body, opts = {}) {
+-    const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 60000;
++    const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 100000;
+     return this.request('POST', '/automation/ai/variable-extract-rule', body, { timeoutMs });
+   }
+
+   aiVisionRecognize(body, opts = ) {
+-    const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 60000;
++    const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 100000;
+     return this.request('POST', '/automation/ai/vision-recognize', body, { timeoutMs });
+   }
+```
+
+---
+
+# 2026-09-13 DOM 属性降级策略扩展（支持 src/href/checked/disabled/readonly/selected/aria-*）
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+原有 DOM 降级策略只覆盖 `src` 属性，无法处理其他常见场景：布尔属性（checked、disabled、readonly、selected）、资源地址（href）、ARIA 状态（aria-checked、aria-disabled）。当 HTML 属性不存在或被框架动态管理时，断言会误判为属性缺失。扩展降级策略到 8+ 属性，统一从 DOM 属性或运行时状态读取。
+
+## 变更内容
+
+1. 扩展 `_buildElementAssertionExpr` 中的 `attribute` 模式 DOM 降级逻辑
+2. 新增 `href` 资源地址降级（读取 `el.href`）
+3. 新增 `checked/disabled/readonly/selected` 布尔属性降级（读取 DOM boolean 属性并转为字符串）
+4. 新增 `aria-checked/aria-disabled` ARIA 状态降级（读取 `getAttribute`）
+
+## 验证
+
+```powershell
+node --check modules/player-manager.js
+node --experimental-default-type=module --test tests/operation-contract.test.js tests/cuecast-recording-compatibility.test.js
+```
+
+结果：语法检查通过，37 个测试全部通过。
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+@@ 第 6359-6382 行，attribute 模式 DOM 降级策略 @@
+       } else if (mode === 'attribute') {
+         var attributeName = ${JSON.stringify(normalizedAttribute)};
+         var attributePresent = Boolean(attributeName && el.hasAttribute(attributeName));
+-        // DOM 降级策略：当 HTML 属性不存在时，尝试从 DOM 属性读取（例如动态加载的 src）
++        // DOM 降级策略：当 HTML 属性不存在时，尝试从 DOM 属性或运行时状态读取
+         if (!attributePresent && attributeName) {
+           var attrLower = attributeName.toLowerCase();
+-          if (attrLower === 'src') {
++          // 图片/资源地址：优先读取运行时实际加载的地址
++          if (attrLower === 'src') {
+             var domSrc = el.currentSrc || el.src || '';
+             if (domSrc) { value = String(domSrc); attributePresent = true; }
++          } else if (attrLower === 'href') {
++            var domHref = el.href || '';
++            if (domHref) { value = String(domHref); attributePresent = true; }
++          }
++          // 布尔属性：从 DOM 属性或 aria 状态读取
++          else if (attrLower === 'checked') {
++            if (typeof el.checked === 'boolean') { value = el.checked ? 'true' : 'false'; attributePresent = true; }
++          } else if (attrLower === 'disabled') {
++            if (typeof el.disabled === 'boolean') { value = el.disabled ? 'true' : 'false'; attributePresent = true; }
++          } else if (attrLower === 'readonly') {
++            if (typeof el.readOnly === 'boolean') { value = el.readOnly ? 'true' : 'false'; attributePresent = true; }
++          } else if (attrLower === 'selected') {
++            if (typeof el.selected === 'boolean') { value = el.selected ? 'true' : 'false'; attributePresent = true; }
++          }
++          // aria 状态映射
++          else if (attrLower === 'aria-checked' && el.getAttribute('aria-checked')) {
++            value = String(el.getAttribute('aria-checked')); attributePresent = true;
++          } else if (attrLower === 'aria-disabled' && el.getAttribute('aria-disabled')) {
++            value = String(el.getAttribute('aria-disabled')); attributePresent = true;
+           }
+         }
+```
+
+# 2026-09-11 CDP 与 Playwright Runner 图片属性断言期望值恢复修复
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `tests/operation-contract.test.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+录制步骤中的完整属性断言值保存在 `expect`，但部分兼容路径错误地优先读取空的 `value`，导致 CDP 和 Runner 后续诊断只能得到空期望值。保留 `expect` 优先级，并在旧数据缺失时回退到录制元数据预览，能够保证 `src` 的 data URL 在执行前保持完整。
+
+## 变更内容
+
+1. CDP 适配录制断言时，按 `expect`、`expected`、`value`、`locator_meta.context.assertion.preview` 的顺序取得第一个非空期望值。
+2. 新增属性断言的 `expect` 优先级及录制元数据预览回退测试，覆盖较长 data URL。
+
+## 验证
+
+```powershell
+node --experimental-default-type=module --test tests/operation-contract.test.js tests/cuecast-recording-compatibility.test.js
+node --check modules/player-manager.js
+```
+
+结果：37 个测试全部通过，语法检查通过。联动验证：`sakura-playwright` 单元测试 113 项通过、定位集成测试 25 项通过、`npm run check` 通过；`continew-automation` 的 `AutomationPlaywrightCaseServiceImplTest` 40 项通过。
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+@@
+-    const expectedValue = step.expect ?? step.value;
+-    const expected = expectedValue != null ? String(expectedValue) : '';
++    const expected = PlayerManager._resolveAssertionExpectedValue(step);
+@@
++  static _resolveAssertionExpectedValue(step) {
++    const contextAssertion = PlayerManager._parseLocatorMetaObject(step?.locator_meta)?.context?.assertion;
++    for (const value of [step?.expect, step?.expected, step?.value, contextAssertion?.preview]) {
++      if (value == null) continue;
++      const text = String(value);
++      if (text.trim()) return text;
++    }
++    return '';
++  }
+```
+
+### `tests/operation-contract.test.js`
+
+```diff
+@@
++test('CueCast 属性断言优先使用 expect 并兼容录制元数据预览', () => {
++  const dataUrl = `data:image/jpg;base64,${'a'.repeat(2048)}`;
++  const step = {
++    action_type: 'assert_text', expect: dataUrl, value: '',
++    locator_meta: { context: { assertion: { source: 'attribute', attribute: 'src', preview: dataUrl } } },
++  };
++  assert.equal(PlayerManager._adaptRecordedStep(step).expect, dataUrl);
++  assert.equal(PlayerManager._resolveAssertionExpectedValue({ ...step, expect: '' }), dataUrl);
++});
+```
+
+# 2026-09-10 extension-cdp 断言 src 完整值展示修复
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `modules/operation-diagnostics.js`
+- `content/recorder.js`
+- `tests/operation-contract.test.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+检查页面元素的 `src` 属性时，CDP 已返回实际断言值，但执行详情中的空断言对象会优先覆盖它，页面最终显示为 `-`。同时诊断层将断言值裁剪为 512 个字符，录制元数据又将断言预览裁剪为 200 个字符，导致 data URL 在配置值、执行值和实际值中无法完整核对。
+
+## 变更内容
+
+1. 优先使用 CDP 本次执行返回的 `operationAssertion`，仅在其缺失时使用执行详情中的断言对象。
+2. 保留断言期望值和实际值的完整文本；敏感字段的现有脱敏逻辑不变。
+3. 录制时完整保存断言元数据中的预览文本，避免 data URL 在后续诊断中提前丢失。
+4. 增加超过 512 字符的 data URL 回归测试，并保留 DOM `src` 属性读取测试。
+
+## 验证
+
+```powershell
+node --experimental-default-type=module --test tests/operation-contract.test.js tests/cuecast-recording-compatibility.test.js
+node --check modules/player-manager.js
+node --check modules/operation-diagnostics.js
+node --check content/recorder.js
+```
+
+结果：36 个测试全部通过，三个 JavaScript 文件语法检查通过；`sakura-admin-ui` 的 `npm run typecheck` 通过。
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+@@
+-        const operationAssertion = configuredOperationAssertion || locator?.operationAssertion;
++        // CDP 读取结果包含本次断言的完整实际值，不能被详情中的历史占位对象覆盖。
++        const operationAssertion = locator?.operationAssertion || configuredOperationAssertion;
+@@
+-          if (!${JSON.stringify(normalizedAttribute)} || !el.hasAttribute(${JSON.stringify(normalizedAttribute)})) {
++          var attributeName = ${JSON.stringify(normalizedAttribute)};
++          var attributePresent = Boolean(attributeName && el.hasAttribute(attributeName));
++          if (!attributePresent && attributeName.toLowerCase() === 'src') {
++            var domSrc = el.currentSrc || el.src || '';
++            if (domSrc) {
++              value = String(domSrc);
++              attributePresent = true;
++            }
++          }
+```
+
+### `modules/operation-diagnostics.js`
+
+```diff
+@@
+-      ? { value_state: state, ...(value.preview != null ? { preview: safeText(value.preview) } : {}) }
++      // 断言值是判定依据，data URL 等长文本必须与配置值、执行值保持一致。
++      ? { value_state: state, ...(value.preview != null ? { preview: fullText(value.preview) } : {}) }
+```
+
+### `content/recorder.js`
+
+```diff
+@@
+-      preview: String(expectedValue ?? '').trim().replace(/\s+/g, ' ').slice(0, 200),
++      // 定位元数据会作为执行定义回传，不能截断 data URL 等断言期望值。
++      preview: String(expectedValue ?? '').trim().replace(/\s+/g, ' '),
+```
+
+### `tests/operation-contract.test.js`
+
+```diff
+@@
++test('CueCast 断言诊断完整保留 data URL 的期望值和实际值', () => {
++  const dataUrl = `data:image/jpg;base64,${'a'.repeat(2048)}`;
++  const result = attachOperationDiagnostic({
++    action_type: 'assert_element_match', status: 'passed',
++    operation_assertion: { expected: { value_state: 'visible', preview: dataUrl }, actual: { value_state: 'visible', preview: dataUrl }, passed: true },
++  }, { action_type: 'assert_element_match', expect: dataUrl });
++  assert.equal(result.details.operation.outcome.assertion.actual.preview, dataUrl);
++});
+```
+
+# 2026-09-10 extension-cdp 检查元素 src 属性读取兼容修复
+
+## 涉及文件
+
+- \`modules/player-manager.js\`
+- \`tests/operation-contract.test.js\`
+- \`commit/git-commit-log.md\`
+
+## 变更原因
+
+extension-cdp 执行“检查页面元素”时，录制的目标为 \`img.weixin-icon\`，读取方式为 \`attribute\`、属性名为 \`src\`。部分页面通过 DOM 属性设置图片地址，元素没有对应的 HTML \`src\` 属性，原实现直接按 \`hasAttribute('src')\` 判定不存在，实际值被读成空字符串，导致 data URL 包含断言失败。
+
+## 变更内容
+
+1. \`src\` 属性不存在但元素存在 \`currentSrc\` 或 \`src\` DOM 属性值时，使用该值完成属性断言。
+2. 新增 \`<img>\` DOM 属性设置场景的 CDP 表达式回归测试。
+
+## 验证
+
+\`\`\`powershell
+node --experimental-default-type=module --test tests/operation-contract.test.js
+node --check modules/player-manager.js
+\`\`\`
+
+## 具体代码改动
+
+### \`modules/player-manager.js\`
+
+\`\`\`diff
+@@
+         } else if (mode === 'attribute') {
+-          if (!\${JSON.stringify(normalizedAttribute)} || !el.hasAttribute(\${JSON.stringify(normalizedAttribute)})) {
++          var attributeName = \${JSON.stringify(normalizedAttribute)};
++          var attributePresent = Boolean(attributeName && el.hasAttribute(attributeName));
++          if (!attributePresent && attributeName.toLowerCase() === 'src') {
++            // 页面可能通过 DOM 属性设置图片地址，未形成 src HTML 属性时仍需读取实际图片地址。
++            var domSrc = el.currentSrc || el.src || '';
++            if (domSrc) {
++              value = String(domSrc);
++              attributePresent = true;
++            }
++          }
++          if (!attributePresent) {
+@@
+-          value = el.getAttribute(\${JSON.stringify(normalizedAttribute)}) || '';
++          if (!value) value = el.getAttribute(attributeName) || '';
+\`\`\`
+
+### \`tests/operation-contract.test.js\`
+
+\`\`\`diff
+@@
+ test('CueCast 五种元素断言匹配方式保持实际值对期望值的比较语义', () => {
+@@
+ });
++
++test('CueCast CDP 属性断言可读取由 DOM 属性设置的图片 src', () => {
++  const imageSrc = 'data:image/jpg;base64,encoded-image';
++  const element = {
++    nodeType: 1,
++    tagName: 'IMG',
++    currentSrc: imageSrc,
++    src: imageSrc,
++    hasAttribute: () => false,
++    getAttribute: () => null,
++  };
++  const expression = PlayerManager._buildElementAssertionExpr(
++    'img.weixin-icon', '', 'attribute',
++    { candidates: [{ type: 'css_fallback', value: 'img.weixin-icon' }] }, 'src',
++  );
++  const result = new Function('document', 'window', \\\`return \\\${expression}\\\`)(document, window);
++  assert.equal(result.value, imageSrc);
++});
+\`\`\`
+
+# 2026-09-08 CDP 跨用例变量共享与异常日志保留修复
+
+## 涉及文件
+
+- `README.md`
+- `background.js`
+- `modules/player-manager.js`
+- `modules/variable-context.js`
+- `../sakura-admin/continew-automation/src/main/java/top/continew/admin/automation/service/AutomationPlaywrightArtifactService.java`
+- `../sakura-admin/continew-automation/src/main/java/top/continew/admin/automation/service/impl/AutomationPlaywrightArtifactServiceImpl.java`
+- `../sakura-admin/continew-automation/src/main/java/top/continew/admin/automation/service/impl/AutomationPlaywrightCaseServiceImpl.java`
+- `../sakura-admin/continew-automation/src/test/java/top/continew/admin/automation/service/impl/AutomationPlaywrightArtifactServiceImplTest.java`
+- `../sakura-admin/continew-automation/src/test/java/top/continew/admin/automation/service/impl/AutomationPlaywrightCaseServiceImplTest.java`
+- `../sakura-admin-ui/src/views/automation/automationUiScene/components/AutomationExecutionBatchDetail.vue`
+- `../sakura-admin-ui/src/views/automation/automationUiScene/components/AutomationExecutionLogViewer.vue`
+- `../sakura-admin-ui/src/views/automation/automationUiScene/components/AutomationExecutionResultDrawer.vue`
+- `modules/batch-variable-context.js`
+- `tests/batch-variable-context.test.js`
+- `../sakura-admin-ui/scripts/test-execution-log.mjs`
+- `../docs/sakura-playwright-recording-admin-integration.md`
+- `../docs/sakura-playwright-recording-admin-stage4-manual-verification.md`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+CDP 每次回放重建变量上下文且预检只识别当前用例，导致同场景后续用例不能引用前序保存的 passwd。扩展虽然上报 execution_logs，但分层历史没有日志文件索引，前端又以步骤摘要替换实时日志且漏掉用例级错误，造成异常在执行结束后消失。
+
+## 变更内容
+
+1. 以鉴权后的批次对象管理后台内存变量，按场景和产品环境隔离；深拷贝保留数据类型、掩码及来源，失败/取消/回传失败不提交，批次结束清理，旧用例迟到提交无效。
+2. PlayerManager 在变量预检前加载批次上下文，预检接受已存在的变量；无批次的旧回放仍保持独立上下文，不关闭真实缺失变量检查。
+3. Admin 在确认场景、批次和用例归属后将 CDP 原始日志保存到统一文件管理，并写入 execution_log 索引；保留异常和毫秒时间，日志存储故障不覆盖原始执行异常。
+4. 前端按执行 ID 隔离日志，同一执行实时切历史时不再用摘要覆盖真实日志；优先读原始 artifact，旧记录摘要保留用例错误及真实耗时，不为跳过步骤伪造开始执行。
+5. 保留此前 Runner 跨用例变量修复、PDF 相关暂存工作和其他无关改动，不修改 manifest 权限、原始 playwright_step、locator_meta 或 Jenkins 默认入口。
+
+## 验证
+
+- 扩展变量、会话及冻结配置定向测试：39/39 通过；其中 tests/batch-variable-context.test.js 为 5/5。
+- 前端日志组件回归：4/4 通过，覆盖异常摘要、原始日志优先、实时转历史、切换执行隔离及模拟 artifact 刷新；既有执行选择回归 13/13 通过。
+- Admin 产物、结果、控制器权限和分层执行记录定向测试：71/71 通过。
+- Admin continew-automation -am compile 通过，Spotless 已显式跳过；admin-ui pnpm build 通过。
+- 扩展全量 node --test tests/*.test.js：120/121，唯一失败仍为既有目录字段计数断言 133 !== 127，本轮未修改该计数。
+- 真实扩展端到端尝试遇到本地模拟 API 配置回退导致的连接失败，未完成验收；用户随后要求跳过，由人工验收。本轮临时、未通过的端到端脚本未纳入交付，已通过的回归测试保留。
+
+## 使用与验收边界
+
+- 更新并重启 Admin、更新 admin-ui，在 chrome://extensions/ 重新加载 CueCast 后刷新中台；不需要数据库迁移或重新录制。
+- 同一批次顺序执行保存和引用变量的用例；单独执行 004 不继承其他批次或其他执行方式的变量。
+- 日志文件依赖默认开启的 automation.playwright-artifact.unified-storage-enabled 和可用系统存储；旧记录无法补回从未保存的完整事件，但可显示已保存的原始错误。
+- 按用户要求，剩余端到端验收交人工，详见 ../docs/sakura-playwright-recording-admin-stage4-manual-verification.md 第 6.3 节；未重启现有服务或执行真实业务用例。
+
+## 具体代码改动
+
+### README.md
+
+```diff
+diff --git a/README.md b/README.md
+index 5511193..92fcf2b 100644
+--- a/README.md
++++ b/README.md
+@@ -96,0 +97,10 @@ Admin 的 CDP 批量执行支持以下三种受管会话模式：
++#### 同一批次跨用例变量与异常日志
++
++- 同一 CDP 批次、场景和产品环境中，前序成功用例保存的变量可由后续用例使用 `{{passwd}}` 或 `${passwd}` 引用；三种受管模式和当前 Profile 兼容模式均通过后台批次入口处理。预检会识别前序变量，但真正缺失的变量仍会报错。
++- 完整变量快照只保存在扩展后台内存中，不写入 `chrome.storage` 或消息响应；展示诊断仅返回脱敏预览和元数据。只有执行成功、结果回传成功且未取消才提交；失败候选不覆盖上一份成功状态。结束/中止批次会清理变量，重新加载扩展也不会恢复旧变量。
++- 必须在同一批次顺序选择保存和引用变量的用例；单独执行用例 004 不继承其他批次或其他执行方式的变量。
++- Admin 会把 CDP 上报的原始 `execution_logs` 保存为受鉴权日志 artifact，保留异常及毫秒时间；前端从实时切换历史不再以步骤摘要覆盖异常。旧记录无原始日志时只能展示含用例级错误的结果摘要，不会伪造跳过步骤已经执行。
++- 生效需要同步更新并重启 Admin、更新 admin-ui、在 `chrome://extensions/` 重新加载 CueCast，随后刷新中台页面。日志文件要求 `automation.playwright-artifact.unified-storage-enabled=true`（默认开启）及可用的系统文件存储；无需数据库迁移或重新录制。
++
++本地回归命令：`node --test tests/batch-variable-context.test.js`。前端日志回归在相邻 `sakura-admin-ui` 执行 `node --test scripts/test-execution-log.mjs`。本轮端到端产品验收按用户安排交人工执行，步骤见工作区 `docs/sakura-playwright-recording-admin-stage4-manual-verification.md` 第 6.3 节。
++
+```
+
+### background.js
+
+```diff
+diff --git a/background.js b/background.js
+index 3d2106a..e791bbc 100644
+--- a/background.js
++++ b/background.js
+@@ -10,0 +11 @@ import { CurrentProfileBatchSessionManager } from './modules/current-profile-bat
++import { BatchVariableContexts } from './modules/batch-variable-context.js';
+@@ -67,0 +69 @@ const currentProfileBatchSessions = new CurrentProfileBatchSessionManager(chrome
++const batchVariables = new BatchVariableContexts();
+@@ -70,0 +73 @@ function finishPlaybackBatch(batchManager, method, message, sourceTabId) {
++  const batch = batchManager.batch;
+@@ -72,0 +76 @@ function finishPlaybackBatch(batchManager, method, message, sourceTabId) {
++      batchVariables.clearBatch(batch);
+@@ -534,0 +539,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
++          prepareVariableContext: async ({ sceneKey, projectEnvironmentId, initialVariables }) => {
++            batchSessionManager.assertBatch(message.batchId, message.sessionMode, message.browserSessionSource);
++            await batchSessionManager.assertExecutionCapability(message.executionCapability);
++            return batchVariables.beginCase(batchSessionManager.batch, { sceneKey, projectEnvironmentId }, initialVariables);
++          },
++          finalizeVariableContext: (session, success) => batchVariables.finishCase(
++            session, success && session?.batch === batchSessionManager.batch,
++          ),
+```
+
+### modules/player-manager.js
+
+```diff
+diff --git a/modules/player-manager.js b/modules/player-manager.js
+index 6d44545..836408e 100644
+--- a/modules/player-manager.js
++++ b/modules/player-manager.js
+@@ -667,0 +668 @@ export class PlayerManager {
++    let batchVariableSession = null;
+@@ -760,4 +761,10 @@ export class PlayerManager {
+-      // 每次回放独立创建变量上下文，不能复用扩展进程状态或将值写入 chrome.storage。
+-      const variableContext = new CuecastVariableContext(
+-        opts.initialVariables ?? testCase.initial_variables ?? testCase.initialVariables ?? {},
+-      );
++      const initialVariables = opts.initialVariables ?? testCase.initial_variables ?? testCase.initialVariables ?? {};
++      // 先验证 Admin case 与批次能力，再从后台受控批次恢复变量，不能接受网页传来的执行原文。
++      if (useAdminCase && opts.batchId && typeof opts.prepareVariableContext === 'function') {
++        batchVariableSession = await opts.prepareVariableContext({
++          sceneKey: sourceCaseKey.split(':')[0],
++          projectEnvironmentId: resolvedProjectEnvironmentId,
++          initialVariables,
++        });
++      }
++      const variableContext = batchVariableSession?.context || new CuecastVariableContext(initialVariables);
+@@ -819 +826,3 @@ export class PlayerManager {
+-      const variablePrecheck = PlayerManager._validateVariableReferencesForPlayback(steps, startStepIndex, stopAfterStepIndex);
++      const variablePrecheck = PlayerManager._validateVariableReferencesForPlayback(
++        steps, startStepIndex, stopAfterStepIndex, variableContext.names(),
++      );
+@@ -1639,0 +1649,5 @@ export class PlayerManager {
++      if (success && !ctx.stopped && !ctx.suppressResultSave && batchVariableSession) {
++        // 结果回传成功后才提交；失败、取消和预览执行均不能污染后续用例。
++        opts.finalizeVariableContext?.(batchVariableSession, true);
++      }
++
+@@ -1753,0 +1768 @@ export class PlayerManager {
++      opts.finalizeVariableContext?.(batchVariableSession, false);
+@@ -5292 +5307 @@ export class PlayerManager {
+-  static _validateVariableReferencesForPlayback(steps, startStepIndex = 0, stopAfterStepIndex = null) {
++  static _validateVariableReferencesForPlayback(steps, startStepIndex = 0, stopAfterStepIndex = null, initialVariableNames = []) {
+@@ -5304 +5319 @@ export class PlayerManager {
+-    const seen = new Set();
++    const seen = new Set(initialVariableNames);
+```
+
+### modules/variable-context.js
+
+```diff
+diff --git a/modules/variable-context.js b/modules/variable-context.js
+index ad93065..a6358df 100644
+--- a/modules/variable-context.js
++++ b/modules/variable-context.js
+@@ -4 +4 @@
+- * 变量仅存在于当前 PlayerManager.start 调用期间；不能写入 extension storage、日志或跨用例 Map。
++ * 单次回放独立解析变量；受控批次可在后台内存中传递成功快照，不能写入 extension storage 或日志。
+@@ -134,0 +135,19 @@ export class CuecastVariableContext {
++  names() {
++    return [...this._values.keys()];
++  }
++
++  snapshot() {
++    // 深拷贝防止失败用例修改嵌套对象污染上一份成功状态，敏感标记必须与值一起保留。
++    return structuredClone([...this._values].map(([name, value]) => ({
++      name, value, ...this._metadata.get(name),
++    })));
++  }
++
++  restore(snapshot) {
++    for (const entry of structuredClone(snapshot)) {
++      this.set(entry.name, entry.value, {
++        masked: entry.masked, source: entry.source, allowReserved: true,
++      });
++    }
++  }
++
+```
+
+### ../sakura-admin/continew-automation/src/main/java/top/continew/admin/automation/service/AutomationPlaywrightArtifactService.java
+
+```diff
+diff --git a/continew-automation/src/main/java/top/continew/admin/automation/service/AutomationPlaywrightArtifactService.java b/continew-automation/src/main/java/top/continew/admin/automation/service/AutomationPlaywrightArtifactService.java
+index 9c34080f..f5537251 100644
+--- a/continew-automation/src/main/java/top/continew/admin/automation/service/AutomationPlaywrightArtifactService.java
++++ b/continew-automation/src/main/java/top/continew/admin/automation/service/AutomationPlaywrightArtifactService.java
+@@ -18,0 +19,2 @@ package top.continew.admin.automation.service;
++import java.util.List;
++
+@@ -36,0 +39,7 @@ public interface AutomationPlaywrightArtifactService {
++    /** 仅由已完成场景、批次和用例鉴权的结果服务调用，不向上传 Controller 开放自定义目录。 */
++    Artifact storeExecutionLog(ExecutionLogContext context, List<?> logs);
++
++    record ExecutionLogContext(String runId, String projectShortName, String versionName, String sceneId,
++                               String caseId) {
++    }
++
+```
+
+### ../sakura-admin/continew-automation/src/main/java/top/continew/admin/automation/service/impl/AutomationPlaywrightArtifactServiceImpl.java
+
+```diff
+diff --git a/continew-automation/src/main/java/top/continew/admin/automation/service/impl/AutomationPlaywrightArtifactServiceImpl.java b/continew-automation/src/main/java/top/continew/admin/automation/service/impl/AutomationPlaywrightArtifactServiceImpl.java
+index c06b6458..eb7530be 100644
+--- a/continew-automation/src/main/java/top/continew/admin/automation/service/impl/AutomationPlaywrightArtifactServiceImpl.java
++++ b/continew-automation/src/main/java/top/continew/admin/automation/service/impl/AutomationPlaywrightArtifactServiceImpl.java
+@@ -26,0 +27 @@ import java.util.LinkedHashMap;
++import java.util.List;
+@@ -32,0 +34 @@ import com.baomidou.mybatisplus.core.toolkit.Wrappers;
++import com.fasterxml.jackson.databind.ObjectMapper;
+@@ -86,0 +89 @@ public class AutomationPlaywrightArtifactServiceImpl implements AutomationPlaywr
++    private final ObjectMapper objectMapper;
+@@ -116 +118,0 @@ public class AutomationPlaywrightArtifactServiceImpl implements AutomationPlaywr
+-        String fileName = relativeFileName(safeRelativePath);
+@@ -118,0 +121,25 @@ public class AutomationPlaywrightArtifactServiceImpl implements AutomationPlaywr
++        return storeUnified(safeRunId, safeArtifactType, safeRelativePath, file, pathMetadata);
++    }
++
++    @Override
++    public Artifact storeExecutionLog(ExecutionLogContext context, List<?> logs) {
++        if (!unifiedStorageEnabled) {
++            throw new BusinessException("CDP 原始执行日志需要启用统一产物存储");
++        }
++        String runId = requireSafeSegment(context.runId(), "执行 ID");
++        ArtifactPathMetadata metadata = new ArtifactPathMetadata(requireSafeSegment(context.projectShortName(), "项目标识"),
++            requireSafeSegment(context.versionName(), "版本标识"), requireSafeSegment(context.sceneId(), "场景标识"),
++            requireSafeSegment(context.caseId(), "用例标识"));
++        try {
++            // CDP 没有 Runner Job；目录只接受结果服务校验后的上下文，原始事件完整文件化。
++            MultipartFile file = new ExecutionLogFile(objectMapper.writeValueAsBytes(logs));
++            requireValidFile(file, "execution-log");
++            return storeUnified(runId, "execution-log", "logs/execution-log.json", file, metadata);
++        } catch (IOException e) {
++            throw new BusinessException("执行日志序列化失败");
++        }
++    }
++
++    private Artifact storeUnified(String safeRunId, String safeArtifactType, String safeRelativePath,
++                                  MultipartFile file, ArtifactPathMetadata pathMetadata) {
++        String fileName = relativeFileName(safeRelativePath);
+@@ -437,0 +465,42 @@ public class AutomationPlaywrightArtifactServiceImpl implements AutomationPlaywr
++
++    private record ExecutionLogFile(byte[] bytes) implements MultipartFile {
++        @Override
++        public String getName() {
++            return "file";
++        }
++
++        @Override
++        public String getOriginalFilename() {
++            return "execution-log.json";
++        }
++
++        @Override
++        public String getContentType() {
++            return "application/json";
++        }
++
++        @Override
++        public boolean isEmpty() {
++            return bytes.length == 0;
++        }
++
++        @Override
++        public long getSize() {
++            return bytes.length;
++        }
++
++        @Override
++        public byte[] getBytes() {
++            return bytes;
++        }
++
++        @Override
++        public InputStream getInputStream() {
++            return new java.io.ByteArrayInputStream(bytes);
++        }
++
++        @Override
++        public void transferTo(java.io.File dest) throws IOException {
++            Files.write(dest.toPath(), bytes);
++        }
++    }
+```
+
+### ../sakura-admin/continew-automation/src/main/java/top/continew/admin/automation/service/impl/AutomationPlaywrightCaseServiceImpl.java
+
+```diff
+diff --git a/continew-automation/src/main/java/top/continew/admin/automation/service/impl/AutomationPlaywrightCaseServiceImpl.java b/continew-automation/src/main/java/top/continew/admin/automation/service/impl/AutomationPlaywrightCaseServiceImpl.java
+index f319bd4f..e28486be 100644
+--- a/continew-automation/src/main/java/top/continew/admin/automation/service/impl/AutomationPlaywrightCaseServiceImpl.java
++++ b/continew-automation/src/main/java/top/continew/admin/automation/service/impl/AutomationPlaywrightCaseServiceImpl.java
+@@ -40,0 +41 @@ import org.apache.commons.lang3.StringUtils;
++import org.springframework.beans.factory.ObjectProvider;
+@@ -59,0 +61,2 @@ import top.continew.admin.automation.service.AutomationPlaywrightCaseService;
++import top.continew.admin.automation.service.AutomationPlaywrightArtifactService;
++import top.continew.admin.automation.service.AutomationPlaywrightArtifactService.ExecutionLogContext;
+@@ -121,0 +125,4 @@ public class AutomationPlaywrightCaseServiceImpl implements AutomationPlaywright
++    // 产物服务的旧上传路径依赖 caseService；延迟获取避免构造循环依赖。
++    @Resource
++    private ObjectProvider<AutomationPlaywrightArtifactService> artifactServiceProvider;
++
+@@ -776,0 +784,6 @@ public class AutomationPlaywrightCaseServiceImpl implements AutomationPlaywright
++        if ("extension-cdp".equals(executionType)) {
++            // 必须先确认目标属于批次，避免非法结果在被拒绝前写入日志文件。
++            String logRunId = batchRecord == null ? executionId : StringUtils.firstNonBlank(
++                stringValue(requireBatchCase(batchRecord, caseId).get("execution_id")), executionId);
++            persistCdpExecutionLog(scene, caseId, logRunId, rawResult, asObjectMap(req.getRaw()));
++        }
+@@ -846,0 +860,28 @@ public class AutomationPlaywrightCaseServiceImpl implements AutomationPlaywright
++    private void persistCdpExecutionLog(AutomationUiSceneDO scene, String caseId, String executionId,
++                                        Map<String, Object> rawResult, Map<String, Object> originalResult) {
++        Object suppliedLogs = originalResult.getOrDefault("execution_logs", originalResult.get("executionLogs"));
++        // 原始事件保留毫秒时间；通用结果时间归一化只用于摘要，不能改写日志事实。
++        List<Object> logs = listValue(sanitizeExecutionResultValue("execution_logs", suppliedLogs));
++        if (logs.isEmpty()) return;
++        try {
++            AutomationPlaywrightCaseResp metadata = new AutomationPlaywrightCaseResp();
++            fillArtifactPathMetadata(metadata, scene);
++            ExecutionLogContext context = new ExecutionLogContext(executionId,
++                StringUtils.firstNonBlank(metadata.getProjectShortName(), "project"),
++                StringUtils.firstNonBlank(metadata.getVersionName(), "version"), scene.getSceneId(), caseId);
++            AutomationPlaywrightArtifactService.Artifact artifact = artifactServiceProvider.getObject()
++                .storeExecutionLog(context, logs);
++            Map<String, Object> urls = asObjectMap(rawResult.get("artifacts"));
++            urls.put("execution_log", artifact.url());
++            rawResult.put("artifacts", urls);
++            Map<String, Object> fileIds = asObjectMap(rawResult.get("artifact_file_ids"));
++            fileIds.put("execution_log", String.valueOf(artifact.fileId()));
++            rawResult.put("artifact_file_ids", fileIds);
++        } catch (Exception e) {
++            // 日志存储故障不能覆盖执行异常，仍回传原始用例结果并记录独立产物错误。
++            List<Object> errors = new ArrayList<>(listValue(rawResult.get("artifact_upload_errors")));
++            errors.add(Map.of("artifact_type", "execution_log", "error", StringUtils.defaultIfBlank(e.getMessage(), "执行日志保存失败")));
++            rawResult.put("artifact_upload_errors", errors);
++        }
++    }
++
+```
+
+### ../sakura-admin/continew-automation/src/test/java/top/continew/admin/automation/service/impl/AutomationPlaywrightArtifactServiceImplTest.java
+
+```diff
+diff --git a/continew-automation/src/test/java/top/continew/admin/automation/service/impl/AutomationPlaywrightArtifactServiceImplTest.java b/continew-automation/src/test/java/top/continew/admin/automation/service/impl/AutomationPlaywrightArtifactServiceImplTest.java
+index 379f29cd..5398def1 100644
+--- a/continew-automation/src/test/java/top/continew/admin/automation/service/impl/AutomationPlaywrightArtifactServiceImplTest.java
++++ b/continew-automation/src/test/java/top/continew/admin/automation/service/impl/AutomationPlaywrightArtifactServiceImplTest.java
+@@ -22,0 +23,2 @@ import java.util.Comparator;
++import java.util.List;
++import java.util.Map;
+@@ -24,0 +27,2 @@ import java.util.UUID;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.baomidou.mybatisplus.extension.conditions.update.LambdaUpdateChainWrapper;
+@@ -28,0 +33,3 @@ import org.dromara.x.file.storage.core.FileStorageService;
++import org.dromara.x.file.storage.core.FileInfo;
++import org.mockito.ArgumentCaptor;
++import org.springframework.web.multipart.MultipartFile;
+@@ -34,0 +42 @@ import top.continew.admin.automation.service.AutomationPlaywrightArtifactService
++import top.continew.admin.automation.service.AutomationPlaywrightArtifactService.ExecutionLogContext;
+@@ -38,0 +47 @@ import top.continew.admin.system.service.FileService;
++import top.continew.admin.system.model.entity.FileDO;
+@@ -43,0 +53,6 @@ import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.ArgumentMatchers.nullable;
+@@ -53 +68,2 @@ class AutomationPlaywrightArtifactServiceImplTest {
+-    private final AutomationPlaywrightArtifactServiceImpl service = new AutomationPlaywrightArtifactServiceImpl(mock(FileService.class), mock(StorageService.class), mock(FileStorageService.class), jobMapper, caseService);
++    private final FileService fileService = mock(FileService.class, RETURNS_DEEP_STUBS);
++    private final AutomationPlaywrightArtifactServiceImpl service = new AutomationPlaywrightArtifactServiceImpl(fileService, mock(StorageService.class), mock(FileStorageService.class), jobMapper, caseService, new ObjectMapper());
+@@ -72,0 +89,37 @@ class AutomationPlaywrightArtifactServiceImplTest {
++    @Test
++    @SuppressWarnings("unchecked")
++    void shouldStoreCdpExecutionLogWithoutCreatingRunnerJobAndPreserveOriginalEvents() throws IOException {
++        ReflectionTestUtils.setField(service, "unifiedStorageEnabled", true);
++        LambdaUpdateChainWrapper<FileDO> update = mock(LambdaUpdateChainWrapper.class);
++        when(fileService.lambdaUpdate()).thenReturn(update);
++        when(update.eq(any(), any())).thenReturn(update);
++        when(update.set(any(), any())).thenReturn(update);
++        FileInfo info = mock(FileInfo.class, RETURNS_DEEP_STUBS);
++        when(info.getId()).thenReturn("101");
++        when(info.getContentType()).thenReturn("application/json");
++        when(info.getSize()).thenReturn(128L);
++        when(info.getHashInfo().getMd5()).thenReturn("fixture-md5");
++        when(fileService.upload(any(), anyString(), nullable(String.class), anyString())).thenReturn(info);
++        List<Map<String, Object>> logs = List.of(Map.of("sequence", 1, "timestamp", "2026-09-08T06:45:19.827Z",
++            "level", "error", "message", "变量预检失败：未定义变量 {{passwd}}", "detail", false));
++
++        Artifact artifact = service.storeExecutionLog(new ExecutionLogContext("20260908144520", "AAS_DBSG", "V6.1", "SCENE_001", "CASE_004"), logs);
++
++        assertThat(artifact.fileId()).isEqualTo(101L);
++        assertThat(artifact.url()).isEqualTo("/automation/playwright/artifacts/files/101");
++        assertThat(artifact.relativePath()).isEqualTo("logs/execution-log.json");
++        ArgumentCaptor<MultipartFile> file = ArgumentCaptor.forClass(MultipartFile.class);
++        verify(fileService).upload(file.capture(), org.mockito.ArgumentMatchers.eq("automation/playwright/AAS_DBSG/V6.1/SCENE_001/CASE_004/20260908/20260908144520/logs/"),
++            nullable(String.class), org.mockito.ArgumentMatchers.eq("execution-log.json"));
++        assertThat(new ObjectMapper().readTree(file.getValue().getBytes())).isEqualTo(new ObjectMapper().valueToTree(logs));
++        verify(jobMapper, never()).selectOne(any());
++    }
++
++    @Test
++    void shouldRejectInvalidCdpLogPathBeforeUploading() {
++        ReflectionTestUtils.setField(service, "unifiedStorageEnabled", true);
++        assertThatThrownBy(() -> service.storeExecutionLog(new ExecutionLogContext("RUN_1", "AAS", "V1", "../other", "CASE_1"), List.of()))
++            .hasMessageContaining("场景标识");
++        verify(fileService, never()).upload(any(), anyString(), nullable(String.class), anyString());
++    }
++
+```
+
+### ../sakura-admin/continew-automation/src/test/java/top/continew/admin/automation/service/impl/AutomationPlaywrightCaseServiceImplTest.java
+
+```diff
+diff --git a/continew-automation/src/test/java/top/continew/admin/automation/service/impl/AutomationPlaywrightCaseServiceImplTest.java b/continew-automation/src/test/java/top/continew/admin/automation/service/impl/AutomationPlaywrightCaseServiceImplTest.java
+index d7798226..b5fd784d 100644
+--- a/continew-automation/src/test/java/top/continew/admin/automation/service/impl/AutomationPlaywrightCaseServiceImplTest.java
++++ b/continew-automation/src/test/java/top/continew/admin/automation/service/impl/AutomationPlaywrightCaseServiceImplTest.java
+@@ -39,0 +40,3 @@ import org.mockito.Mock;
++import org.mockito.ArgumentCaptor;
++import org.springframework.beans.factory.ObjectProvider;
++import org.springframework.test.util.ReflectionTestUtils;
+@@ -55,0 +59,3 @@ import top.continew.admin.automation.service.AutomationPlaywrightSessionStateSer
++import top.continew.admin.automation.service.AutomationPlaywrightArtifactService;
++import top.continew.admin.automation.service.AutomationPlaywrightArtifactService.Artifact;
++import top.continew.admin.automation.service.AutomationPlaywrightArtifactService.ExecutionLogContext;
+@@ -88,0 +95,6 @@ class AutomationPlaywrightCaseServiceImplTest {
++    @Mock
++    private AutomationPlaywrightArtifactService artifactService;
++
++    @Mock
++    private ObjectProvider<AutomationPlaywrightArtifactService> artifactServiceProvider;
++
+@@ -1139,0 +1152,91 @@ class AutomationPlaywrightCaseServiceImplTest {
++    @Test
++    @SuppressWarnings("unchecked")
++    void shouldPersistCdpStartupFailureLogsWithOriginalTimestampsAndCaseArtifactIndex() {
++        AutomationUiSceneDO storedScene = prepareCdpLogBatch();
++        when(artifactService.storeExecutionLog(any(), any())).thenReturn(new Artifact(101L, "RUN_CASE_1", "execution-log",
++            "logs/execution-log.json", "execution-log.json", "/automation/playwright/artifacts/files/101", "application/json", 128L, "md5", "local"));
++        AutomationPlaywrightResultReq request = cdpFailureWithLogs();
++
++        service.saveResult("100:CASE_001", request);
++
++        Map<String, Object> result = firstStoredCase(storedScene);
++        assertThat(result.get("error")).isEqualTo(request.getError());
++        assertThat(result.get("status")).isEqualTo("failed");
++        assertThat(result.get("duration_ms")).isEqualTo(82L);
++        assertThat(result.get("artifact_file_ids")).isEqualTo(Map.of("execution_log", "101"));
++        assertThat(result.get("artifact_urls")).isEqualTo(Map.of("execution_log", "/automation/playwright/artifacts/files/101"));
++        ArgumentCaptor<ExecutionLogContext> context = ArgumentCaptor.forClass(ExecutionLogContext.class);
++        ArgumentCaptor<List<?>> logs = ArgumentCaptor.forClass(List.class);
++        verify(artifactService).storeExecutionLog(context.capture(), logs.capture());
++        assertThat(context.getValue().runId()).isEqualTo("RUN_CASE_1");
++        assertThat(context.getValue().caseId()).isEqualTo("CASE_001");
++        assertThat(context.getValue().sceneId()).isEqualTo(storedScene.getSceneId());
++        Map<String, Object> errorLog = (Map<String, Object>)logs.getValue().get(0);
++        assertThat(errorLog).containsEntry("timestamp", "2026-09-08T06:45:19.827Z");
++        assertThat(errorLog).containsEntry("message", request.getError());
++        assertThat(errorLog).doesNotContainKey("execution_capability");
++    }
++
++    @Test
++    void shouldKeepOriginalExecutionErrorWhenCdpLogStorageFails() {
++        AutomationUiSceneDO storedScene = prepareCdpLogBatch();
++        when(artifactService.storeExecutionLog(any(), any())).thenThrow(new IllegalStateException("file storage offline"));
++        AutomationPlaywrightResultReq request = cdpFailureWithLogs();
++
++        service.saveResult("100:CASE_001", request);
++
++        Map<String, Object> result = firstStoredCase(storedScene);
++        assertThat(result.get("status")).isEqualTo("failed");
++        assertThat(result.get("error")).isEqualTo(request.getError());
++        assertThat(result.get("artifact_upload_errors")).isEqualTo(List.of(Map.of("artifact_type", "execution_log", "error", "file storage offline")));
++    }
++
++    @Test
++    @SuppressWarnings("unchecked")
++    void shouldValidateBatchMembershipBeforeWritingCdpLogFile() {
++        AutomationUiSceneDO storedScene = prepareCdpLogBatch();
++        Map<String, Object> batch = (Map<String, Object>)storedScene.getDebugRecord().get(0);
++        batch.put("caseResults", List.of(Map.of("case_id", "OTHER_CASE", "status", "running")));
++
++        assertThatThrownBy(() -> service.saveResult("100:CASE_001", cdpFailureWithLogs()))
++            .hasMessageContaining("批次目标用例不存在");
++        verify(artifactService, never()).storeExecutionLog(any(), any());
++    }
++
++    private AutomationUiSceneDO prepareCdpLogBatch() {
++        AutomationUiSceneDO storedScene = scene(1L);
++        when(sceneMapper.selectById(100L)).thenReturn(storedScene);
++        Map<String, Object> pendingCase = new LinkedHashMap<>();
++        pendingCase.put("case_id", "CASE_001");
++        pendingCase.put("execution_id", "RUN_CASE_1");
++        pendingCase.put("status", "running");
++        Map<String, Object> batch = new LinkedHashMap<>();
++        batch.put("batchId", "CDP_BATCH");
++        batch.put("executionType", "extension-cdp");
++        batch.put("startedAt", "2026-09-08 14:45:19");
++        batch.put("caseResults", new ArrayList<>(List.of(pendingCase)));
++        storedScene.setDebugRecord(new ArrayList<>(List.of(batch)));
++        ReflectionTestUtils.setField(service, "artifactServiceProvider", artifactServiceProvider);
++        lenient().when(artifactServiceProvider.getObject()).thenReturn(artifactService);
++        return storedScene;
++    }
++
++    private AutomationPlaywrightResultReq cdpFailureWithLogs() {
++        AutomationPlaywrightResultReq request = new AutomationPlaywrightResultReq();
++        request.setStatus("failed");
++        request.setSuccess(false);
++        request.setDurationMs(82L);
++        request.setError("变量预检失败：第 6 步引用了未定义变量 {{passwd}}");
++        request.setRaw(Map.of("executor", "extension-cdp", "batch_id", "CDP_BATCH", "run_id", "UNTRUSTED_RUN",
++            "startup_failure", true, "started_at", "2026-09-08T06:45:19.745Z", "finished_at", "2026-09-08T06:45:19.827Z",
++            "execution_logs", List.of(Map.of("sequence", 1, "timestamp", "2026-09-08T06:45:19.827Z", "level", "error",
++                "message", request.getError(), "execution_capability", "not-for-storage"))));
++        return request;
++    }
++
++    @SuppressWarnings("unchecked")
++    private Map<String, Object> firstStoredCase(AutomationUiSceneDO scene) {
++        Map<String, Object> batch = (Map<String, Object>)scene.getDebugRecord().get(0);
++        return (Map<String, Object>)((List<?>)batch.get("caseResults")).get(0);
++    }
++
+```
+
+### ../sakura-admin-ui/src/views/automation/automationUiScene/components/AutomationExecutionBatchDetail.vue
+
+```diff
+diff --git a/src/views/automation/automationUiScene/components/AutomationExecutionBatchDetail.vue b/src/views/automation/automationUiScene/components/AutomationExecutionBatchDetail.vue
+index fb1f58d..c6dab25 100644
+--- a/src/views/automation/automationUiScene/components/AutomationExecutionBatchDetail.vue
++++ b/src/views/automation/automationUiScene/components/AutomationExecutionBatchDetail.vue
+@@ -140,0 +141 @@
++                  :execution-id="record.executionId"
+@@ -565,0 +567,2 @@ function recordLogFallback(record: ExecutionHistoryCaseRow) {
++    result: record.executeResult,
++    duration_ms: record.duration,
+```
+
+### ../sakura-admin-ui/src/views/automation/automationUiScene/components/AutomationExecutionLogViewer.vue
+
+```diff
+diff --git a/src/views/automation/automationUiScene/components/AutomationExecutionLogViewer.vue b/src/views/automation/automationUiScene/components/AutomationExecutionLogViewer.vue
+index d220039..5c4c20a 100644
+--- a/src/views/automation/automationUiScene/components/AutomationExecutionLogViewer.vue
++++ b/src/views/automation/automationUiScene/components/AutomationExecutionLogViewer.vue
+@@ -80,0 +81 @@ const props = defineProps<{
++  executionId?: string
+@@ -112,0 +114 @@ let resolvedArtifactUrl = ''
++let loadedExecutionKey = ''
+@@ -131,0 +134 @@ watch(
++    props.executionId,
+@@ -149,0 +153,5 @@ async function resetAndLoad() {
++  const executionKey = props.executionId || props.jobId
++    || (props.caseExecutionDbId == null ? '' : `${props.executionDbId}:${props.caseExecutionDbId}`)
++  const sameExecution = Boolean(executionKey && loadedExecutionKey === executionKey)
++  loadedExecutionKey = executionKey
++  if (!sameExecution) logs.value = []
+@@ -162,2 +170 @@ async function resetAndLoad() {
+-  logs.value = []
+-  status.value = ''
++  status.value = props.status || ''
+@@ -313,0 +321,2 @@ function useFallback() {
++  // 同一执行的真实日志不能被步骤摘要覆盖；只有成功读取原始 artifact 后才替换。
++  if (logs.value.length) return
+@@ -338 +347,4 @@ function buildFallbackLogs(content: string): AutomationPlaywrightRunnerLog[] {
+-  if (!Array.isArray(result?.steps)) return []
++  const persistedLogs = [result?.execution_logs, result?.executionLogs].find(value => Array.isArray(value) && value.length)
++  if (persistedLogs) return persistedLogs.map(normalizeLog).filter(Boolean) as AutomationPlaywrightRunnerLog[]
++  if (!Array.isArray(result?.steps) && !result?.error) return []
++  const steps = Array.isArray(result.steps) ? result.steps : []
+@@ -354,3 +366,3 @@ function buildFallbackLogs(content: string): AutomationPlaywrightRunnerLog[] {
+-  push('info', 'runner', `${executor} 任务开始，case=${result.case_id || result.case_name || '-'}`)
+-  push('success', 'case', `用例加载完成，共 ${result.steps.length} 个步骤`)
+-  result.steps.forEach((step: any, index: number) => {
++  push('info', 'runner', `${executor} 执行结果摘要，case=${result.case_id || result.case_name || '-'}（原始日志不可用）`)
++  push('info', 'case', `记录包含 ${steps.length} 个步骤`)
++  steps.forEach((step: any, index: number) => {
+@@ -359 +371,4 @@ function buildFallbackLogs(content: string): AutomationPlaywrightRunnerLog[] {
+-    push('info', 'step', `步骤 ${number}: ${name}，开始执行`)
++    // 预检失败时服务端会补齐跳过占位；占位不是实际执行过的步骤。
++    if (['passed', 'success', 'failed', 'error', 'running'].includes(String(step.status || '').toLowerCase())) {
++      push('info', 'step', `步骤 ${number}: ${name}，开始执行`)
++    }
+@@ -384,2 +399,6 @@ function buildFallbackLogs(content: string): AutomationPlaywrightRunnerLog[] {
+-  const runOutcome = fallbackRunOutcome(result.status)
+-  push(runOutcome.level, 'runner', `${executor} ${runOutcome.message}，耗时 ${elapsed}ms`)
++  const runError = String(result.error || result.error_message || '').trim()
++  const runOutcome = fallbackRunOutcome(result.result || (runError ? 'failed' : result.status))
++  const duration = Number(result.duration_ms ?? result.duration)
++  if (Number.isFinite(duration) && duration >= 0) elapsed = duration
++  const errorCode = result.error_code && result.error_code !== '-' ? `[${result.error_code}] ` : ''
++  push(runOutcome.level, 'runner', `${executor} ${runOutcome.message}，耗时 ${elapsed}ms${runError ? `：${errorCode}${runError}` : ''}`)
+```
+
+### ../sakura-admin-ui/src/views/automation/automationUiScene/components/AutomationExecutionResultDrawer.vue
+
+```diff
+diff --git a/src/views/automation/automationUiScene/components/AutomationExecutionResultDrawer.vue b/src/views/automation/automationUiScene/components/AutomationExecutionResultDrawer.vue
+index 5c2404b..ad36bf0 100644
+--- a/src/views/automation/automationUiScene/components/AutomationExecutionResultDrawer.vue
++++ b/src/views/automation/automationUiScene/components/AutomationExecutionResultDrawer.vue
+@@ -52,0 +53 @@
++                :execution-id="selectedExecutionId"
+@@ -267,8 +267,0 @@ const logContent = computed(() => {
+-  if (executionType.value === 'extension-cdp') {
+-    return prettyJson({
+-      error: caseResult.value?.error || selectedPlaywrightResult.value?.error || record.playwrightError || '',
+-      failed_step_index: selectedPlaywrightResult.value?.failed_step_index,
+-      cdp_attach_error: selectedPlaywrightResult.value?.detail?.cdp_attach_error,
+-      diagnostics: selectedPlaywrightResult.value?.detail || {},
+-    })
+-  }
+@@ -282,0 +276,3 @@ const logContent = computed(() => {
++    result: caseResult.value?.executeResult || selectedRecord.value?.executeResult,
++    duration_ms: caseResult.value?.duration_ms ?? selectedPlaywrightResult.value?.duration_ms,
++    execution_logs: selectedPlaywrightResult.value?.execution_logs || selectedPlaywrightResult.value?.executionLogs,
+```
+
+### modules/batch-variable-context.js
+
+```diff
+diff --git a/modules/batch-variable-context.js b/modules/batch-variable-context.js
+new file mode 100644
+--- /dev/null
++++ b/modules/batch-variable-context.js
+@@ -0,0 +1,42 @@
++import { CuecastVariableContext } from './variable-context.js';
++
++/** 批次对象由后台鉴权后的会话管理器持有；原始快照不进入中台网页、日志或 chrome.storage。 */
++export class BatchVariableContexts {
++  constructor() {
++    this._batches = new WeakMap();
++  }
++
++  beginCase(batch, { sceneKey, projectEnvironmentId }, initialValues = {}) {
++    if (!batch || !batch.batchId || !sceneKey || projectEnvironmentId == null || projectEnvironmentId === '') {
++      throw new Error('CDP 场景变量共享缺少受控批次、场景或产品环境');
++    }
++    let state = this._batches.get(batch);
++    if (!state) {
++      state = { snapshots: new Map(), active: null };
++      this._batches.set(batch, state);
++    }
++    if (state.active) throw new Error('同一 CDP 批次必须等待前一用例结束后再共享变量');
++    const scopeKey = JSON.stringify([String(sceneKey), String(projectEnvironmentId)]);
++    const context = new CuecastVariableContext(initialValues);
++    context.restore(state.snapshots.get(scopeKey) || []);
++    const session = { batch, scopeKey, context };
++    state.active = session;
++    return session;
++  }
++
++  finishCase(session, success) {
++    if (!session) return;
++    const state = this._batches.get(session.batch);
++    // 批次已清理或旧用例迟到时，不能重新建立状态或覆盖下一用例的变量。
++    if (!state || state.active !== session) return;
++    try {
++      if (success) state.snapshots.set(session.scopeKey, session.context.snapshot());
++    } finally {
++      state.active = null;
++    }
++  }
++
++  clearBatch(batch) {
++    if (batch) this._batches.delete(batch);
++  }
++}
+```
+
+### tests/batch-variable-context.test.js
+
+```diff
+diff --git a/tests/batch-variable-context.test.js b/tests/batch-variable-context.test.js
+new file mode 100644
+--- /dev/null
++++ b/tests/batch-variable-context.test.js
+@@ -0,0 +1,126 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import { PlayerManager } from '../modules/player-manager.js';
++import { BatchVariableContexts } from '../modules/batch-variable-context.js';
++
++test('CDP 变量预检接受同场景前序成功用例的变量', () => {
++  const steps = [{ action_type: 'input', value: '{{passwd}}', target_selector: '#password' }];
++  const result = PlayerManager._validateVariableReferencesForPlayback(steps, 0, null, ['passwd']);
++  assert.equal(result.ok, true);
++  assert.deepEqual(result.issues, []);
++  assert.equal(PlayerManager._validateVariableReferencesForPlayback(steps).ok, false);
++});
++
++const scope = { sceneKey: 'SCENE_1', projectEnvironmentId: '47' };
++
++test('CDP 成功变量跨用例传递并保留掩码、来源和嵌套类型', () => {
++  const store = new BatchVariableContexts();
++  const batch = { batchId: 'BATCH_1' };
++  const first = store.beginCase(batch, scope);
++  first.context.set('passwd', 'local-secret', { masked: true, source: 'locator' });
++  first.context.set('query.rows', [{ id: 42, enabled: false }], { source: 'infrastructure' });
++  store.finishCase(first, true);
++  const next = store.beginCase(batch, scope, { passwd: 'old-default' });
++  assert.equal(next.context.resolveText('{{passwd}}'), 'local-secret');
++  assert.equal(next.context.resolveText('${query.rows[0].id}'), 42);
++  assert.equal(next.context.resolveText('{{query.rows[0].enabled}}'), false);
++  assert.deepEqual(next.context.describe('passwd'), { variable_name: 'passwd', value_masked: 1, source: 'locator' });
++  assert.throws(() => next.context.set('passwd', 'new', { overwrite: false }), /不允许覆盖/);
++});
++
++test('CDP 变量按批次对象、场景和环境隔离，旧批次同名也不复用', () => {
++  const store = new BatchVariableContexts();
++  const batch = { batchId: 'BATCH_1' };
++  const first = store.beginCase(batch, scope);
++  first.context.set('passwd', 'local-secret');
++  store.finishCase(first, true);
++  for (const [targetBatch, targetScope] of [
++    [batch, { ...scope, sceneKey: 'SCENE_2' }],
++    [batch, { ...scope, projectEnvironmentId: '48' }],
++    [{ batchId: 'BATCH_2' }, scope],
++    [{ batchId: 'BATCH_1' }, scope],
++  ]) {
++    const current = store.beginCase(targetBatch, targetScope);
++    assert.throws(() => current.context.get('passwd'), /变量不存在/);
++    store.finishCase(current, false);
++  }
++});
++
++test('失败候选的嵌套修改不会污染成功状态，结束批次后迟到提交无效', () => {
++  const store = new BatchVariableContexts();
++  const batch = { batchId: 'BATCH_1' };
++  const first = store.beginCase(batch, scope);
++  first.context.set('rows', [{ id: 42 }]);
++  store.finishCase(first, true);
++  const failed = store.beginCase(batch, scope);
++  failed.context.get('rows')[0].id = 99;
++  store.finishCase(failed, false);
++  const next = store.beginCase(batch, scope);
++  assert.equal(next.context.get('rows[0].id'), 42);
++  assert.throws(() => store.beginCase(batch, scope), /必须等待前一用例/);
++  store.clearBatch(batch);
++  store.finishCase(next, true);
++  assert.throws(() => store.beginCase(batch, scope).context.get('rows'), /变量不存在/);
++});
++
++test('真实 PlayerManager.start 跨用例使用变量，回传失败不提交且预检异常仍上报原日志', async () => {
++  const previousChrome = globalThis.chrome;
++  globalThis.chrome = {
++    runtime: { id: 'local-extension', getManifest: () => ({ version: 'test' }) },
++    debugger: { onEvent: { addListener() {} } },
++    tabs: { query: async () => [], remove: async () => {} },
++  };
++  const store = new BatchVariableContexts();
++  const batch = { batchId: 'BATCH_1' };
++  const reports = [];
++  let failReport = false;
++  let inherited;
++  const cases = {
++    SAVE: [{ action_type: 'global_variable_set', source_type: 'literal', variable_name: 'passwd', value: 'local-secret', value_masked: 1 }],
++    USE: [{ action_type: 'global_variable_set', source_type: 'literal', variable_name: 'copy', value: '{{passwd}}', value_masked: 1 }],
++    FAIL_REPORT: [{ action_type: 'global_variable_set', source_type: 'literal', variable_name: 'passwd', value: 'uncommitted', value_masked: 1 }],
++  };
++  const player = new PlayerManager({ mode: 'idle', activePlayCount: 0 }, {
++    getAdminPlaywrightCase: async (key) => ({ data: {
++      name: key, case_id: key.split(':')[1], project_environment_id: '47', steps: cases[key.split(':')[1]],
++      effectiveExecutionConfig: { browser_bootstrap_mode: 'none', step_timeout_ms: 3000, case_timeout_ms: 60000 },
++    } }),
++    saveAdminPlaywrightResult: async (_key, result) => {
++      reports.push(result);
++      if (failReport) throw new Error('模拟回传失败');
++    },
++  });
++  player._broadcastPlayback = () => {};
++  player._notifyPopup = () => {};
++  player._showNotification = () => {};
++  player._sleep = async () => {};
++  const run = (caseId, sceneKey = scope.sceneKey) => player.start(caseId, '', {
++    adminCaseKey: `${sceneKey}:${caseId}`, batchId: batch.batchId, executionCapability: 'local-capability',
++    projectEnvironmentId: '47', dataSource: 'admin',
++    prepareVariableContext: ({ initialVariables, ...caseScope }) => {
++      const session = store.beginCase(batch, caseScope, initialVariables);
++      inherited = session.context.names().includes('passwd') ? session.context.get('passwd') : undefined;
++      return session;
++    },
++    finalizeVariableContext: (session, success) => store.finishCase(session, success),
++  });
++  try {
++    assert.equal((await run('SAVE')).ok, true);
++    assert.equal((await run('USE')).ok, true);
++    assert.equal(inherited, 'local-secret');
++    assert.equal(reports.at(-1).raw.case_result.steps[0].details.variable_references[0].value_masked, 1);
++    failReport = true;
++    assert.equal((await run('FAIL_REPORT')).ok, false);
++    failReport = false;
++    assert.equal((await run('USE')).ok, true);
++    assert.equal(inherited, 'local-secret');
++    const missing = await run('USE', 'SCENE_2');
++    assert.equal(missing.ok, false);
++    assert.match(missing.error, /变量预检失败.*passwd/);
++    assert.ok(reports.at(-1).raw.execution_logs.some(item => item.level === 'error' && item.message.includes(missing.error)));
++    assert.ok(!JSON.stringify(reports).includes('local-secret'));
++    assert.equal(player._playContexts.size, 0);
++  } finally {
++    globalThis.chrome = previousChrome;
++  }
++});
+```
+
+### ../sakura-admin-ui/scripts/test-execution-log.mjs
+
+```diff
+diff --git a/scripts/test-execution-log.mjs b/scripts/test-execution-log.mjs
+new file mode 100644
+--- /dev/null
++++ b/scripts/test-execution-log.mjs
+@@ -0,0 +1,107 @@
++import assert from 'node:assert/strict'
++import fs from 'node:fs'
++import path from 'node:path'
++import { createRequire } from 'node:module'
++import { compileFunction } from 'node:vm'
++import { test } from 'node:test'
++
++const root = path.resolve(import.meta.dirname, '..')
++const require = createRequire(path.join(root, 'package.json'))
++const ts = require('typescript')
++const Vue = require('vue')
++const { parse, compileScript } = require('vue/compiler-sfc')
++const filename = path.join(root, 'src/views/automation/automationUiScene/components/AutomationExecutionLogViewer.vue')
++const { descriptor } = parse(fs.readFileSync(filename, 'utf8'), { filename })
++const script = compileScript(descriptor, { id: 'execution-log-regression' })
++const renderer = Vue.createRenderer({
++  createElement: tag => ({ tag, children: [] }), createText: text => ({ text }), createComment: text => ({ text }),
++  insert: (child, parent) => parent.children.push(child), remove() {}, patchProp() {}, setText() {}, setElementText() {},
++  parentNode: () => null, nextSibling: () => null,
++})
++const failure = '变量预检失败：第 6 步引用了未定义变量 {{passwd}}。请先添加保存变量步骤，或修正变量名。'
++const originalLogs = [
++  { sequence: 1, timestamp: '2026-09-08T06:45:19.745Z', level: 'info', phase: 'runner', message: 'CDP 任务开始', detail: false },
++  { sequence: 2, timestamp: '2026-09-08T06:45:19.827Z', level: 'error', phase: 'runner', message: `CDP 执行失败，耗时 82ms：${failure}`, detail: false },
++]
++
++function mount(props, fetcher = async () => { throw new Error('未模拟的网络请求') }) {
++  const mocks = {
++    vue: Vue,
++    '@vueuse/core': { onKeyStroke() {}, useResizeObserver() {}, useFullscreen: () => ({ isFullscreen: Vue.ref(false), toggle() {} }) },
++    '@/apis/automation/automationUiQuery': { getAutomationUiExecutionArtifacts: async () => ({ data: { list: [] } }) },
++    '@/apis/automation/automationPlaywrightRunner': { getAutomationPlaywrightRunnerJob: async () => { throw new Error('RUNNER_JOB_NOT_FOUND') } },
++    '@/utils/auth': { getToken: () => '' },
++  }
++  const source = `import { ref, computed, watch, onUnmounted, nextTick, shallowRef } from 'vue'\n${script.content}`
++    .replaceAll('import.meta.env', '({})')
++  const output = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
++  const module = { exports: {} }
++  compileFunction(output, ['require', 'module', 'exports', 'window', 'fetch', 'requestAnimationFrame'])(
++    name => mocks[name] ?? require(name), module, module.exports, { setTimeout, clearTimeout }, fetcher, callback => callback(),
++  )
++  const component = module.exports.default
++  component.render = () => null
++  const reactiveProps = Vue.reactive(props)
++  let instance
++  const app = renderer.createApp({ setup: () => () => Vue.h(component, { ...reactiveProps, ref: value => { instance = value } }) })
++  app.mount({ children: [] })
++  return { props: reactiveProps, state: () => instance.$.setupState, close: () => app.unmount() }
++}
++
++async function flush() {
++  await Vue.nextTick()
++  await new Promise(resolve => setImmediate(resolve))
++  await Vue.nextTick()
++}
++
++test('历史摘要保留用例级异常和真实耗时，不为跳过步骤伪造开始执行', async (t) => {
++  const view = mount({ status: 'failed', executionId: 'RUN_1', fallbackContent: JSON.stringify({
++    executor: 'extension-cdp', status: 'completed', result: 'failed', error: failure, duration_ms: 82,
++    steps: Array.from({ length: 8 }, (_, index) => ({ step_index: index, status: 'skipped', description: `S${index + 1}` })),
++  }) })
++  t.after(view.close)
++  await flush()
++  const messages = view.state().logs.map(item => item.message)
++  assert.ok(messages.some(message => message.includes(failure)))
++  assert.ok(messages.some(message => message.includes('82ms')))
++  assert.ok(!messages.some(message => message.includes('开始执行')))
++});
++
++test('结果内已有 execution_logs 时优先使用原始日志', async (t) => {
++  const view = mount({ status: 'failed', executionId: 'RUN_1', fallbackContent: JSON.stringify({
++    executor: 'extension-cdp', status: 'failed', execution_logs: originalLogs, steps: [],
++  }) })
++  t.after(view.close)
++  await flush()
++  assert.deepEqual(view.state().logs.map(item => item.message), originalLogs.map(item => item.message))
++});
++
++test('同一执行从实时切换到历史时保留异常，切换其他执行时隔离日志', async (t) => {
++  const view = mount({ status: 'running', executionId: 'RUN_1', liveLogs: originalLogs, fallbackContent: '' })
++  t.after(view.close)
++  await flush()
++  view.props.status = 'failed'
++  view.props.liveLogs = []
++  view.props.fallbackContent = JSON.stringify({ executor: 'extension-cdp', status: 'failed', steps: [] })
++  await flush()
++  assert.deepEqual(view.state().logs.map(item => item.message), originalLogs.map(item => item.message))
++  view.props.executionId = 'RUN_2'
++  view.props.fallbackContent = JSON.stringify({ executor: 'extension-cdp', status: 'passed', steps: [] })
++  await flush()
++  assert.ok(!view.state().logs.some(item => item.message.includes('passwd')))
++});
++
++test('刷新页面后从持久化 artifact 恢复原始异常日志，不使用步骤摘要', async (t) => {
++  const urls = []
++  const view = mount({ status: 'failed', executionId: 'RUN_1', artifactUrl: 'https://fixture.test/log.json',
++    fallbackContent: JSON.stringify({ executor: 'extension-cdp', status: 'failed', steps: [] }),
++  }, async (url) => {
++    urls.push(url)
++    return new Response(JSON.stringify(originalLogs), { headers: { 'Content-Type': 'application/json' } })
++  })
++  t.after(view.close)
++  await flush()
++  assert.deepEqual(urls, ['https://fixture.test/log.json'])
++  assert.deepEqual(view.state().logs.map(item => item.message), originalLogs.map(item => item.message))
++  assert.equal(view.state().logs[1].timestamp, originalLogs[1].timestamp)
++});
+```
+
+### ../docs/sakura-playwright-recording-admin-integration.md
+
+```diff
+--- a/docs/sakura-playwright-recording-admin-integration.md
++++ b/docs/sakura-playwright-recording-admin-integration.md
+@@
++补充修复（2026-09-08）：已实现 CDP 同批次/场景/环境的后台内存变量共享，预检识别前序成功变量，失败/取消/回传失败不提交；批次结束清理。Admin 将 CDP 原始 `execution_logs` 文件化并建立受鉴权索引，保留异常和毫秒时间；前端同执行实时转历史时保留原日志，旧记录摘要补齐用例级错误和真实耗时，不伪造跳过步骤的执行。扩展定向测试 39/39、前端日志测试 4/4、后端定向测试 71/71、Admin 编译及 admin-ui 构建通过；扩展全量为 120/121，唯一失败仍是既有目录字段计数 `133 !== 127`。真实扩展端到端尝试受本地模拟 API 配置影响未完成，按用户要求停止后续验收并交人工，阶段 4 保持 `[~]`；部署和复验步骤见第 6.3 节手动验证说明。前述 Runner 修复及其他暂存工作均保留。
++12. `[~]` CDP 跨用例变量及原始异常日志保留：后台受控批次共享变量、预检、成功提交、终态清理和原始日志 artifact 已实现；前端保留实时异常并修复旧历史摘要。单元/组件测试与构建通过，剩余端到端验收按用户要求交人工，不改 Runner/Jenkins 默认链路或原始录制数据。
+```
+
+### ../docs/sakura-playwright-recording-admin-stage4-manual-verification.md
+
+```diff
+--- a/docs/sakura-playwright-recording-admin-stage4-manual-verification.md
++++ b/docs/sakura-playwright-recording-admin-stage4-manual-verification.md
+@@
++### 6.3 CDP 跨用例变量与异常日志保留（人工验收）
++
++本轮代码及定向回归已完成；按用户要求，剩余端到端验收由人工执行，不将下列项目记为已通过。
++
++1. 同步部署 `sakura-admin`、`sakura-admin-ui` 和 `sakura-cuecast`。重启 Admin，在 `chrome://extensions/` 重新加载扩展，并刷新中台页面；无需数据库迁移、重新录制或修改原始 `playwright_step/locator_meta`。
++2. 确认 `automation.playwright-artifact.unified-storage-enabled=true`（默认值），系统文件管理的默认存储可写。CDP 原始日志通过现有 `/automation/playwright/artifacts/files/{fileId}` 鉴权读取，分层执行记录只保存文件索引。
++3. 在同一场景、同一产品环境发起一个新的 CDP 批次，按顺序包含保存 `passwd` 的用例和引用该变量的用例；如有前置条件，选择完整场景。分别按需要验证独立登录、复用登录态、共享浏览器或当前 Profile 兼容模式。后续密码输入应通过预检并正常执行，敏感变量仍保持掩码。
++4. 在专用测试场景制造变量写入后的失败或取消：后续用例只能读取上一份成功状态。更换场景、产品环境或新开批次不能读取旧变量；批次结束或扩展重载后也不恢复旧变量。
++5. 新建批次仅执行引用未定义 `{{passwd}}` 的用例，确认仍然报变量预检失败；这是真实配置错误，不能通过关闭预检掩盖。观察实时日志、执行结束后的日志、刷新页面后的历史日志，三处均应能看到相同的完整异常原因。
++6. 检查新生成的 `execution_log` artifact 保留原始事件、级别和毫秒时间，未被跳过步骤的摘要替换。旧记录没有原始日志文件时，应标注“原始日志不可用”，仍显示已保存的用例级错误和真实耗时；未执行/跳过步骤不能出现伪造的“开始执行”。
++7. 用无场景权限的账号访问日志 URL 应被拒绝；日志保存失败不得覆盖原始业务错误。完整变量快照不得写入 `chrome.storage`、日志、前端消息或长期报告；`value_masked=1` 的变量引用应继续隐藏预览。
++
++已执行的本地检查：扩展变量/会话/配置 39/39，前端日志组件 4/4（含实时切换及模拟 artifact 刷新），后端结果/产物/权限/分层记录 71/71；Admin 编译和 admin-ui 构建通过。扩展全量 120/121 的唯一失败是原有目录字段计数 `133 !== 127`。真实扩展端到端尝试出现本地模拟 API 地址回退到默认配置的连接失败，未完成验收；按用户要求不继续该自动验收，且未运行真实业务场景、重启现有服务或改动业务账号数据。
++
++| 2026-09-08 | 人工待验收 | CDP 同批次变量与异常日志持久化 | 代码与本地检查通过；端到端按用户要求暂缓 | 按第 6.3 节执行。须更新前后端、重载 CueCast 后新建批次；旧日志无法补回未持久化的完整事件，但可展示已保存的原始错误原因。 |
+```
+
+---
+
+# 2026-09-08 扩展 CDP PDF Viewer 属性断言与失败摘要修复
+
+## 涉及文件
+
+- README.md
+- modules/cdp-pdf-viewer.js
+- modules/player-manager.js
+- modules/operation-diagnostics.js
+- tests/cdp-pdf-viewer.test.js
+- tests/integration/cdp-pdf-viewer.test.js
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更原因
+
+同一个 PDF 帮助手册用例在 Playwright Runner 中已通过，但扩展 `extension-cdp` 的属性断言仍在当前文档执行 XPath，无法访问 Chrome PDF Viewer 内部的跨进程 iframe / Shadow DOM，最终返回 `not_found`。此外，操作摘要只按动作类型生成，导致失败状态仍显示“属性检查通过”。
+
+## 变更内容
+
+1. 为 `//embed[@type='application/x-google-chrome-pdf']` 增加窄范围 CDP 适配；只识别明确等价的 XPath，不按用例 ID、文件名或产品 URL 特判，不修改原始 `playwright_step` 和 `locator_meta`。
+2. 在当前受控 tab 内临时附加 iframe flat session，穿透普通 DOM、同进程 frame 和 Shadow Root；跨进程 frame 递归附加。真实节点定位后再次读取属性，不能使用下载事件、其他窗口的 PDF 或陈旧节点代替断言。
+3. 所有读取使用剩余步骤等待预算；完成或失败后移除监听、关闭临时自动附加并释放后代会话，保留主调试连接。子会话不复用主 iframe 的 `contextId`；清理失败不会静默记为成功。
+4. 属性断言输出实际值和 `pdf_viewer_frame` 定位来源。找不到元素时实际值标记为不可用，错误期望时保留真实值，受掩码保护的值仍脱敏；普通属性读取路径保持不变。
+5. 摘要根据 passed / failed / skipped / cancelled / canceled / timeout 等实际状态生成，避免失败或跳过被描述为成功。
+6. 新增单元测试和真实扩展浏览器测试；后者只用 Playwright 启动临时 Chromium，实际回放与断言经扩展 `chrome.debugger` 执行。README 补充重新加载扩展、复跑、依赖和产物说明。
+
+## 验证
+
+- 修改前基线：`node --test tests/*.test.js` 为 99/100；既有目录字段计数断言失败，`133 !== 127`。
+- 对本轮六个 JavaScript 文件执行 `node --check`：全部通过。
+- `node --test tests/cdp-pdf-viewer.test.js`：15/15 通过，覆盖跨进程与同进程 frame、关闭的 Shadow Root、延迟加载、错误期望、属性缺失、其他窗口、陈旧会话、节点替换、超时、清理和脱敏。
+- `node --test --test-name-pattern "执行摘要遵循实际状态" tests/operation-contract.test.js`：1/1 通过。
+- `node --test tests/integration/cdp-pdf-viewer.test.js`：3/3 通过（父测试及有头、无头两个子测试）；两种模式均完整执行 8 步，错误期望及其他窗口反例均失败，延迟 frame 正例通过。
+- `node --test tests/*.test.js`：115/116 通过；唯一失败仍是 `tests/operation-contract.test.js` 原有 `fieldCount` 固定计数断言 `133 !== 127`，本轮没有修改该计数，不将其记为全量通过。
+- 在相邻 `sakura-playwright` 运行 `npm run check`、`npm run test:pdf`：语法检查及 PDF 回归 6/6 通过，覆盖 isolated / reuse-browser 的有头与无头模式。
+- 在相邻 `sakura-admin` 运行 `mvn -pl continew-automation -am -DskipTests -Dspotless.skip=true -Dspotless.apply.skip=true compile`：5 个 reactor 模块编译通过；未运行后端测试，未执行格式化。
+- `git diff --check`：通过；变更记录为除日志自身外每个改动文件保留实际 diff。
+
+### CDP 实测耗时
+
+| 模式 | 步骤 6 切页 | 步骤 7 等待 | 步骤 8 属性断言 | 结果 |
+| --- | --- | --- | --- | --- |
+| 无头 | 524ms | 3013ms | 17ms | 8/8 通过 |
+| 有头 | 517ms | 3006ms | 17ms | 8/8 通过 |
+
+真实属性值为 `application/x-google-chrome-pdf`，定位来源为 `pdf_viewer_frame`。真实 CDP 命令确认临时后代会话已失效、主会话仍可用；已目视确认有头和无头截图包含 PDF 正文及 Viewer。
+
+CDP 最终产物：`%TEMP%/cuecast-cdp-pdf-y7bZPZ/`，每种模式包含 `result.json`、`step-6.jpg`、`step-7.jpg` 和 `step-8.jpg`。前一次通过产物为 `%TEMP%/cuecast-cdp-pdf-vLl9Lu/`。Runner 回归产物为 `../sakura-playwright/artifacts/pdf-viewer-regression/run-nrXnZc/`。生成产物与临时浏览器 profile 均不加入 Git。
+
+## 使用与验收边界
+
+- 使用 Chrome 125+，保持浏览器内置 PDF 预览可用；在 `chrome://extensions/` 重新加载更新后的 CueCast，刷新中台页面，再创建新的 CDP 执行。
+- 原用例无需重录或修改 XPath；历史失败记录不会自动改变。
+- 本轮仅验证本地真实扩展与模拟页面，未执行真实产品场景、未回写原场景 debugRecord，仍需用户在产品环境复跑验收。
+- 未修改 manifest 权限、Admin / admin-ui 业务代码、Runner 业务代码、Jenkins 默认入口或 test-lab 用例数据；其他仓库既有未提交改动均保留。
+
+## 具体代码改动
+
+### README.md
+
+```diff
+diff --git a/README.md b/README.md
+index 8c3c54e..5511193 100644
+--- a/README.md
++++ b/README.md
+@@ -65,6 +65,25 @@ sakura-cuecast/
+ - **CDP 模式（优先）**：使用 `chrome.debugger` + Chrome DevTools Protocol，模拟真实鼠标键盘输入，兼容 React/Vue 等框架
+ - **DOM 模式（降级）**：使用 `document.querySelector` + `element.click()` 等原生 DOM API
+
++### CDP 回放 PDF 帮助手册
++
++需要 Chrome 125+，并允许浏览器使用内置 PDF Viewer。更新扩展文件后，在 `chrome://extensions/` 重新加载 CueCast，刷新中台页面，再创建一次新的 CDP 执行；历史失败记录不会自动变为成功。
++
++- 保持原来的“打开帮助手册 → 切换当前最新窗口 → 等待 → 检查属性”步骤，无需重录或修改用例。
++- 对 `assert_attribute` 的 `//embed[@type='application/x-google-chrome-pdf']` 定位，CDP 会在当前标签页的内部 iframe / Shadow DOM 中读取真实属性，并等待延迟加载的 Viewer；原始 `playwright_step` 与 `locator_meta` 不变。
++- 该能力是 PDF Viewer 专项兼容，不是任意 XPath 的跨 frame 定位。其他窗口中的 PDF、下载记录和文件名都不能代替当前页面的属性断言。
++- 报告应显示 `pdf_viewer_frame` 定位来源和实际属性值；定位失败时实际值不可用，错误期望时保留真实值，失败摘要不再显示“属性检查通过”。
++
++本地回归（从 `sakura-cuecast` 目录执行）：
++
++```bash
++node --test tests/cdp-pdf-viewer.test.js
++node --test --test-name-pattern "执行摘要遵循实际状态" tests/operation-contract.test.js
++node --test tests/integration/cdp-pdf-viewer.test.js
++```
++
++真实浏览器测试复用相邻 `sakura-playwright` 已安装的 `playwright` 依赖和完整 Chromium；缺失时先在该目录运行 `npm install`、`npm exec -- playwright install chromium`。测试使用全新临时浏览器配置和本地页面，覆盖有头、无头八步回放、错误期望、其他窗口反例和延迟 frame。日志打印 `%TEMP%/cuecast-cdp-pdf-*/` 产物目录，含每种模式的 `result.json` 与步骤 6–8 的 JPEG，不替代真实产品环境验收。
++
+ ### Admin 批量回放用例会话
+
+ Admin 的 CDP 批量执行支持以下三种受管会话模式：
+```
+
+### modules/cdp-pdf-viewer.js
+
+```diff
+diff --git a/modules/cdp-pdf-viewer.js b/modules/cdp-pdf-viewer.js
+new file mode 100644
+--- /dev/null
++++ b/modules/cdp-pdf-viewer.js
+@@
++const PDF_MIME_TYPE = 'application/x-google-chrome-pdf';
++const PDF_SELECTOR = `embed[type="${PDF_MIME_TYPE}"]`;
++const AUTO_ATTACH = {
++  autoAttach: true,
++  waitForDebuggerOnStart: false,
++  flatten: true,
++  filter: [{ type: 'iframe', exclude: false }, { exclude: true }],
++};
++
++export function isPdfViewerAttributeTarget(step) {
++  return /^\/\/embed\[@type\s*=\s*(['"])application\/x-google-chrome-pdf\1\]$/.test(
++    String(step?.target_xpath || '').trim(),
++  );
++}
++
++function nodeAttributes(node) {
++  const attributes = new Map();
++  const pairs = node?.attributes || [];
++  for (let index = 0; index + 1 < pairs.length; index += 2) {
++    attributes.set(pairs[index], pairs[index + 1]);
++  }
++  return attributes;
++}
++
++function findPdfEmbed(root) {
++  const pending = root ? [root] : [];
++  while (pending.length) {
++    const node = pending.pop();
++    if (String(node.nodeName || '').toLowerCase() === 'embed'
++      && nodeAttributes(node).get('type') === PDF_MIME_TYPE) return node;
++    // CDP 的穿透 DOM 包含关闭的 Shadow Root 和同进程 frame，不能只遍历普通 children。
++    const children = [...(node.children || []), ...(node.shadowRoots || [])];
++    if (node.contentDocument) children.push(node.contentDocument);
++    pending.push(...children.reverse());
++  }
++  return null;
++}
++
++async function readTargetAttribute(send, attribute, sessionId) {
++  const document = await send('DOM.getDocument', { depth: -1, pierce: true }, sessionId);
++  const node = findPdfEmbed(document?.root);
++  if (!node?.nodeId) return null;
++  const attributes = nodeAttributes(await send('DOM.getAttributes', { nodeId: node.nodeId }, sessionId));
++  // 再读一次真实节点，避免把已导航、已替换的节点或下载记录当成属性断言的证据。
++  if (attributes.get('type') !== PDF_MIME_TYPE) return null;
++  return {
++    value: attributes.has(attribute) ? attributes.get(attribute) : null,
++    locator: {
++      source: 'pdf_viewer_frame',
++      executionSource: 'cdp:pdf-viewer-frame',
++      type: 'css',
++      value: PDF_SELECTOR,
++      matchedCount: 1,
++    },
++  };
++}
++
++export async function readPdfViewerAttribute({ tabId, attribute, timeoutMs, sendCommand }) {
++  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
++  const sessions = new Map();
++  const attaching = new Set();
++  let closed = false;
++  let lastError = 'not_found';
++  const send = (method, params, sessionId) => sendCommand(method, params, {
++    sessionId,
++    timeoutMs: Math.max(1, deadline - Date.now()),
++  });
++  const forgetSession = (sessionId) => {
++    sessions.delete(sessionId);
++    for (const [child, parent] of sessions) {
++      if (parent === sessionId) forgetSession(child);
++    }
++  };
++  const onEvent = (source, method, params) => {
++    // 只接受当前 tab 根会话派生的 iframe；禁止扫描其他窗口或全局 debugger targets。
++    if (closed || source?.tabId !== tabId || (source.sessionId && !sessions.has(source.sessionId))) return;
++    if (method === 'Target.detachedFromTarget') {
++      forgetSession(params.sessionId);
++    } else if (method === 'Target.attachedToTarget' && params.targetInfo?.type === 'iframe') {
++      const sessionId = params.sessionId;
++      if (!sessionId || sessions.has(sessionId)) return;
++      sessions.set(sessionId, source.sessionId || '');
++      const task = send('Target.setAutoAttach', AUTO_ATTACH, sessionId)
++        .catch((error) => { lastError = error.message; })
++        .finally(() => attaching.delete(task));
++      attaching.add(task);
++    }
++  };
++
++  chrome.debugger.onEvent.addListener(onEvent);
++  try {
++    // PDF Viewer 可能在独立进程，必须使用 Chrome 125+ 的 flat session 读取其真实 DOM。
++    await send('Target.setAutoAttach', AUTO_ATTACH);
++    do {
++      for (const sessionId of [undefined, ...sessions.keys()]) {
++        if (sessionId && !sessions.has(sessionId)) continue;
++        try {
++          const result = await readTargetAttribute(send, attribute, sessionId);
++          if (result && (!sessionId || sessions.has(sessionId))) return result;
++        } catch (error) {
++          // 内部 frame 延迟创建或导航时节点会短暂失效；重试仍受当前步骤的总等待预算约束。
++          lastError = error.message;
++        }
++        if (Date.now() >= deadline) break;
++      }
++      if (Date.now() >= deadline) break;
++      await new Promise((resolve) => setTimeout(resolve, Math.min(100, deadline - Date.now())));
++    } while (Date.now() < deadline);
++
++    const error = new Error(`断言失败：当前标签页未找到 Chrome PDF Viewer 属性目标元素（${lastError}）；请确认已切换到 PDF 窗口且浏览器允许内置 PDF 预览`);
++    error.locatorError = { code: 'LOCATOR_NOT_FOUND', reason: 'pdf_viewer_not_found' };
++    throw error;
++  } finally {
++    closed = true;
++    chrome.debugger.onEvent.removeListener(onEvent);
++    await Promise.allSettled([...attaching]);
++    // 临时自动附加仅服务本次断言；关闭后级联释放子会话，保留当前 tab 的主调试连接。
++    await sendCommand('Target.setAutoAttach', {
++      autoAttach: false, waitForDebuggerOnStart: false, flatten: true,
++    }, { timeoutMs: 1000 });
++  }
++}
+```
+
+### modules/player-manager.js
+
+```diff
+diff --git a/modules/player-manager.js b/modules/player-manager.js
+index f750c44..6d44545 100644
+--- a/modules/player-manager.js
++++ b/modules/player-manager.js
+@@ -16,6 +16,7 @@ import {
+   toBoolean,
+ } from './variable-context.js';
+ import { attachOperationDiagnostic } from './operation-diagnostics.js';
++import { isPdfViewerAttributeTarget, readPdfViewerAttribute } from './cdp-pdf-viewer.js';
+
+ /** 改为 true 后：打开扩展 Service Worker 控制台可看到 AI 步骤的节点数与操作计划 */
+ const DEBUG_AI_NATURAL = false;
+@@ -2582,17 +2583,19 @@ export class PlayerManager {
+     return { tabId: targetTab.id, cdpAvailable: nextCdpAvailable };
+   }
+
+-  async _cdpSend(tabId, method, params = {}) {
+-    const effectiveParams = await this._prepareCdpCommandParams(tabId, method, params);
++  async _cdpSend(tabId, method, params = {}, options = {}) {
++    // 子调试会话有独立的 execution context，不能混入主会话选中的 iframe contextId。
++    const effectiveParams = options.sessionId ? params : await this._prepareCdpCommandParams(tabId, method, params);
++    const target = options.sessionId ? { tabId, sessionId: options.sessionId } : { tabId };
+     return new Promise((resolve, reject) => {
+       let settled = false;
+       const timer = setTimeout(() => {
+         if (settled) return;
+         settled = true;
+         reject(new Error(`CDP 命令超时：${method}`));
+-      }, CDP_COMMAND_TIMEOUT_MS);
++      }, Math.max(1, Math.min(options.timeoutMs ?? CDP_COMMAND_TIMEOUT_MS, CDP_COMMAND_TIMEOUT_MS)));
+       // Runtime.evaluate 可能需要绑定当前 iframe 的 execution context；必须发送预处理后的参数。
+-      chrome.debugger.sendCommand({ tabId }, method, effectiveParams, (result) => {
++      chrome.debugger.sendCommand(target, method, effectiveParams, (result) => {
+         if (settled) return;
+         settled = true;
+         clearTimeout(timer);
+@@ -3279,9 +3282,38 @@ export class PlayerManager {
+     const attribute = PlayerManager._firstStepString(step, ['attribute', 'value']).trim();
+     const expected = PlayerManager._firstStepString(step, ['expect', 'expected']);
+     if (!attribute) throw new Error('assert_attribute 缺少 attribute');
+-    const actual = await this._waitForTargetAttributeCDP(tabId, step, attribute);
+-    if (actual !== expected) {
+-      throw new Error(`断言失败：属性 ${attribute} 的实际值与期望值不一致`);
++    const masked = step.value_masked === true || step.value_masked === 1;
++    const operationAssertion = {
++      subject: `元素属性 ${attribute}`,
++      operator: 'equals',
++      expected: masked ? { value_state: 'masked' } : { value_state: 'visible', preview: expected },
++      actual: { value_state: 'unavailable' },
++      passed: false,
++    };
++    let locator = null;
++    try {
++      // 不修改原始 playwright_step / locator_meta；仅为明确等价的 PDF XPath 补充 CDP 读取路径。
++      const result = isPdfViewerAttributeTarget(step)
++        ? await readPdfViewerAttribute({
++          tabId,
++          attribute,
++          timeoutMs: this._getEffectiveWaitTimeout(tabId, 8000),
++          sendCommand: (method, params, options) => this._cdpSend(tabId, method, params, options),
++        })
++        : { value: await this._waitForTargetAttributeCDP(tabId, step, attribute) };
++      locator = result.locator || null;
++      operationAssertion.actual = masked
++        ? { value_state: 'masked' }
++        : { value_state: 'visible', preview: String(result.value) };
++      operationAssertion.passed = result.value === expected;
++      if (!operationAssertion.passed) {
++        throw new Error(`断言失败：属性 ${attribute} 的实际值与期望值不一致`);
++      }
++      return { ...(locator || {}), operationAssertion };
++    } catch (error) {
++      error.operationAssertion = operationAssertion;
++      if (locator) error.actualLocator = locator;
++      throw error;
+     }
+   }
+
+@@ -9732,7 +9764,7 @@ export class PlayerManager {
+       }
+
+       case 'assert_attribute': {
+-        await this._executeAssertAttributeCDP(tabId, step);
++        actualLocator = await this._executeAssertAttributeCDP(tabId, step);
+         break;
+       }
+```
+
+### modules/operation-diagnostics.js
+
+```diff
+diff --git a/modules/operation-diagnostics.js b/modules/operation-diagnostics.js
+index fed3e6d..c31200f 100644
+--- a/modules/operation-diagnostics.js
++++ b/modules/operation-diagnostics.js
+@@ -111,6 +111,7 @@ export function buildOperationDiagnostic(definitionStep = {}, runtimeStep = {},
+     definitionStep.diagnostic_profile || definitionStep.diagnosticProfile || ACTION_PROFILES[actionType] || 'generic',
+   );
+   const assertion = result.operation_assertion ? safeAssertion(result.operation_assertion) : null;
++  const summary = summaryFor(actionType, result.status);
+   const operation = {
+     schema_version: 1,
+     ...(firstText(definitionStep.catalog_version, runtimeStep.catalog_version)
+@@ -128,13 +129,13 @@ export function buildOperationDiagnostic(definitionStep = {}, runtimeStep = {},
+         ? { method_label: firstText(definitionStep.method_label, definitionStep.methodLabel) } : {}),
+       action_type: actionType || 'custom',
+     },
+-    summary: summaryFor(actionType),
++    summary,
+     // 断言的执行值是页面实际读取结果，不能继续把期望值误当成执行值。
+     inputs: applyAssertionActual(collectInputs(definitionStep, runtimeStep), profile, assertion),
+     outcome: {
+       kind: profile,
+       status: result.status || 'unknown',
+-      summary: summaryFor(actionType),
++      summary,
+       facts: collectFacts(result),
+       ...(assertion ? { assertion } : {}),
+     },
+@@ -277,14 +278,20 @@ function readValue(step, key) {
+   return aliases.reduce((value, name) => value === undefined ? step[name] : value, undefined);
+ }
+
+-function summaryFor(actionType) {
++function summaryFor(actionType, status) {
+   const labels = {
+     navigate: '页面导航完成', click: '点击完成', input: '输入完成', select_option: '选项选择完成',
+     wait: '固定等待完成', assert_text: '文本检查通过', assert_attribute: '属性检查通过',
+     global_variable_set: '全局变量设置完成', evaluate: '脚本执行完成', server_command: '服务器命令执行完成',
+     database_sql: '数据库操作完成',
+   };
+-  return labels[actionType] || `动作 ${actionType || 'custom'} 执行完成`;
++  const summary = labels[actionType] || `动作 ${actionType || 'custom'} 执行完成`;
++  if (normalize(status) === 'passed') return summary;
++  // 摘要与实际状态保持一致，定位失败、跳过或取消都不能显示为“检查通过”。
++  const ending = {
++    failed: '失败', skipped: '已跳过', cancelled: '已取消', canceled: '已取消', timeout: '超时',
++  }[normalize(status)] || '状态未知';
++  return summary.replace(/(?:通过|完成)$/, ending);
+ }
+
+ function safeUrl(value, truncate = true) {
+```
+
+### tests/cdp-pdf-viewer.test.js
+
+```diff
+diff --git a/tests/cdp-pdf-viewer.test.js b/tests/cdp-pdf-viewer.test.js
+new file mode 100644
+--- /dev/null
++++ b/tests/cdp-pdf-viewer.test.js
+@@
++test('CDP PDF 成功和错误期望均保留真实属性与定位来源', async (t) => {
++  const harness = createHarness(t, ({ method }) => method === 'DOM.getDocument' ? pdfDocument : undefined);
++  const manager = createManager(harness);
++  const original = structuredClone(pdfStep);
++  const result = await manager._executeAssertAttributeCDP(5, pdfStep);
++  assert.equal(result.operationAssertion.actual.preview, pdfType);
++  assert.equal(result.operationAssertion.passed, true);
++  assert.equal(result.source, 'pdf_viewer_frame');
++  await assert.rejects(manager._executeAssertAttributeCDP(5, { ...pdfStep, expect: 'wrong' }), (error) => {
++    assert.equal(error.operationAssertion.actual.preview, pdfType);
++    assert.equal(error.operationAssertion.passed, false);
++    assert.equal(error.actualLocator.source, 'pdf_viewer_frame');
++    return true;
++  });
++  assert.deepEqual(pdfStep, original);
++  assertCleaned(harness, 1);
++});
++
++test('CDP PDF 清理失败不得静默报告成功，监听仍必须移除', async (t) => {
++  const harness = createHarness(t, ({ method, params }) => {
++    if (method === 'DOM.getDocument') return pdfDocument;
++    if (method === 'Target.setAutoAttach' && !params.autoAttach) throw new Error('子会话清理失败');
++  });
++  await assert.rejects(readPdfViewerAttribute({ tabId: 5, attribute: 'type', timeoutMs: 500, sendCommand: harness.sendCommand }),
++    /子会话清理失败/);
++  assertCleaned(harness);
++});
+```
+
+### tests/integration/cdp-pdf-viewer.test.js
+
+```diff
+diff --git a/tests/integration/cdp-pdf-viewer.test.js b/tests/integration/cdp-pdf-viewer.test.js
+new file mode 100644
+--- /dev/null
++++ b/tests/integration/cdp-pdf-viewer.test.js
+@@
++      const assertion = result.steps[7];
++      assert.equal(assertion.locator_source, 'pdf_viewer_frame');
++      assert.equal(assertion.details.operation.executor, 'extension-cdp');
++      assert.equal(assertion.details.operation.outcome.assertion.actual.preview, 'application/x-google-chrome-pdf');
++      assert.equal(assertion.details.operation.summary, '属性检查通过');
++      assert.equal(result.originalStepPreserved, true);
++      assert.equal(result.mainSessionStillAttached, true);
++      assert.equal(result.childSessionsReleased, true);
++      assert.equal(result.wrongExpected.status, 'failed');
++      assert.equal(result.wrongExpected.details.operation.summary, '属性检查失败');
++      assert.equal(result.wrongExpected.details.operation.outcome.assertion.actual.preview, 'application/x-google-chrome-pdf');
++      assert.equal(result.otherTab.status, 'failed');
++      assert.equal(result.otherTab.details.operation.summary, '属性检查失败');
++      assert.deepEqual(result.otherTab.details.operation.outcome.assertion.actual, { value_state: 'unavailable' });
++      assert.equal(result.delayedFrame.operationAssertion.actual.preview, 'application/x-google-chrome-pdf');
++      assert.deepEqual(frames.map((frame) => frame.step), [6, 7, 8]);
++      assert.ok(result.steps[6].duration_ms >= 3000 && result.steps[6].duration_ms < 5000);
+```
+
+### tests/operation-contract.test.js
+
+```diff
+diff --git a/tests/operation-contract.test.js b/tests/operation-contract.test.js
+index 0c7b699..bec4da7 100644
+--- a/tests/operation-contract.test.js
++++ b/tests/operation-contract.test.js
+@@ -23,6 +23,22 @@ const catalog = JSON.parse(fs.readFileSync(new URL(
+ const profileByMethod = Object.fromEntries(Object.entries(catalog.diagnostic_profiles)
+   .flatMap(([profile, methods]) => methods.map((methodCode) => [methodCode, profile])));
+
++test('CueCast 执行摘要遵循实际状态，失败和跳过不会写成通过', () => {
++  const expectedSummaries = {
++    passed: '属性检查通过', failed: '属性检查失败', skipped: '属性检查已跳过',
++    cancelled: '属性检查已取消', canceled: '属性检查已取消', timeout: '属性检查超时',
++    unknown: '属性检查状态未知',
++  };
++  for (const [status, summary] of Object.entries(expectedSummaries)) {
++    const result = attachOperationDiagnostic({ action_type: 'assert_attribute', status }, { action_type: 'assert_attribute' });
++    assert.equal(result.details.operation.summary, summary);
++    assert.equal(result.details.operation.outcome.summary, summary);
++    assert.equal(result.details.operation.outcome.status, status);
++  }
++  const failedClick = attachOperationDiagnostic({ action_type: 'click', status: 'failed' });
++  assert.equal(failedClick.details.operation.summary, '点击失败');
++});
++
+ test('CueCast registry covers every canonical action in the 63-method fixture', () => {
+   assert.equal(fixture.catalog_version, OPERATION_CATALOG_VERSION);
+   assert.equal(fixture.methods.length, 63);
+```
+
 # 2026-08-31 扩展 CDP 条件点击为指定元素存在判断
 
 ## 涉及文件
@@ -7550,5 +9320,50 @@ node --experimental-default-type=module --input-type=module -e "import { Cuecast
 +    result.details.operation.inputs.map((item) => item.key),
 +    ['variable_name', 'format', 'date_mode', 'datetime', 'offset_seconds', 'timestamp_unit'],
 +  );
++});
+```
+# 2026-09-11 CDP 与 Playwright Runner 图片属性断言期望值恢复修复
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `tests/operation-contract.test.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+录制的图片 `src` 断言将完整 data URL 保存在 `expect`。当兼容字段 `value` 为空时，CDP 未继续读取录制元数据的断言预览，导致统一元素属性断言的期望值丢失；空字符串“包含”断言还可能产生误通过。
+
+## 验证
+
+```powershell
+node --experimental-default-type=module --test tests/operation-contract.test.js tests/cuecast-recording-compatibility.test.js
+node --check modules/player-manager.js
+```
+
+结果：待本次修改后执行。
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+@@
+-        expect: matchMode === 'visible' ? '' : String(step.expect ?? step.value ?? ''),
++        expect: matchMode === 'visible' ? '' : PlayerManager._resolveAssertionExpectedValue(step),
+@@
+-    const expectedValue = step.expect ?? step.value;
+-    const expected = expectedValue != null ? String(expectedValue) : '';
++    const expected = PlayerManager._resolveAssertionExpectedValue(step);
+```
+
+### `tests/operation-contract.test.js`
+
+```diff
+@@
++test('CueCast 属性断言优先使用 expect 并兼容录制元数据预览', () => {
++  const dataUrl = `data:image/jpg;base64,${'a'.repeat(2048)}`;
++  assert.equal(PlayerManager._adaptRecordedStep(step).expect, dataUrl);
++  assert.equal(PlayerManager._resolveAssertionExpectedValue({ ...step, expect: '' }), dataUrl);
 +});
 ```

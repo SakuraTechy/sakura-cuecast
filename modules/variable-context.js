@@ -1,7 +1,7 @@
 /**
  * CueCast 单次回放变量上下文。
  *
- * 变量仅存在于当前 PlayerManager.start 调用期间；不能写入 extension storage、日志或跨用例 Map。
+ * 单次回放独立解析变量；受控批次可在后台内存中传递成功快照，不能写入 extension storage 或日志。
  * 新步骤统一使用 {{name}}、{{object.key}}、{{list[0]}}；历史 ${name} 继续兼容，但不依赖 Node API。
  */
 
@@ -130,6 +130,25 @@ export class CuecastVariableContext {
         source: meta.source || '',
       };
     });
+  }
+
+  names() {
+    return [...this._values.keys()];
+  }
+
+  snapshot() {
+    // 深拷贝防止失败用例修改嵌套对象污染上一份成功状态，敏感标记必须与值一起保留。
+    return structuredClone([...this._values].map(([name, value]) => ({
+      name, value, ...this._metadata.get(name),
+    })));
+  }
+
+  restore(snapshot) {
+    for (const entry of structuredClone(snapshot)) {
+      this.set(entry.name, entry.value, {
+        masked: entry.masked, source: entry.source, allowReserved: true,
+      });
+    }
   }
 
   _parseReference(reference) {

@@ -65,6 +65,25 @@ sakura-cuecast/
 - **CDP 模式（优先）**：使用 `chrome.debugger` + Chrome DevTools Protocol，模拟真实鼠标键盘输入，兼容 React/Vue 等框架
 - **DOM 模式（降级）**：使用 `document.querySelector` + `element.click()` 等原生 DOM API
 
+### CDP 回放 PDF 帮助手册
+
+需要 Chrome 125+，并允许浏览器使用内置 PDF Viewer。更新扩展文件后，在 `chrome://extensions/` 重新加载 CueCast，刷新中台页面，再创建一次新的 CDP 执行；历史失败记录不会自动变为成功。
+
+- 保持原来的“打开帮助手册 → 切换当前最新窗口 → 等待 → 检查属性”步骤，无需重录或修改用例。
+- 对 `assert_attribute` 的 `//embed[@type='application/x-google-chrome-pdf']` 定位，CDP 会在当前标签页的内部 iframe / Shadow DOM 中读取真实属性，并等待延迟加载的 Viewer；原始 `playwright_step` 与 `locator_meta` 不变。
+- 该能力是 PDF Viewer 专项兼容，不是任意 XPath 的跨 frame 定位。其他窗口中的 PDF、下载记录和文件名都不能代替当前页面的属性断言。
+- 报告应显示 `pdf_viewer_frame` 定位来源和实际属性值；定位失败时实际值不可用，错误期望时保留真实值，失败摘要不再显示“属性检查通过”。
+
+本地回归（从 `sakura-cuecast` 目录执行）：
+
+```bash
+node --test tests/cdp-pdf-viewer.test.js
+node --test --test-name-pattern "执行摘要遵循实际状态" tests/operation-contract.test.js
+node --test tests/integration/cdp-pdf-viewer.test.js
+```
+
+真实浏览器测试复用相邻 `sakura-playwright` 已安装的 `playwright` 依赖和完整 Chromium；缺失时先在该目录运行 `npm install`、`npm exec -- playwright install chromium`。测试使用全新临时浏览器配置和本地页面，覆盖有头、无头八步回放、错误期望、其他窗口反例和延迟 frame。日志打印 `%TEMP%/cuecast-cdp-pdf-*/` 产物目录，含每种模式的 `result.json` 与步骤 6–8 的 JPEG，不替代真实产品环境验收。
+
 ### Admin 批量回放用例会话
 
 Admin 的 CDP 批量执行支持以下三种受管会话模式：
@@ -74,6 +93,16 @@ Admin 的 CDP 批量执行支持以下三种受管会话模式：
 - **同一浏览器窗口连续执行**：批次内复用同一个受控无痕窗口和活动标签页；用例失败或目标页丢失时重置会话，避免继续使用不可信页面状态。
 
 三种模式都要求扩展能力探测通过。批次开始时配置会被冻结，单条用例不能覆盖；批次结束或中止时必须执行清理。认证快照只保存在 `chrome.storage.session`，不通过 Admin API、执行日志或测试报告持久化。
+
+#### 同一批次跨用例变量与异常日志
+
+- 同一 CDP 批次、场景和产品环境中，前序成功用例保存的变量可由后续用例使用 `{{passwd}}` 或 `${passwd}` 引用；三种受管模式和当前 Profile 兼容模式均通过后台批次入口处理。预检会识别前序变量，但真正缺失的变量仍会报错。
+- 完整变量快照只保存在扩展后台内存中，不写入 `chrome.storage` 或消息响应；展示诊断仅返回脱敏预览和元数据。只有执行成功、结果回传成功且未取消才提交；失败候选不覆盖上一份成功状态。结束/中止批次会清理变量，重新加载扩展也不会恢复旧变量。
+- 必须在同一批次顺序选择保存和引用变量的用例；单独执行用例 004 不继承其他批次或其他执行方式的变量。
+- Admin 会把 CDP 上报的原始 `execution_logs` 保存为受鉴权日志 artifact，保留异常及毫秒时间；前端从实时切换历史不再以步骤摘要覆盖异常。旧记录无原始日志时只能展示含用例级错误的结果摘要，不会伪造跳过步骤已经执行。
+- 生效需要同步更新并重启 Admin、更新 admin-ui、在 `chrome://extensions/` 重新加载 CueCast，随后刷新中台页面。日志文件要求 `automation.playwright-artifact.unified-storage-enabled=true`（默认开启）及可用的系统文件存储；无需数据库迁移或重新录制。
+
+本地回归命令：`node --test tests/batch-variable-context.test.js`。前端日志回归在相邻 `sakura-admin-ui` 执行 `node --test scripts/test-execution-log.mjs`。本轮端到端产品验收按用户安排交人工执行，步骤见工作区 `docs/sakura-playwright-recording-admin-stage4-manual-verification.md` 第 6.3 节。
 
 扩展自动化验证：
 

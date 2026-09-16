@@ -8,6 +8,7 @@ import { PlayerManager } from './modules/player-manager.js';
 import { ApiClient } from './modules/api-client.js';
 import { CdpBatchSessionManager } from './modules/cdp-batch-session-manager.js';
 import { CurrentProfileBatchSessionManager } from './modules/current-profile-batch-session-manager.js';
+import { BatchVariableContexts } from './modules/batch-variable-context.js';
 
 const state = {
   mode: 'idle',       // idle | recording（回放中仅用 activePlayCount 表示，见 AT_GET_STATE）
@@ -65,11 +66,14 @@ const recorder = new RecorderManager(state, api);
 const player = new PlayerManager(state, api);
 const cdpBatchSessions = new CdpBatchSessionManager(chrome);
 const currentProfileBatchSessions = new CurrentProfileBatchSessionManager(chrome);
+const batchVariables = new BatchVariableContexts();
 const RECORDING_KEEPALIVE_ALARM = 'cc-recording-keepalive';
 
 function finishPlaybackBatch(batchManager, method, message, sourceTabId) {
+  const batch = batchManager.batch;
   return batchManager[method](message.batchId, message.executionCapability, sourceTabId)
     .then(async (response) => {
+      batchVariables.clearBatch(batch);
       // 网页可能在步骤结束后才真正提交文件，必须等批次成功结束再删除下载文件。
       await player.cleanupExecutionFiles(message.batchId, {
         removeFiles: state.cleanupExecutionFilesOnBatchEnd,
@@ -532,6 +536,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sessionMode: message.sessionMode,
         browserSessionSource: message.browserSessionSource,
         ...(batchSessionManager ? {
+          prepareVariableContext: async ({ sceneKey, projectEnvironmentId, initialVariables }) => {
+            batchSessionManager.assertBatch(message.batchId, message.sessionMode, message.browserSessionSource);
+            await batchSessionManager.assertExecutionCapability(message.executionCapability);
+            return batchVariables.beginCase(batchSessionManager.batch, { sceneKey, projectEnvironmentId }, initialVariables);
+          },
+          finalizeVariableContext: (session, success) => batchVariables.finishCase(
+            session, success && session?.batch === batchSessionManager.batch,
+          ),
           prepareBrowserSession: ({ startUrl, ignoreHttpsErrors }) => batchSessionManager.prepareCase({
             batchId: message.batchId,
             sessionMode: message.sessionMode,

@@ -9367,3 +9367,76 @@ node --check modules/player-manager.js
 +  assert.equal(PlayerManager._resolveAssertionExpectedValue({ ...step, expect: '' }), dataUrl);
 +});
 ```
+# 2026-09-22 增加日期全局变量的 script 计算偏移兼容
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `tests/operation-contract.test.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+Admin 日期全局操作新增了旧版 `web-setdate` 使用的 `script` 日期偏移表达式。CueCast 回放此前只读取数字 `offset_seconds`，无法执行 `60*60*24*7` 等合法计算配置。
+
+## 变更内容
+
+- 日期全局变量优先读取 `script`，使用受限算术表达式计算秒数，禁止执行任意 JavaScript。
+- 更新目录字段数量契约测试，覆盖新增日期计算字段。
+
+## 验证
+
+- `node --check modules/player-manager.js`
+- `node --test tests/operation-contract.test.js`：24 个测试通过。
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+@@
+-      const offsetSeconds = Number(step?.offset_seconds ?? 0);
+-      if (!Number.isFinite(offsetSeconds)) throw new Error('offset_seconds 必须是有效数字');
++      const offsetExpression = step?.script ?? step?.offset_seconds ?? 0;
++      const offsetSeconds = evaluateArithmeticExpression(offsetExpression, variableContext);
+```
+
+### `tests/operation-contract.test.js`
+
+```diff
+@@
+-  assert.equal(fieldCount, 137);
++  assert.equal(fieldCount, 148);
+```
+
+---
+# 2026-09-22 支持日期 script 引用全局变量
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+日期偏移脚本需要支持 `60*60*24*{{date}}` 这类由前序步骤生成天数的配置。
+
+## 变更内容
+
+CueCast 日期变量执行改为通过当前 `variableContext` 解析 `${name}` / `{{name}}` 后再执行受限算术表达式。
+
+## 验证
+
+`node --test tests/operation-contract.test.js`：24 个测试通过。
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+@@
+-      const offsetSeconds = evaluateArithmeticExpression(offsetExpression);
++      const offsetSeconds = evaluateArithmeticExpression(offsetExpression, variableContext);
+```
+
+---

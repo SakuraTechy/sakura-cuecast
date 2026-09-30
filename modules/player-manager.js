@@ -2347,8 +2347,8 @@ export class PlayerManager {
     if (actionType === 'global_variable_date') {
       const name = String(step?.variable_name || '').trim();
       const mode = String(step?.date_mode || 'current_datetime').trim().toLowerCase();
-      const offsetSeconds = Number(step?.offset_seconds ?? 0);
-      if (!Number.isFinite(offsetSeconds)) throw new Error('offset_seconds 必须是有效数字');
+      const offsetExpression = step?.script ?? step?.offset_seconds ?? 0;
+      const offsetSeconds = evaluateArithmeticExpression(offsetExpression, variableContext);
       const date = mode === 'custom_datetime'
         ? new Date(String(step?.datetime ?? step?.date_value ?? step?.value ?? ''))
         : new Date();

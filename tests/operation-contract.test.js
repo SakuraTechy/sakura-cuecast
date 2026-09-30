@@ -145,7 +145,7 @@ test('所有目录 form_schema 字段都进入 CueCast 执行详情', () => {
       fieldCount += method.form_schema.length;
     }
   }
-  assert.equal(fieldCount, 137);
+  assert.equal(fieldCount, 148);
 });
 
 test('CueCast 变量引用详情只输出脱敏预览并保留来源', () => {

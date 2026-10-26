@@ -13,9 +13,63 @@
   let pageErrorCheckEnabled = false;
   const runtimeVariables = Object.create(null);
 
+  function pushUnique(list, value) {
+    if (value && !list.includes(value)) list.push(value);
+  }
+
+  function escapeCssIdentifier(value) {
+    const raw = String(value || '');
+    if (globalThis.CSS && typeof globalThis.CSS.escape === 'function') return globalThis.CSS.escape(raw);
+    return raw.replace(/([\\"'#.:\[\],>+~*^$|=()])/g, '\\$1');
+  }
+
+  /**
+   * 组件库常把原生 checkbox/radio 设为透明，由 label/span 呈现真实视觉状态。
+   * player.js 由 chrome.scripting 作为普通脚本注入，辅助逻辑必须内联，不能使用 import。
+   */
+  function resolveSemanticVisibilityTarget(element, isVisible, documentRef = document) {
+    if (!element || typeof isVisible !== 'function') return null;
+    if (isVisible(element)) return element;
+
+    const tag = String(element.tagName || '').toLowerCase();
+    const type = String(element.type || '').toLowerCase();
+    if (tag !== 'input' || !['checkbox', 'radio'].includes(type)) return null;
+
+    const candidates = [];
+    if (element.labels) Array.from(element.labels).forEach((label) => pushUnique(candidates, label));
+    if (element.closest) {
+      pushUnique(candidates, element.closest(
+        'label, .ivu-checkbox-wrapper, .ivu-radio-wrapper, .ant-checkbox-wrapper, .ant-radio-wrapper, '
+        + '.el-checkbox, .el-radio, [role="checkbox"], [role="radio"]',
+      ));
+      pushUnique(candidates, element.closest(
+        '.ivu-checkbox, .ivu-radio, .ant-checkbox, .ant-radio, .el-checkbox__input, .el-radio__input',
+      ));
+    }
+    const id = String(element.id || '').trim();
+    if (id && documentRef?.querySelector) {
+      try {
+        pushUnique(candidates, documentRef.querySelector(`label[for="${escapeCssIdentifier(id)}"]`));
+      } catch {
+        // 非法历史 id 不应导致诊断探针自身失败。
+      }
+    }
+    return candidates.find((candidate) => isVisible(candidate)) || null;
+  }
+
+  // 上传按钮常由业务页面的普通按钮触发，再由页面脚本调用 input[type=file].click()。
+  // 回放时保留按钮本身的业务状态切换，但阻止文件控件打开系统选择器；随后 upload_file
+  // 步骤会把中台绑定的测试文件直接写入该控件并触发 input/change。
+  function preventPlaybackFilePicker(event) {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement) || String(target.type || '').toLowerCase() !== 'file') return;
+    event.preventDefault();
+  }
+  document.addEventListener('click', preventPlaybackFilePicker, true);
+
   function normalizeLocale(locale) {
     const raw = String(locale || '').trim().toLowerCase();
-    return raw.startsWith('en') ? 'en' : 'zh';
+    return raw.startsWith('zh') ? 'zh' : 'en';
   }
 
   function tr(zh, en) {
@@ -247,10 +301,79 @@
     }
   }
 
-  function dispatchMouseLike(el, actionType) {
+  function getRecordedPointerPoint(el, locatorMeta) {
+    try {
+      const ctx = parseLocatorMeta(locatorMeta)?.context || {};
+      const pointer = ctx.pointer;
+      if (!pointer || pointer.use_recorded_point !== true) return null;
+      const r = el.getBoundingClientRect();
+      if (!r || r.width <= 0 || r.height <= 0) return null;
+      const xRatio = Number(pointer.x_ratio);
+      const yRatio = Number(pointer.y_ratio);
+      if (!Number.isFinite(xRatio) || !Number.isFinite(yRatio)) return null;
+      if (xRatio < 0 || xRatio > 1 || yRatio < 0 || yRatio > 1) return null;
+      const vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+      const vh = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+      return {
+        x: Math.round(Math.min(Math.max(r.left + r.width * xRatio, 1), Math.max(1, vw - 1))),
+        y: Math.round(Math.min(Math.max(r.top + r.height * yRatio, 1), Math.max(1, vh - 1))),
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function compositeControlRoot(node) {
+    if (!node?.closest) return null;
+    try {
+      return node.closest([
+        '.el-select', '.ivu-select', '.ant-select', '.v-select', '.vs__dropdown-toggle',
+        '.el-cascader', '.ivu-cascader', '.ant-cascader', '.ant-cascader-picker',
+        '.el-autocomplete', '.t-select', '.arco-select', '.n-select', '.MuiSelect-root',
+        '[role="combobox"]',
+      ].join(','));
+    } catch {
+      return null;
+    }
+  }
+
+  function sameCompositeControlSurface(target, hit) {
+    const root = compositeControlRoot(target);
+    if (!root || root !== compositeControlRoot(hit)) return false;
+    try {
+      const independent = hit.closest?.([
+        'button', 'a[href]', 'select', 'textarea',
+        '[role="button"]', '[role="link"]', '[role="option"]', '[role="menuitem"]',
+        '.el-select-dropdown__item', '.el-option', '.ivu-select-item', '.ant-select-item-option',
+        '.el-tag__close', '.el-input__clear', '.el-select__caret.el-icon-circle-close',
+        '.ant-select-clear', '.ivu-select-clear',
+      ].join(','));
+      return !independent || independent === root || !root.contains(independent);
+    } catch {
+      return false;
+    }
+  }
+
+  function dispatchMouseLike(el, actionType, locatorMeta = null) {
     const r = el.getBoundingClientRect();
-    const cx = Math.round(r.left + r.width / 2);
-    const cy = Math.round(r.top + r.height / 2);
+    const recordedPoint = getRecordedPointerPoint(el, locatorMeta);
+    let cx = recordedPoint ? recordedPoint.x : Math.round(r.left + r.width / 2);
+    let cy = recordedPoint ? recordedPoint.y : Math.round(r.top + r.height / 2);
+    // 旧步骤或布局改变时，录制点可能落到遮挡物上。DOM 降级路径改用目标内
+    // 离中心最近的可点击点，避免固定比例坐标误点到其它元素。
+    const hitsTarget = (x, y) => {
+      const hit = document.elementFromPoint(x, y);
+      return !!hit && (hit === el || el.contains(hit) || hit.contains?.(el)
+        || hit.closest?.('label')?.control === el || sameCompositeControlSurface(el, hit));
+    };
+    if (!hitsTarget(cx, cy)) {
+      const points = [[.5, .5], [.35, .5], [.65, .5], [.5, .35], [.5, .65], [.2, .2], [.8, .2], [.2, .8], [.8, .8]];
+      for (const [xRatio, yRatio] of points) {
+        const x = Math.round(r.left + r.width * xRatio);
+        const y = Math.round(r.top + r.height * yRatio);
+        if (hitsTarget(x, y)) { cx = x; cy = y; break; }
+      }
+    }
     const button = actionType === 'right_click' ? 2 : 0;
     const common = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button };
     if (actionType === 'right_click') {
@@ -269,8 +392,40 @@
       el.dispatchEvent(new MouseEvent('dblclick', common));
       return;
     }
+    if (getNativeToggleControl(el)) {
+      el.click();
+      return;
+    }
     el.click();
     el.dispatchEvent(new MouseEvent('click', common));
+  }
+
+  function preferTopmostSemanticClickTarget(el) {
+    if (!el) return el;
+    try {
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return el;
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      if (!hit || hit === el || el.contains(hit)) return el;
+      const ownerSel = 'a[href],button,label,[role="button"],[role="link"],[role="menuitem"],.xcomponent-btn,.next-btn,.ant-btn,.ivu-btn,.el-button';
+      const hitOwner = hit.closest?.(ownerSel);
+      const targetOwner = el.closest?.(ownerSel) || el;
+      if (!hitOwner || !targetOwner) return el;
+      const tagA = String(hitOwner.tagName || '').toLowerCase();
+      const tagB = String(targetOwner.tagName || '').toLowerCase();
+      if (tagA !== tagB) return el;
+      if (tagA === 'a') {
+        const ah = hitOwner.getAttribute?.('href');
+        const bh = targetOwner.getAttribute?.('href');
+        if (ah && bh && ah === bh) return hitOwner;
+      }
+      const text = (node) => String(node?.innerText || node?.textContent || '').replace(/\s+/g, ' ').trim();
+      if (text(hitOwner) && text(hitOwner) === text(targetOwner)) return hitOwner;
+      const labelA = hitOwner.getAttribute?.('aria-label') || hitOwner.getAttribute?.('title');
+      const labelB = targetOwner.getAttribute?.('aria-label') || targetOwner.getAttribute?.('title');
+      if (labelA && labelA === labelB) return hitOwner;
+    } catch (e) { /* ignore */ }
+    return el;
   }
 
   /**
@@ -501,6 +656,71 @@
     return r.width >= 1 || r.height >= 1;
   }
 
+  function probeVisibleTarget(step) {
+    const target = findElement(step.target_selector, step.target_xpath, step.locator_meta);
+    const visibleTarget = resolveSemanticVisibilityTarget(target, isDomVisible, document);
+    return { target, visibleTarget };
+  }
+
+  function describeProbeTarget(target) {
+    return String(target?.getAttribute?.('aria-label') || target?.textContent || target?.tagName || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 180);
+  }
+
+  function probeOverlaySelection(step) {
+    const expected = [step?.value_text, step?.value]
+      .map((value) => String(value || '').replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
+    if (!expected.length) return { observed: null, evidence: 'selection_value_unavailable' };
+    const selectors = [
+      'option:checked',
+      '[role="option"][aria-selected="true"]',
+      '.ivu-select-item-selected',
+      '.el-select-dropdown__item.selected',
+      '.ant-select-item-option-selected',
+      '.arco-select-option-selected',
+      '.n-base-select-option--selected',
+      '.ivu-select-selected-value',
+      '.ant-select-selection-item',
+      '.el-select .el-input__inner',
+      '.arco-select-view-value',
+    ];
+    const nodes = Array.from(document.querySelectorAll(selectors.join(',')));
+    for (const node of nodes) {
+      if (!isDomVisible(node)) continue;
+      const actual = String(node.value || node.textContent || node.getAttribute?.('title') || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (expected.includes(actual)) {
+        return { observed: true, actual: actual.slice(0, 180), evidence: 'selected_value_visible' };
+      }
+    }
+    // Absence is inconclusive: many custom controls close and remove their
+    // selected option without exposing a stable selected-value node.
+    return { observed: null, evidence: 'selection_state_unavailable' };
+  }
+
+  // 断言“可见”采用布局可见语义：不把遮挡或是否处于视口内混入其中。
+  // 这与点击步骤的可交互命中测试保持职责分离。
+  function isElementLayoutVisible(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    let cur = el;
+    while (cur) {
+      const style = window.getComputedStyle(cur);
+      if (
+        style.display === 'none'
+        || style.visibility === 'hidden'
+        || style.visibility === 'collapse'
+        || parseFloat(style.opacity) <= 0.01
+      ) return false;
+      cur = cur.parentElement;
+    }
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
   /**
    * 同一 CSS 命中多个节点时：优先弹窗/confirm 内、可见、堆叠最高（避免点到页面里隐藏的模板按钮或遮罩下的副本）
    */
@@ -572,13 +792,225 @@
     }
   }
 
+  /** DOM 降级回放与 CDP 使用同一集合项语义：未唯一命中时安全失败。 */
+  function findCollectionItemByOrdinal(cfg, semanticPeers = null) {
+    const visible = (node) => {
+      const rect = node.getBoundingClientRect(); const style = getComputedStyle(node);
+      return (rect.width > 0 || rect.height > 0) && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const isNativeToggle = (node) => {
+      if (!node || String(node.tagName || '').toLowerCase() !== 'input') return false;
+      const type = String(node.type || '').toLowerCase();
+      return type === 'radio' || type === 'checkbox';
+    };
+    const norm = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const action = cfg.action || {}, scope = String(action.scope || '');
+    // 保留集合行内的隐藏原生状态控件，交给 _buildFindCode 映射到
+    // 可见 label/组件代理，同时继续以原始 input 做点击后状态校验。
+    const matchesAction = (node) => node && (visible(node) || isNativeToggle(node))
+      && (!action.tag || String(node.tagName || '').toLowerCase() === String(action.tag).toLowerCase())
+      && (!action.text || norm(node.innerText || node.textContent) === norm(action.text));
+    const targetIn = (item) => {
+      if (!item) return null;
+      let target = null;
+      if (action.css) {
+        try {
+          if (scope !== 'descendant' && item.matches(action.css)) target = item;
+          if (!target && scope !== 'self') target = item.querySelector(action.css);
+        } catch { /* Invalid recorded selector: try the recorded action text in this row only. */ }
+      }
+      if (target && matchesAction(target)) return target;
+      if (!action.text) return null;
+      if (scope !== 'descendant' && matchesAction(item)) return item;
+      const matches = scope === 'self' ? [] : [...item.querySelectorAll('a,button,[role="button"],[role="link"],span,div')].filter(matchesAction);
+      return matches.length === 1 ? matches[0] : null;
+    };
+    if (cfg?.collection?.kind && cfg.collection.kind !== 'table') {
+      const rootCfg = cfg.collection.root || {};
+      let roots = [...document.querySelectorAll(rootCfg.selector || '[role="list"],ul,ol,div')];
+      const rootIndex = Number(rootCfg.index);
+      if (Number.isInteger(rootIndex) && rootIndex >= 0) roots = roots[rootIndex] ? [roots[rootIndex]] : [];
+      const items = roots.flatMap((root) => [...root.querySelectorAll(`:scope > ${(cfg.collection.item || {}).selector || '[role="listitem"],li'}`)]).filter(visible);
+      const index = Number(cfg.recorded_item_index);
+      return targetIn(Number.isInteger(index) && index >= 0 ? items[index] : null);
+    }
+    const framework = String(cfg.collection?.root?.framework || cfg.framework || '');
+    const selector = framework === 'el' ? '.el-table' : (framework === 'ant' ? '.ant-table' : (framework === 'ivu' ? '.ivu-table' : 'table,[role="grid"]'));
+    const roots = [...document.querySelectorAll(selector)];
+    const rootIndex = Number(cfg.collection?.root?.wrapper_index ?? cfg.wrapper_index);
+    // An absent recorded wrapper must not redirect an action into another table.
+    const root = Number.isInteger(rootIndex) && rootIndex >= 0 ? roots[rootIndex] : roots.length === 1 ? roots[0] : null;
+    if (!root) return null;
+    const fixedSelector = '.ivu-table-fixed,.ivu-table-fixed-right,.el-table__fixed,.el-table__fixed-right,.ant-table-fixed-left,.ant-table-fixed-right';
+    const rows = [...root.querySelectorAll('tbody > tr,[role="rowgroup"] > [role="row"]')]
+      .filter((row) => visible(row) && (!row.closest || row.closest(selector) === root));
+    const fixedOwner = (row) => row.closest ? row.closest(fixedSelector) : null;
+    const mainRows = rows.filter((row) => !fixedOwner(row));
+    const index = Number(cfg.recorded_row_index);
+    const row = Number.isInteger(index) && index >= 0 ? mainRows[index] : null;
+    if (!row) return null;
+    if (semanticPeers && semanticPeers[0] !== row) return null;
+    const peers = semanticPeers && semanticPeers[0] === row ? semanticPeers : [row];
+    const owners = [...new Set(rows.map(fixedOwner).filter(Boolean))];
+    for (const owner of semanticPeers ? [] : owners) {
+      const copies = rows.filter((candidate) => fixedOwner(candidate) === owner);
+      // A fixed pane must represent the same row sequence, not another nested table.
+      if (copies.length !== mainRows.length) continue;
+      const copy = copies[index];
+      const attrs = ['data-row-key', 'data-key', 'data-id', 'data-row-id', 'data-record-id'];
+      if (attrs.some((attr) => row.getAttribute(attr) && copy.getAttribute(attr) && row.getAttribute(attr) !== copy.getAttribute(attr))) continue;
+      const a = row.getBoundingClientRect(), b = copy.getBoundingClientRect();
+      if (Math.abs(a.top - b.top) > 3 || Math.abs(a.bottom - b.bottom) > 3) continue;
+      peers.push(copy);
+    }
+    const targets = peers.map(targetIn).filter(Boolean);
+    if (!owners.length) return targets[0] || null;
+    // Fixed copies are separate DOM nodes. Select only a node which receives its own hit-test.
+    // Never deliver a synthetic DOM click through a real modal or to a same-label adjacent row.
+    return targets.find((target) => {
+      let hitTarget = target;
+      if (!visible(hitTarget) && isNativeToggle(target)) {
+        const labels = target.labels ? Array.from(target.labels) : [];
+        hitTarget = labels.find((label) => label?.control === target && visible(label)) || null;
+      }
+      if (!hitTarget) return false;
+      let r = hitTarget.getBoundingClientRect();
+      const viewport = document.documentElement;
+      if (viewport && (r.left + r.width / 2 < 0 || r.top + r.height / 2 < 0
+        || r.left + r.width / 2 >= viewport.clientWidth || r.top + r.height / 2 >= viewport.clientHeight)) {
+        hitTarget.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+        r = hitTarget.getBoundingClientRect();
+      }
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      return hit === hitTarget || (hit && hitTarget.contains(hit));
+    }) || null;
+  }
+
+  function findCollectionItem(rawValue) {
+    let cfg = rawValue;
+    try { if (typeof cfg === 'string') cfg = JSON.parse(cfg); } catch { return null; }
+    if (!cfg) return null;
+    if (cfg._collection_locator_mode === 'ordinal') return findCollectionItemByOrdinal(cfg);
+    if (Array.isArray(cfg?.identity?.selected) && cfg.identity.selected.length) cfg.fields = cfg.identity.selected;
+    if (cfg?.collection?.root) {
+      cfg.framework = cfg.collection.root.framework || cfg.framework;
+      cfg.wrapper_index = cfg.collection.root.wrapper_index ?? cfg.wrapper_index;
+    }
+    if (cfg?.collection?.kind && !['table', 'list', 'card', 'menu'].includes(cfg.collection.kind)) return null;
+    if (!Array.isArray(cfg.fields) || !cfg.fields.length) return null;
+    try {
+      if (cfg.collection?.kind && cfg.collection.kind !== 'table') {
+        const rootCfg = cfg.collection.root || {};
+        const allRoots = [...document.querySelectorAll(rootCfg.selector || '[role="list"],ul,ol,div')];
+        const rootIndex = Number(rootCfg.index);
+        const preferredRoot = Number.isInteger(rootIndex) && rootIndex >= 0 ? allRoots[rootIndex] : null;
+        const norm = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+        const visible = (node) => { const rect = node.getBoundingClientRect(); const style = getComputedStyle(node); return (rect.width > 0 || rect.height > 0) && style.display !== 'none' && style.visibility !== 'hidden'; };
+        const itemSelector = (cfg.collection.item || {}).selector || '[role="listitem"],li';
+        const semanticTexts = (item) => [...new Set([
+          norm(item.getAttribute?.('aria-label')),
+          norm(item.innerText || item.textContent),
+          ...[...item.querySelectorAll('h1,h2,h3,h4,h5,h6,[title],strong,b,.title,[class*="title"],[class*="name"]')]
+            .map((node) => norm(node.innerText || node.textContent || node.getAttribute?.('title'))),
+        ].filter(Boolean))];
+        const itemMatches = (item) => {
+          const values = semanticTexts(item);
+          return visible(item) && cfg.fields.every((field) => field.kind === 'item_text' && values.indexOf(norm(field.value)) >= 0);
+        };
+        let matches = preferredRoot ? [...preferredRoot.querySelectorAll(`:scope > ${itemSelector}`)].filter(itemMatches) : [];
+        if (!preferredRoot || matches.length === 0) {
+          const fallbackRoots = allRoots.filter((root) => root !== preferredRoot);
+          matches = [...document.querySelectorAll(itemSelector)].filter((item) => fallbackRoots.includes(item.parentElement) && itemMatches(item));
+        }
+        if (matches.length !== 1) return null;
+        const action = cfg.action || {}; const scope = String(action.scope || ''); let target = null;
+        if (action.css) { try { if (scope !== 'descendant' && matches[0].matches(action.css)) target = matches[0]; if (!target && scope !== 'self') target = matches[0].querySelector(action.css); } catch { /* ignore */ } }
+        if (!target && action.text) { if (scope !== 'descendant' && (!action.tag || matches[0].tagName.toLowerCase() === String(action.tag).toLowerCase()) && norm(matches[0].innerText || matches[0].textContent) === norm(action.text)) target = matches[0]; if (!target && scope !== 'self') target = [...matches[0].querySelectorAll('a,button,[role="button"],[role="link"],span,div')].find((node) => (!action.tag || node.tagName.toLowerCase() === String(action.tag).toLowerCase()) && norm(node.innerText || node.textContent) === norm(action.text)) || null; }
+        return target;
+      }
+      const framework = String(cfg.framework || '');
+      const selector = framework === 'el'
+        ? '.el-table'
+        : (framework === 'ant' ? '.ant-table' : (framework === 'ivu' ? '.ivu-table' : 'table,[role="grid"]'));
+      const all = [...document.querySelectorAll(selector)];
+      const index = Number(cfg.wrapper_index);
+      const roots = Number.isInteger(index) && index >= 0 && all[index] ? [all[index]] : all;
+      const fixedSelector = '.ivu-table-fixed,.ivu-table-fixed-right,.el-table__fixed,.el-table__fixed-right,.ant-table-fixed-left,.ant-table-fixed-right';
+      const norm = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+      const visible = (node) => {
+        const rect = node.getBoundingClientRect();
+        const style = window.getComputedStyle(node);
+        return (rect.width > 0 || rect.height > 0) && style.display !== 'none' && style.visibility !== 'hidden';
+      };
+      const cells = (row) => [...row.querySelectorAll(
+        ':scope > td,:scope > th,:scope > .ant-table-cell,:scope > .el-table__cell,:scope > .ivu-table-cell,:scope > [role="gridcell"]',
+      )];
+      const groups = [];
+      const mappedRows = new Set();
+      const domMatches = [];
+      const keyAttrs = ['data-row-key', 'data-key', 'data-id', 'data-row-id', 'data-record-id'];
+      const fixedOwner = (row) => row.closest?.(fixedSelector) || null;
+      const matchesIdentity = (row) => {
+        const rowCells = cells(row);
+        return cfg.fields.every((field) => {
+          if (field.kind === 'row_attr') return norm(row.getAttribute(field.attr)) === norm(field.value);
+          const colIndex = Number(field.col_index);
+          return Number.isInteger(colIndex)
+            && norm(rowCells[colIndex]?.innerText || rowCells[colIndex]?.textContent) === norm(field.value);
+        });
+      };
+      for (const root of roots) {
+        const rows = [...root.querySelectorAll('tbody > tr,.el-table__body-wrapper tbody > tr,.ant-table-tbody > tr,.ivu-table-tbody > tr,[role="rowgroup"] > [role="row"]')]
+          .filter((row) => visible(row) && row.closest?.(selector) === root);
+        const mainRows = rows.filter((row) => !fixedOwner(row));
+        const rootGroups = mainRows.map((row, rowIndex) => ({ row, root, rowIndex, peers: [row] }));
+        mainRows.forEach((row) => mappedRows.add(row));
+        const owners = [...new Set(rows.map(fixedOwner).filter(Boolean))];
+        for (const owner of owners) {
+          const copies = rows.filter((row) => fixedOwner(row) === owner);
+          for (const [copyIndex, copy] of copies.entries()) {
+            const keyed = rootGroups.filter(({ row }) => keyAttrs.some((attr) => row.getAttribute(attr)
+              && copy.getAttribute(attr) && row.getAttribute(attr) === copy.getAttribute(attr)));
+            const candidate = keyed.length === 1 ? keyed[0]
+              : keyed.length ? null : copies.length === mainRows.length ? rootGroups[copyIndex] : null;
+            if (!candidate) continue;
+            const row = candidate.row;
+            if (keyAttrs.some((attr) => row.getAttribute(attr) && copy.getAttribute(attr)
+              && row.getAttribute(attr) !== copy.getAttribute(attr))) continue;
+            const a = row.getBoundingClientRect(); const b = copy.getBoundingClientRect();
+            if (Math.abs(a.top - b.top) > 3 || Math.abs(a.bottom - b.bottom) > 3) continue;
+            candidate.peers.push(copy);
+            mappedRows.add(copy);
+          }
+        }
+        groups.push(...rootGroups);
+        domMatches.push(...rows.filter(matchesIdentity));
+      }
+      const matches = groups.filter(({ peers }) => peers.some(matchesIdentity));
+      if (matches.length !== 1 || domMatches.some((row) => !mappedRows.has(row))) return null;
+      // Use the matched business row's current index, never the recorded position.
+      const match = matches[0];
+      return findCollectionItemByOrdinal({
+        ...cfg,
+        wrapper_index: all.indexOf(match.root),
+        collection: { ...cfg.collection, root: { ...cfg.collection?.root, wrapper_index: all.indexOf(match.root) } },
+        recorded_row_index: match.rowIndex,
+      }, match.peers);
+    } catch {
+      return null;
+    }
+  }
+
   function resolveAssertionConfig(step, hasLocator = false) {
     const meta = parseLocatorMeta(step?.locator_meta);
     const raw = meta?.assertion && typeof meta.assertion === 'object' ? meta.assertion : {};
     const target = ['page', 'element', 'error', 'url'].includes(String(raw.target || '')) ? String(raw.target) : (hasLocator ? 'element' : 'page');
     const rawMatch = ['contains', 'equals', 'not_contains', 'regex', 'visible'].includes(String(raw.match || '')) ? String(raw.match) : (hasLocator ? 'equals' : 'contains');
     const match = rawMatch === 'visible' && target !== 'element' ? 'contains' : rawMatch;
-    return { target, match };
+    const waitMode = String(raw.wait_mode || '').trim().toLowerCase() === 'immediate'
+      ? 'immediate'
+      : 'eventually';
+    return { target, match, waitMode };
   }
 
   function matchAssertionText(actual, expected, mode = 'contains') {
@@ -606,7 +1038,7 @@
 
   function assertionTargetLabel(target = 'page') {
     if (target === 'element') return tr('指定元素', 'element');
-    if (target === 'error') return tr('错误提示', 'error message');
+    if (target === 'error') return tr('失败提示（错误/警告）', 'failure message (error/warning)');
     if (target === 'url') return 'URL';
     return tr('整页文本', 'page text');
   }
@@ -629,18 +1061,78 @@
     ].join('\n  ');
   }
 
-  async function waitForPageErrorText(timeout = 10000) {
-    const end = Date.now() + timeout;
-    let last = '';
-    while (Date.now() < end) {
-      const sig = detectPageErrorSignal(true);
-      if (sig && sig.hit) {
-        last = sig.snippet || sig.keyword || '';
-        if (last) return last;
+  // 仅供用户显式配置的“失败提示”断言使用。warning 不参与全局页面错误中止判断。
+  const FAILURE_PROMPT_SELECTOR = [
+    '.ivu-message-error', '.ivu-message-warning', '.ivu-notice-error', '.ivu-notice-warning', '.ivu-alert-error', '.ivu-alert-warning',
+    '.el-message--error', '.el-message--warning', '.el-notification--error', '.el-notification--warning', '.el-alert--error', '.el-alert--warning',
+    '.ant-message-error', '.ant-message-warning', '.ant-notification-notice-error', '.ant-notification-notice-warning', '.ant-alert-error', '.ant-alert-warning',
+    '.arco-message-error', '.arco-message-warning', '.arco-notification-notice-error', '.arco-notification-notice-warning', '.arco-alert-error', '.arco-alert-warning',
+    '.t-message--error', '.t-message--warning', '.t-alert--error', '.t-alert--warning',
+    '.alert-danger', '.alert-error', '.alert-warning',
+  ].join(',');
+
+  function collectFailurePromptText() {
+    try {
+      const seen = new Set();
+      const texts = [];
+      for (const el of document.querySelectorAll(FAILURE_PROMPT_SELECTOR)) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) < 0.05) continue;
+        const text = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 800);
+        if (text && !seen.has(text)) {
+          seen.add(text);
+          texts.push(text);
+        }
       }
-      await sleep(300);
+      return texts.join('\n');
+    } catch {
+      return '';
     }
-    return last;
+  }
+
+  async function waitForElementAssertion(step, assertion, expected) {
+    const timeout = 10000;
+    const interval = 250;
+    const eventually = assertion.waitMode !== 'immediate';
+    const observeAbsence = eventually && assertion.match === 'not_contains';
+    const deadline = Date.now() + timeout;
+    let found = false;
+    let lastActual = '';
+    let attempts = 0;
+    while (true) {
+      attempts += 1;
+      const el = findElement(step.target_selector, step.target_xpath, step.locator_meta);
+      if (el) {
+        found = true;
+        lastActual = getElementRawTextForAssert(el);
+        const hit = assertion.match === 'visible'
+          ? isElementLayoutVisible(el)
+          : matchAssertionText(lastActual, expected, assertion.match);
+        if (!observeAbsence && hit) return { hit: true, found, actual: lastActual, attempts };
+        if (observeAbsence && !hit) return { hit: false, found, actual: lastActual, attempts };
+      }
+      if (!eventually || Date.now() >= deadline) {
+        return { hit: observeAbsence, found, actual: lastActual, attempts };
+      }
+      await sleep(interval);
+    }
+  }
+
+  async function waitForTextAssertion(assertion, expected, readActual) {
+    const eventually = assertion.waitMode !== 'immediate';
+    const observeAbsence = eventually && assertion.match === 'not_contains';
+    const deadline = Date.now() + 10000;
+    let actual = '';
+    while (true) {
+      actual = String(readActual() ?? '');
+      const hit = matchAssertionText(actual, expected, assertion.match);
+      if (!observeAbsence && hit) return { hit: true, actual };
+      if (observeAbsence && !hit) return { hit: false, actual };
+      if (!eventually || Date.now() >= deadline) return { hit: observeAbsence, actual };
+      await sleep(250);
+    }
   }
 
   function extractRevealTriggerFromLocatorMeta(metaRaw) {
@@ -675,8 +1167,10 @@
     el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
     await sleep(80);
     if (action === 'click') {
-      el.click();
-      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      // HTMLElement.click() 本身就会派发 click。再补发 MouseEvent 会让 toggle
+      // 类菜单在一次 reveal 中开、关各一次，最终回到关闭状态。
+      if (typeof el.click === 'function') el.click();
+      else el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
       await sleep(220);
       return true;
     }
@@ -692,6 +1186,40 @@
     el.dispatchEvent(new MouseEvent('mouseenter', { ...common, bubbles: false }));
     await sleep(380);
     return true;
+  }
+
+  function revealTriggerReportsExpanded(trigger) {
+    if (!trigger || String(trigger.action || 'hover').toLowerCase() !== 'click') return false;
+    const el = findElement(
+      trigger.target_selector || '',
+      trigger.target_xpath || '',
+      trigger.locator_meta ?? null,
+    );
+    if (!el) return false;
+    const hosts = [el];
+    const clickable = el.closest?.('button,[role="button"],[aria-haspopup],[aria-expanded],summary,a[href]');
+    if (clickable && !hosts.includes(clickable)) hosts.push(clickable);
+    for (let cur = el.parentElement, depth = 0; cur && depth < 3; cur = cur.parentElement, depth += 1) {
+      if (!hosts.includes(cur)) hosts.push(cur);
+    }
+    return hosts.some((host) => {
+      if (String(host.getAttribute?.('aria-expanded') || '').toLowerCase() === 'true') return true;
+      if (String(host.getAttribute?.('data-state') || '').toLowerCase() === 'open') return true;
+      if (String(host.getAttribute?.('data-open') || '').toLowerCase() === 'true') return true;
+      if (host.hasAttribute?.('open')) return true;
+      const className = typeof host.className === 'string' ? host.className : String(host.getAttribute?.('class') || '');
+      if (/(^|[\s_-])(open|opened|expanded)(?=$|[\s_-])/i.test(className)) return true;
+      const controlled = String(host.getAttribute?.('aria-controls') || host.getAttribute?.('aria-owns') || '').trim();
+      return controlled.split(/\s+/).filter(Boolean).some((id) => isElementLayoutVisible(document.getElementById(id)));
+    });
+  }
+
+  function isRevealAlreadySatisfied(step, trigger, looksLikeOverlay) {
+    if (looksLikeOverlay && String(step?.value || '').trim()) {
+      const option = findOverlayOptionByText(step.value);
+      if (option && isElementLayoutVisible(option)) return true;
+    }
+    return revealTriggerReportsExpanded(trigger);
   }
 
   function findByTagAndTextExact(tag, text) {
@@ -847,35 +1375,69 @@
     const title = normLocatorText(cfg.title || '');
     if (!title) return null;
     const actionIndex = Math.max(0, Number(cfg.actionIndex || 0));
-    let nodes = Array.from(document.querySelectorAll('.ant-tree-treenode'));
-    if (!nodes.length) nodes = Array.from(document.querySelectorAll('.ant-tree-node-content-wrapper, [role="treeitem"]'));
+    let nodes = Array.from(document.querySelectorAll(
+      '.ant-tree-treenode, .ec-ant-tree-treenode, [class*="-ant-tree-treenode"], .ant-select-tree-treenode, .ec-ant-select-tree-treenode, [class*="-ant-select-tree-treenode"]',
+    ));
+    if (!nodes.length) nodes = Array.from(document.querySelectorAll(
+      '.ant-tree-node-content-wrapper, .ec-ant-tree-node-content-wrapper, ' +
+      '[class*="-ant-tree-node-content-wrapper"], .ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"], [role="treeitem"]',
+    ));
     const items = collectVisibleTreeItems(
       nodes,
-      (node) => getTreeNodeVisibleTitle(node.querySelector?.('.ant-tree-title') || node),
-      (node) => node.querySelector?.('.ant-tree-node-content-wrapper') || node,
+      (node) => getTreeNodeVisibleTitle(node.querySelector?.('.ant-tree-title, .ec-ant-tree-title, [class*="-ant-tree-title"], .ant-select-tree-title, .ec-ant-select-tree-title, [class*="-ant-select-tree-title"]') || node),
+      (node) => node.querySelector?.('.ant-tree-node-content-wrapper, .ec-ant-tree-node-content-wrapper, [class*="-ant-tree-node-content-wrapper"], .ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"]') || node,
     );
     const node = pickBestTreeItem(items, cfg);
     if (!node) return null;
     let hosts = Array.from(node.querySelectorAll(
-      '.tree-node-actions .data-source-icon, .tree-node-actions [class*="data-source-icon"]',
+      '.tree-node-actions .data-source-icon, .tree-node-actions [class*="data-source-icon"], ' +
+      '.tree-node-actions .action-icon-wrapper, .tree-node-actions [class*="action-icon"], ' +
+      '[aria-haspopup="menu"], button, [role="button"], .teamNode > i',
     ));
-    if (!hosts.length) {
-      hosts = Array.from(node.querySelectorAll(
-        '.tree-node-actions .action-icon-wrapper, .tree-node-actions [class*="action-icon"]',
-      ));
-    }
+    hosts = hosts.filter((host) => !host.closest?.([
+      '.ant-tree-switcher', '.ec-ant-tree-switcher', '[class*="-ant-tree-switcher"]',
+      '.ant-select-tree-switcher', '.ec-ant-select-tree-switcher', '[class*="-ant-select-tree-switcher"]',
+      '.ant-tree-checkbox', '.ec-ant-tree-checkbox', '[class*="-ant-tree-checkbox"]',
+      '.ant-select-tree-checkbox', '.ec-ant-select-tree-checkbox', '[class*="-ant-select-tree-checkbox"]',
+    ].join(',')));
     return hosts[actionIndex] || hosts[0] || null;
   }
 
   function findAntTreeNodeByConfig(cfg) {
-    let nodes = Array.from(document.querySelectorAll('.ant-tree-treenode'));
-    if (!nodes.length) nodes = Array.from(document.querySelectorAll('.ant-tree-node-content-wrapper, [role="treeitem"]'));
+    const variant = String(cfg.variant || '').toLowerCase();
+    let isSelectTree = variant === 'select';
+    let nodeSelector = isSelectTree
+      ? '.ant-select-tree-treenode, .ec-ant-select-tree-treenode, [class*="-ant-select-tree-treenode"]'
+      : '.ant-tree-treenode, .ec-ant-tree-treenode, [class*="-ant-tree-treenode"]';
+    let contentSelector = isSelectTree
+      ? '.ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"]'
+      : '.ant-tree-node-content-wrapper, .ec-ant-tree-node-content-wrapper, [class*="-ant-tree-node-content-wrapper"]';
+    let titleSelector = isSelectTree
+      ? '.ant-select-tree-title, .ec-ant-select-tree-title, [class*="-ant-select-tree-title"]'
+      : '.ant-tree-title, .ec-ant-tree-title, [class*="-ant-tree-title"]';
+    let nodes = Array.from(document.querySelectorAll(nodeSelector));
+    // v1 TreeSelect 的展开/正文步骤曾遗漏 variant；页面未出现普通 Ant Tree
+    // 时可安全推断为 TreeSelect，避免退回脆弱的 CSS/XPath。
+    if (!nodes.length && variant !== 'tree') {
+      const selectNodes = Array.from(document.querySelectorAll(
+        '.ant-select-tree-treenode, .ec-ant-select-tree-treenode, [class*="-ant-select-tree-treenode"]',
+      ));
+      if (selectNodes.length) {
+        isSelectTree = true;
+        nodeSelector = '.ant-select-tree-treenode, .ec-ant-select-tree-treenode, [class*="-ant-select-tree-treenode"]';
+        contentSelector = '.ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"]';
+        titleSelector = '.ant-select-tree-title, .ec-ant-select-tree-title, [class*="-ant-select-tree-title"]';
+        nodes = selectNodes;
+      }
+    }
+    if (!nodes.length) nodes = Array.from(document.querySelectorAll(`${contentSelector}, [role="treeitem"]`));
     const items = collectVisibleTreeItems(
       nodes,
-      (node) => getTreeNodeVisibleTitle(node.querySelector?.('.ant-tree-title') || node),
-      (node) => node.querySelector?.('.ant-tree-node-content-wrapper') || node,
+      (node) => getTreeNodeVisibleTitle(node.querySelector?.(titleSelector) || node),
+      (node) => node.querySelector?.(contentSelector) || node,
     );
-    return pickBestTreeItem(items, cfg);
+    const node = pickBestTreeItem(items, cfg);
+    return node ? { node, isSelectTree } : null;
   }
 
   function findTreeNodeByText(value) {
@@ -915,6 +1477,20 @@
     return pickBestTreeItem(items, cfg);
   }
 
+  function findComponentTreeNodeByConfig(cfg, framework) {
+    const isElement = framework === 'element-tree';
+    const nodeSelector = isElement ? '.el-tree-node' : '.ivu-tree-title';
+    const titleSelector = isElement ? '.el-tree-node__label' : '';
+    const anchorSelector = isElement ? '.el-tree-node__content' : '';
+    const nodes = Array.from(document.querySelectorAll(nodeSelector));
+    const items = collectVisibleTreeItems(
+      nodes,
+      (node) => getTreeNodeVisibleTitle(titleSelector ? (node.querySelector?.(titleSelector) || node) : node),
+      (node) => anchorSelector ? (node.querySelector?.(anchorSelector) || node) : node,
+    );
+    return pickBestTreeItem(items, cfg);
+  }
+
   function findTreeInteraction(value) {
     let cfg = null;
     try { cfg = typeof value === 'string' ? JSON.parse(value) : value; } catch { cfg = null; }
@@ -925,13 +1501,23 @@
       if (kind === 'node_action') {
         return findAntTreeAction(cfg);
       }
-      const node = findAntTreeNodeByConfig(cfg);
-      if (!node) return null;
+      const found = findAntTreeNodeByConfig(cfg);
+      if (!found) return null;
+      const { node, isSelectTree } = found;
       if (kind === 'expand_toggle') {
-        return node.querySelector?.('.ant-tree-switcher') || null;
+        return node.querySelector?.(isSelectTree
+          ? '.ant-select-tree-switcher, .ec-ant-select-tree-switcher, [class*="-ant-select-tree-switcher"]'
+          : '.ant-tree-switcher, .ec-ant-tree-switcher, [class*="-ant-tree-switcher"]') || null;
       }
       if (kind === 'node_content') {
-        return node.querySelector?.('.ant-tree-node-content-wrapper, .ant-tree-title') || node;
+        return node.querySelector?.(isSelectTree
+          ? '.ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"], .ant-select-tree-title, .ec-ant-select-tree-title, [class*="-ant-select-tree-title"]'
+          : '.ant-tree-node-content-wrapper, .ec-ant-tree-node-content-wrapper, [class*="-ant-tree-node-content-wrapper"], .ant-tree-title, .ec-ant-tree-title, [class*="-ant-tree-title"]') || node;
+      }
+      if (kind === 'checkbox') {
+        return node.querySelector?.(isSelectTree
+          ? '.ant-select-tree-checkbox, .ec-ant-select-tree-checkbox, [class*="-ant-select-tree-checkbox"]'
+          : '.ant-tree-checkbox, .ec-ant-tree-checkbox, [class*="-ant-tree-checkbox"]') || null;
       }
     }
     if (framework === 'vtree') {
@@ -943,6 +1529,84 @@
       if (kind === 'node_content') {
         return node.querySelector('.vtree-tree-node__title, .vtree-tree-node__node-body') || node;
       }
+    }
+    if (framework === 'element-tree' || framework === 'iview-tree') {
+      const node = findComponentTreeNodeByConfig(cfg, framework);
+      if (!node) return null;
+      if (framework === 'element-tree') {
+        if (kind === 'expand_toggle') return node.querySelector?.('.el-tree-node__expand-icon') || null;
+        if (kind === 'checkbox') return node.querySelector?.('.el-checkbox') || null;
+        if (kind === 'node_content') return node.querySelector?.('.el-tree-node__content, .el-tree-node__label') || node;
+      }
+      if (framework === 'iview-tree') {
+        const item = node.closest?.('li') || node.parentElement || node;
+        if (kind === 'expand_toggle') return item.querySelector?.('.ivu-tree-arrow') || null;
+        // 点击 View UI 的组件根节点而不是内部 input，避免将组件受控状态误按
+        // input.checked 校验；部分版本中该属性不会随视觉状态同步。
+        if (kind === 'checkbox') return item.querySelector?.('.ivu-checkbox') || null;
+        if (kind === 'node_content') return node;
+      }
+    }
+    return null;
+  }
+
+  function getTreeScrollContainers(cfg) {
+    const framework = String(cfg?.framework || '').toLowerCase();
+    const selector = framework === 'ant-tree'
+      ? '.ant-select-tree-list-holder, .ec-ant-select-tree-list-holder, [class*="-ant-select-tree-list-holder"], .ant-tree-list-holder, .ec-ant-tree-list-holder, [class*="-ant-tree-list-holder"], .rc-virtual-list-holder, .ant-select-tree, .ec-ant-select-tree, [class$="-ant-select-tree"], .ant-tree, .ec-ant-tree, [class$="-ant-tree"]'
+      : framework === 'element-tree'
+        ? '.el-tree .el-scrollbar__wrap, .el-tree'
+        : framework === 'iview-tree'
+          ? '.ivu-tree, .ivu-select-dropdown'
+          : '.vtree-tree, [role="tree"]';
+    const result = [];
+    const add = (node) => {
+      if (!node || result.includes(node)) return;
+      const rect = node.getBoundingClientRect?.();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return;
+      if (node.scrollHeight - node.clientHeight > 2) result.push(node);
+    };
+    document.querySelectorAll(selector).forEach((seed) => {
+      add(seed);
+      let parent = seed.parentElement;
+      for (let i = 0; parent && i < 4; i += 1, parent = parent.parentElement) add(parent);
+      seed.querySelectorAll?.('*').forEach(add);
+    });
+    return result.slice(0, 6);
+  }
+
+  // 与 CDP 主路径保持一致：树节点不在当前虚拟列表渲染窗口时，滚动树容器
+  // 并重新通过 title + parentPath + level 匹配。不会滚动页面，也不会改变树的
+  // 展开状态；展开仍应由录制到的 expand_toggle 步骤完成。
+  async function findTreeInteractionWithScroll(metaRaw, timeout = 6000) {
+    const cfg = getTreeInteractionConfig(metaRaw);
+    if (!cfg) return null;
+    const rawCfg = JSON.stringify(cfg);
+    let target = findTreeInteraction(rawCfg);
+    if (target) return target;
+
+    const deadline = Date.now() + timeout;
+    let attempts = 0;
+    while (Date.now() < deadline && attempts < 14) {
+      const containers = getTreeScrollContainers(cfg);
+      let moved = false;
+      containers.forEach((container) => {
+        const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+        if (maxTop <= 2) return;
+        const before = container.scrollTop;
+        const step = Math.max(48, Math.floor(container.clientHeight * 0.72));
+        let next = before + step;
+        if (next >= maxTop - 1 && before > 0) next = 0;
+        else next = Math.min(maxTop, next);
+        container.scrollTop = next;
+        try { container.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (e) { /* ignore */ }
+        if (container.scrollTop !== before) moved = true;
+      });
+      if (!moved) break;
+      await sleep(140);
+      target = findTreeInteraction(rawCfg);
+      if (target) return target;
+      attempts += 1;
     }
     return null;
   }
@@ -967,6 +1631,7 @@
     const cfg = getTreeInteractionConfig(metaRaw);
     if (!cfg) return null;
     const framework = String(cfg.framework || '').toLowerCase();
+    const variant = String(cfg.variant || '').toLowerCase();
     const kind = String(cfg.kind || '').toLowerCase();
     const title = normLocatorText(cfg.title || '');
     if (!framework || !kind || !title) return null;
@@ -976,12 +1641,22 @@
     let nodes = [];
     let items = [];
     if (framework === 'ant-tree') {
-      nodes = Array.from(document.querySelectorAll('.ant-tree-treenode'));
-      if (!nodes.length) nodes = Array.from(document.querySelectorAll('.ant-tree-node-content-wrapper, [role="treeitem"]'));
+      const isSelectTree = variant === 'select';
+      const nodeSelector = isSelectTree
+        ? '.ant-select-tree-treenode, .ec-ant-select-tree-treenode, [class*="-ant-select-tree-treenode"]'
+        : '.ant-tree-treenode, .ec-ant-tree-treenode, [class*="-ant-tree-treenode"]';
+      const contentSelector = isSelectTree
+        ? '.ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"]'
+        : '.ant-tree-node-content-wrapper, .ec-ant-tree-node-content-wrapper, [class*="-ant-tree-node-content-wrapper"]';
+      const titleSelector = isSelectTree
+        ? '.ant-select-tree-title, .ec-ant-select-tree-title, [class*="-ant-select-tree-title"]'
+        : '.ant-tree-title, .ec-ant-tree-title, [class*="-ant-tree-title"]';
+      nodes = Array.from(document.querySelectorAll(nodeSelector));
+      if (!nodes.length) nodes = Array.from(document.querySelectorAll(`${contentSelector}, [role="treeitem"]`));
       items = collectVisibleTreeItems(
         nodes,
-        (node) => getTreeNodeVisibleTitle(node.querySelector?.('.ant-tree-title') || node),
-        (node) => node.querySelector?.('.ant-tree-node-content-wrapper') || node,
+        (node) => getTreeNodeVisibleTitle(node.querySelector?.(titleSelector) || node),
+        (node) => node.querySelector?.(contentSelector) || node,
       );
     } else if (framework === 'vtree') {
       nodes = Array.from(document.querySelectorAll('.vtree-tree-node__indent-wrapper'));
@@ -990,14 +1665,34 @@
         getVtreeNodeTitle,
         (node) => node.querySelector?.('.vtree-tree-node__title, .vtree-tree-node__node-body') || node,
       );
+    } else if (framework === 'element-tree' || framework === 'iview-tree') {
+      const isElementTree = framework === 'element-tree';
+      const nodeSelector = isElementTree ? '.el-tree-node' : '.ivu-tree-title';
+      const titleSelector = isElementTree ? '.el-tree-node__label' : '';
+      const anchorSelector = isElementTree ? '.el-tree-node__content' : '';
+      nodes = Array.from(document.querySelectorAll(nodeSelector));
+      items = collectVisibleTreeItems(
+        nodes,
+        (node) => getTreeNodeVisibleTitle(titleSelector ? (node.querySelector?.(titleSelector) || node) : node),
+        (node) => anchorSelector ? (node.querySelector?.(anchorSelector) || node) : node,
+      );
     } else {
       return null;
     }
     const targetOf = (node) => {
       if (!node) return null;
       if (framework === 'ant-tree') {
-        if (kind === 'expand_toggle') return node.querySelector?.('.ant-tree-switcher') || null;
-        if (kind === 'node_content') return node.querySelector?.('.ant-tree-node-content-wrapper, .ant-tree-title') || node;
+        const isSelectTree = variant === 'select'
+          || Array.from(node.classList || []).some((name) => /ant-select-tree-treenode$/.test(name));
+        if (kind === 'expand_toggle') return node.querySelector?.(isSelectTree
+          ? '.ant-select-tree-switcher, .ec-ant-select-tree-switcher, [class*="-ant-select-tree-switcher"]'
+          : '.ant-tree-switcher, .ec-ant-tree-switcher, [class*="-ant-tree-switcher"]') || null;
+        if (kind === 'node_content') return node.querySelector?.(isSelectTree
+          ? '.ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"], .ant-select-tree-title, .ec-ant-select-tree-title, [class*="-ant-select-tree-title"]'
+          : '.ant-tree-node-content-wrapper, .ec-ant-tree-node-content-wrapper, [class*="-ant-tree-node-content-wrapper"], .ant-tree-title, .ec-ant-tree-title, [class*="-ant-tree-title"]') || node;
+        if (kind === 'checkbox') return node.querySelector?.(isSelectTree
+          ? '.ant-select-tree-checkbox, .ec-ant-select-tree-checkbox, [class*="-ant-select-tree-checkbox"]'
+          : '.ant-tree-checkbox, .ec-ant-tree-checkbox, [class*="-ant-tree-checkbox"]') || null;
         if (kind === 'node_action') {
           let hosts = Array.from(node.querySelectorAll('.tree-node-actions .data-source-icon, .tree-node-actions [class*="data-source-icon"]'));
           if (!hosts.length) {
@@ -1009,6 +1704,17 @@
       if (framework === 'vtree') {
         if (kind === 'expand_toggle') return node.querySelector?.('.vtree-tree-node__square.vtree-tree-node__expand') || null;
         if (kind === 'node_content') return node.querySelector?.('.vtree-tree-node__title, .vtree-tree-node__node-body') || node;
+      }
+      if (framework === 'element-tree') {
+        if (kind === 'expand_toggle') return node.querySelector?.('.el-tree-node__expand-icon') || null;
+        if (kind === 'checkbox') return node.querySelector?.('.el-checkbox') || null;
+        if (kind === 'node_content') return node.querySelector?.('.el-tree-node__content, .el-tree-node__label') || node;
+      }
+      if (framework === 'iview-tree') {
+        const item = node.closest?.('li') || node.parentElement || node;
+        if (kind === 'expand_toggle') return item.querySelector?.('.ivu-tree-arrow') || null;
+        if (kind === 'checkbox') return item.querySelector?.('.ivu-checkbox') || null;
+        if (kind === 'node_content') return node;
       }
       return null;
     };
@@ -1301,6 +2007,50 @@
     }
   }
 
+  function treeNodeTextMatchesRecordedTarget(el, ctx) {
+    if (!el) return false;
+    const recordedTag = String(ctx?.tag || '').trim().toLowerCase();
+    const controlKind = String(ctx?.control_kind || '').trim().toLowerCase();
+    const childControlTags = new Set(['a', 'button', 'input', 'label', 'select', 'textarea', 'i', 'svg', 'path', 'use']);
+    const childControlKinds = new Set(['button', 'checkbox', 'radio', 'select', 'svg', 'switch', 'menu_trigger', 'node_action']);
+    if (!childControlTags.has(recordedTag) && !childControlKinds.has(controlKind)) return true;
+    return String(el.tagName || '').trim().toLowerCase() === recordedTag;
+  }
+
+  function findTreeChildActionHost(treeNode, ctx) {
+    if (!treeNode?.querySelectorAll) return null;
+    const recordedTag = String(ctx?.tag || '').trim().toLowerCase();
+    if (!['a', 'button', 'i', 'svg', 'path', 'use'].includes(recordedTag)) return null;
+    let hosts = Array.from(treeNode.querySelectorAll(
+      'button, a[href], [role="button"], [aria-haspopup="menu"], [onclick], i',
+    )).filter((host) => {
+      if (host.closest?.([
+        '.ant-tree-switcher', '.ec-ant-tree-switcher', '[class*="-ant-tree-switcher"]',
+        '.ant-tree-checkbox', '.ec-ant-tree-checkbox', '[class*="-ant-tree-checkbox"]',
+      ].join(','))) return false;
+      const rect = host.getBoundingClientRect?.();
+      if (!rect || (rect.width <= 0 && rect.height <= 0)) return false;
+      const style = window.getComputedStyle?.(host);
+      return !style || (style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) !== 0);
+    });
+    if (['svg', 'path', 'use'].includes(recordedTag)) {
+      const svgHosts = hosts.filter((host) => host.querySelector?.('svg'));
+      if (svgHosts.length) hosts = svgHosts;
+    }
+    if (hosts.length === 1) return hosts[0];
+    const recordedRect = ctx?.rect;
+    if (!hosts.length || !recordedRect || !Number.isFinite(Number(recordedRect.left)) || !Number.isFinite(Number(recordedRect.top))) return null;
+    const expectedX = Number(recordedRect.left) + Number(recordedRect.width || 0) / 2;
+    const expectedY = Number(recordedRect.top) + Number(recordedRect.height || 0) / 2;
+    hosts.sort((a, b) => {
+      const ar = a.getBoundingClientRect();
+      const br = b.getBoundingClientRect();
+      return Math.hypot(ar.left + ar.width / 2 - expectedX, ar.top + ar.height / 2 - expectedY)
+        - Math.hypot(br.left + br.width / 2 - expectedX, br.top + br.height / 2 - expectedY);
+    });
+    return hosts[0] || null;
+  }
+
   function findByLocatorMeta(metaRaw) {
     const meta = parseLocatorMeta(metaRaw);
     const ctx = getLocatorContext(metaRaw);
@@ -1345,7 +2095,13 @@
         }
         if (type === 'tree_node_text') {
           const el = findTreeNodeByText(value);
-          if (el) return el;
+          // tree_node_text 只能恢复节点正文。录制目标若是节点内部的图标、按钮
+          // 或输入控件，只允许在该节点内恢复最近的可点击宿主，绝不点击整行。
+          const childHost = el && !treeNodeTextMatchesRecordedTarget(el, ctx)
+            ? findTreeChildActionHost(el, ctx)
+            : null;
+          if (childHost) return childHost;
+          if (el && treeNodeTextMatchesRecordedTarget(el, ctx)) return el;
         }
       } catch (e) { /* ignore */ }
     }
@@ -1355,6 +2111,10 @@
   // 查找元素：非 #id 时优先 XPath；忽略 rc_* 自增 id（勾选后重渲染会变），必要时兜底 Ant Select 搜索框
   function findElement(selector, xpath, locatorMeta) {
     const ctx = getLocatorContext(locatorMeta);
+    const collectionCandidate = parseLocatorMeta(locatorMeta)?.candidates
+      ?.find((candidate) => ['collection_item', 'table_row_semantic'].includes(String(candidate?.type || '')));
+    // 有集合项语义候选时，禁止后续 CSS/XPath 回落到固定序号。
+    if (collectionCandidate) return findCollectionItem(collectionCandidate.value);
     const fromMeta = findByLocatorMeta(locatorMeta);
     if (fromMeta) return fromMeta;
 
@@ -1414,7 +2174,12 @@
     return el;
   }
 
-  const OVERLAY_CONTAINER_SEL = '.ivu-select-dropdown,.el-select-dropdown,.ant-select-dropdown,.v-menu__content,.vs__dropdown-menu,.el-popper';
+  const OVERLAY_CONTAINER_SEL = [
+    '.ivu-select-dropdown', '.el-select-dropdown', '.ant-select-dropdown',
+    '.v-menu__content', '.vs__dropdown-menu', '.el-popper',
+    '.ivu-cascader-menu', '.el-cascader__dropdown',
+    '.ant-cascader-dropdown', '.ant-cascader-menus',
+  ].join(',');
   /** iView Poptip / Modal：确定、取消等按钮不在下拉 li 里，需单独扫描 */
   const POPUP_OVERLAY_SEL = '.ivu-tooltip-popper, .ivu-poptip-popper, .ivu-modal-wrap .ivu-modal';
 
@@ -1495,7 +2260,7 @@
     for (const container of dropdownContainers) {
       const cz = zIndex(container);
       const items = container.querySelectorAll(
-        'li, [role="option"], [role="menuitem"], .ivu-select-item, .el-select-dropdown__item, .el-option, .ant-select-item, .ant-select-item-option-content',
+        'li, [role="option"], [role="menuitem"], .ivu-select-item, .el-select-dropdown__item, .el-option, .ant-select-item, .ant-select-item-option-content, .ivu-cascader-menu-item, .el-cascader-node, .ant-cascader-menu-item',
       );
       for (const item of items) {
         const t2 = item.textContent.trim().replace(/\s+/g, ' ');
@@ -1575,6 +2340,9 @@
       '.el-select-dropdown__item',
       '.el-option',
       '.ivu-select-item',
+      '.ivu-cascader-menu-item',
+      '.el-cascader-node',
+      '.ant-cascader-menu-item',
       '[class*="virtual"]',
       '[class*="row"]',
       '[class*="item"]',
@@ -1618,7 +2386,7 @@
           return needle.length >= 1 && text.includes(needle);
         });
       if (!row) return null;
-      return row.matches?.('button,a,[role="button"],input[type="button"],input[type="submit"],li,[role="option"],[role="menuitem"],.ant-select-item,.el-select-dropdown__item,.el-option,.ivu-select-item')
+      return row.matches?.('button,a,[role="button"],input[type="button"],input[type="submit"],li,[role="option"],[role="menuitem"],.ant-select-item,.el-select-dropdown__item,.el-option,.ivu-select-item,.ivu-cascader-menu-item,.el-cascader-node,.ant-cascader-menu-item')
         ? row
         : row.querySelector?.('button,a,[role="button"],input[type="button"],input[type="submit"]') || row;
     };
@@ -1667,7 +2435,7 @@
   }
 
   /** 与 extension/modules/player-manager.js 中 PAGE_LOADING_UI_CHECK 语义一致 */
-  const LOADING_WAIT_WALL_MS = 180000;
+  const LOADING_WAIT_WALL_MS = 90000;
 
   function isPageLoadingUi() {
     try {
@@ -1676,6 +2444,8 @@
         '.ivu-spin-fix .ivu-spin-main,.ivu-table-wrapper .ivu-spin-main,.ivu-table-with-loading .ivu-spin,'
         + '.ivu-spin.ivu-spin-fix .ivu-spin-main,.ivu-load-loop,.ant-spin-spinning,.ant-spin-nested-loading .ant-spin,'
         + '.el-loading-mask,.el-loading-spinner,.el-icon-loading,.v-loading-parent--relative .v-loading,'
+        + '.next-loading,.next-loading-mask,.next-loading-inline,.next-loading-fusion-reactor,.next-icon-loading,'
+        + '.next-spin,.next-spin-spinning,.next-spin-dot,.next-spin-icon,'
         + '[data-loading="true"]',
       );
       for (let i = 0; i < nodes.length; i++) {
@@ -1747,6 +2517,67 @@
       };
       check();
     });
+  }
+
+  function getActiveOverlayScrollContainers() {
+    const zIndex = (el) => {
+      let z = 0;
+      for (let cur = el; cur && cur !== document.body; cur = cur.parentElement) {
+        const value = Number.parseInt(window.getComputedStyle(cur).zIndex, 10);
+        if (Number.isFinite(value) && value > z) z = value;
+      }
+      return z;
+    };
+    const visible = (el) => {
+      const rect = el?.getBoundingClientRect?.();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+      const style = window.getComputedStyle(el);
+      return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0.02;
+    };
+    const overlays = Array.from(document.querySelectorAll(OVERLAY_CONTAINER_SEL))
+      .filter(visible)
+      .map((el) => ({ el, z: zIndex(el) }))
+      .sort((a, b) => b.z - a.z);
+    if (!overlays.length) return [];
+    const containers = [];
+    const add = (el) => {
+      if (!el || containers.includes(el) || !visible(el)) return;
+      if (el.scrollHeight - el.clientHeight > 2) containers.push(el);
+    };
+    overlays.filter((item) => item.z === overlays[0].z).slice(0, 2).forEach(({ el }) => {
+      add(el);
+      el.querySelectorAll('*').forEach(add);
+    });
+    return containers.slice(0, 5);
+  }
+
+  // 无论录制时是否识别出 virtual class，浮层内按文本首次未命中后都可以
+  // 受控地滚动当前最上层下拉 / 自动完成 / 级联面板再重试。
+  async function findOverlayOptionByScrolling(text, timeout = 3800) {
+    const needle = String(text || '').trim();
+    if (!needle) return null;
+    const deadline = Date.now() + timeout;
+    let attempts = 0;
+    while (Date.now() < deadline && attempts < 18) {
+      const found = findOverlayOptionByText(needle);
+      if (found) return found;
+      let moved = false;
+      getActiveOverlayScrollContainers().forEach((container) => {
+        const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+        const before = container.scrollTop;
+        const step = Math.max(40, Math.floor(container.clientHeight * 0.8));
+        let next = before + step;
+        if (next >= maxTop - 1 && before > 0) next = 0;
+        else next = Math.min(maxTop, next);
+        container.scrollTop = next;
+        try { container.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (e) { /* ignore */ }
+        if (container.scrollTop !== before) moved = true;
+      });
+      if (!moved) break;
+      attempts += 1;
+      await sleep(140);
+    }
+    return null;
   }
 
   // 非浮层场景：仅精确文本匹配（避免 includes 误命中）
@@ -1842,9 +2673,20 @@
    * iView/Ant 等将原生 radio/checkbox 设为 0×0 时，用外层可点击块参与等待滚动与点击。
    * disabled 仍以原生 input 为准（在 waitForElement 里先校验再替换）。
    */
-  function resolveVisibleClickTarget(el) {
+  function resolveVisibleClickTarget(el, locatorMeta = null) {
     if (!el) return el;
     const tagName = (el.tagName || '').toLowerCase();
+    const locatorContext = getLocatorContext(locatorMeta);
+    if (['svg', 'path', 'use'].includes(tagName)) {
+      const treeNode = el.closest?.([
+        '.ant-tree-treenode', '.ec-ant-tree-treenode', '[class*="-ant-tree-treenode"]', '[role="treeitem"]',
+      ].join(','));
+      const host = treeNode && el.closest?.('button, a[href], [role="button"], [aria-haspopup="menu"], [onclick], i');
+      if (host && treeNode.contains(host) && host !== treeNode) {
+        const recovered = findTreeChildActionHost(treeNode, locatorContext);
+        if (recovered === host) return host;
+      }
+    }
     const vtreeExpandToggle = el.closest?.('.vtree-tree-node__square.vtree-tree-node__expand');
     if (vtreeExpandToggle) {
       const tr = vtreeExpandToggle.getBoundingClientRect();
@@ -1866,6 +2708,8 @@
         if (ir.width > 0 || ir.height > 0) return inner;
       }
     }
+    const visibleToggleHost = findVisibleNativeToggleHost(el, locatorMeta);
+    if (visibleToggleHost) return visibleToggleHost;
     let r = el.getBoundingClientRect();
     if (r.width > 0 || r.height > 0) return el;
     if (el.tagName === 'INPUT') {
@@ -1881,6 +2725,95 @@
       }
     }
     return el;
+  }
+
+  function getNativeToggleControl(el) {
+    if (!el) return null;
+    if (el.tagName === 'INPUT') {
+      const type = String(el.type || '').toLowerCase();
+      if (type === 'radio' || type === 'checkbox') return el;
+    }
+    if (el.tagName === 'LABEL' && el.control) return getNativeToggleControl(el.control);
+    if (el.matches?.('.ivu-radio-wrapper, .ant-radio-wrapper, .el-radio, .ivu-checkbox-wrapper, .ant-checkbox-wrapper, .el-checkbox')) {
+      return getNativeToggleControl(el.querySelector?.('input[type="radio"],input[type="checkbox"]'));
+    }
+    return null;
+  }
+
+  function getToggleCheckedState(control) {
+    if (!control) return false;
+    // View UI 的受控 checkbox 以组件 class 为准；其内部 input 在部分版本中
+    // 不会同步 checked 属性，直接读取会把成功的点击判为失败。
+    const iviewCheckbox = control.closest?.('.ivu-checkbox');
+    if (iviewCheckbox) return iviewCheckbox.classList.contains('ivu-checkbox-checked');
+    return Boolean(control.checked);
+  }
+
+  function findVisibleNativeToggleHost(input, locatorMeta = null) {
+    const control = getNativeToggleControl(input);
+    if (!control) return null;
+
+    const usableHost = (host) => {
+      if (!host || host === control || !host.getBoundingClientRect) return false;
+      const rect = host.getBoundingClientRect();
+      if (rect.width <= 2 || rect.height <= 2) return false;
+      const style = window.getComputedStyle(host);
+      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) === 0) return false;
+      const nestedInteractive = Array.from(host.querySelectorAll?.('a[href],button,select,textarea,[role="button"]') || []);
+      return !nestedInteractive.some((node) => {
+        const nodeRect = node.getBoundingClientRect();
+        return node !== control && nodeRect.width > 2 && nodeRect.height > 2;
+      });
+    };
+    const activatesControl = (host) => {
+      if (!host) return false;
+      if (host.tagName === 'LABEL') {
+        return host.control === control
+          || host.contains(control)
+          || Boolean(control.id && host.getAttribute('for') === control.id);
+      }
+      return Boolean(host.contains?.(control));
+    };
+    const activationMeta = parseLocatorMeta(locatorMeta)?.context?.activation_target;
+    if (activationMeta && typeof activationMeta === 'object') {
+      let recordedHost = null;
+      try {
+        if (activationMeta.selector) recordedHost = document.querySelector(String(activationMeta.selector));
+      } catch (e) { /* ignore invalid historical selector */ }
+      if (!recordedHost && activationMeta.xpath) {
+        recordedHost = findXPathMatches(String(activationMeta.xpath))[0] || null;
+      }
+      if (activatesControl(recordedHost) && usableHost(recordedHost)) return recordedHost;
+    }
+    const inputRect = control.getBoundingClientRect();
+    if (inputRect.width > 2 || inputRect.height > 2) return null;
+    const labels = control.labels ? Array.from(control.labels) : [];
+    for (const label of labels) {
+      if (!label || label.control !== control) continue;
+      if (usableHost(label)) return label;
+    }
+    const component = control.closest?.(
+      '.ivu-radio-wrapper, .ant-radio-wrapper, .el-radio, .ivu-checkbox-wrapper, .ant-checkbox-wrapper, .el-checkbox',
+    );
+    if (usableHost(component)) return component;
+    return null;
+  }
+
+  function expectedToggleState(step, control, fallback = null) {
+    const recorded = parseLocatorMeta(step?.locator_meta)?.context?.toggle?.expected_checked;
+    if (typeof recorded === 'boolean') return recorded;
+    if (fallback != null) return Boolean(fallback);
+    if (!control) return null;
+    return String(control.type || '').toLowerCase() === 'radio' ? true : !getToggleCheckedState(control);
+  }
+
+  async function waitForNativeToggleState(control, expectedChecked, timeout = 900) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      if (control?.isConnected && getToggleCheckedState(control) === expectedChecked) return true;
+      await sleep(100);
+    }
+    return false;
   }
 
   function waitForElement(selector, xpath, textFallback = '', timeout = 5000, skipDisabledCheck = false, locatorMeta = null, skipPageErrorCheck = false) {
@@ -1910,7 +2843,7 @@
             resolve(null);
             return;
           }
-          const clickEl = resolveVisibleClickTarget(el);
+          const clickEl = resolveVisibleClickTarget(el, locatorMeta);
           const r = clickEl.getBoundingClientRect();
           if (r.width > 0 || r.height > 0) {
             clickEl.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
@@ -2071,6 +3004,55 @@
     return true;
   }
 
+  // 仅将原生 select 这类可稳定读取的控件升级为强校验；普通输入可能被
+  // 掩码、格式化或异步联动，仍只采集观察证据，避免制造假失败。
+  function collectStepOutcome(step) {
+    const actionType = String(step?.action_type || '').trim().toLowerCase();
+    const base = { mode: 'none', observed: null };
+    if (!['input', 'select', 'click'].includes(actionType)) return { effect: base };
+    const el = findElement(step.target_selector, step.target_xpath, step.locator_meta);
+    if (!el) return { effect: { mode: 'observe', type: 'target_state', observed: null, evidence: 'target_not_available_after_action' } };
+
+    if (actionType === 'click') {
+      const toggle = getNativeToggleControl(el);
+      if (!toggle) return { effect: base };
+      const actualChecked = getToggleCheckedState(toggle);
+      const expectedChecked = expectedToggleState(step, toggle, actualChecked);
+      return {
+        effect: {
+          mode: 'observe',
+          type: 'toggle_checked',
+          observed: actualChecked === expectedChecked,
+          actual: actualChecked ? 'checked' : 'unchecked',
+          expected: expectedChecked ? 'checked' : 'unchecked',
+        },
+      };
+    }
+
+    const target = el.matches?.('input,textarea,select,[contenteditable="true"]')
+      ? el
+      : (el.querySelector?.('input,textarea,select,[contenteditable="true"]') || el);
+    const actual = target?.isContentEditable
+      ? String(target.textContent || '')
+      : String(target?.value ?? '');
+    const nativeSelect = target?.tagName === 'SELECT';
+    const expected = String(actionType === 'select' || nativeSelect ? (step.value_text || step.value || '') : (step.value || ''));
+    const normalizedActual = actual.trim();
+    const normalizedExpected = expected.trim();
+    const observed = nativeSelect
+      ? (String(target.value || '') === String(step.value || '') || normalizedActual === normalizedExpected)
+      : normalizedActual === normalizedExpected;
+    return {
+      effect: {
+        mode: nativeSelect ? 'required' : 'observe',
+        type: actionType === 'select' || nativeSelect ? 'select_value' : 'input_value',
+        observed,
+        expected: expected.slice(0, 240),
+        actual: actual.slice(0, 240),
+      },
+    };
+  }
+
   // 执行单步操作
   async function executeStep(step, nextStep = null) {
     step = resolveStepRuntimeVariables(step);
@@ -2094,23 +3076,26 @@
       case 'click':
       case 'double_click':
       case 'right_click': {
-        const revealTrigger = extractRevealTriggerFromLocatorMeta(step.locator_meta);
-        if (revealTrigger) {
-          try { await activateRevealTrigger(revealTrigger); } catch (e) { /* ignore */ }
-          await sleep(450);
-        }
         // 自动识别浮层选项步骤（兼容旧版录制数据）
         // is_overlay 且 value 为空时勿走「按文案点下拉项」（Poptip 内 textarea 等易被误判为浮层）
         const locatorContext = parseLocatorMeta(step.locator_meta)?.context || {};
         const looksLikeOverlay = (step.is_overlay && String(step.value || '').trim() !== '')
           || (locatorContext.overlay === true && String(step.value || '').trim() !== '')
           || (!step.target_selector && step.value);
+        const revealTrigger = extractRevealTriggerFromLocatorMeta(step.locator_meta);
+        if (revealTrigger && !isRevealAlreadySatisfied(step, revealTrigger, looksLikeOverlay)) {
+          try { await activateRevealTrigger(revealTrigger); } catch (e) { /* ignore */ }
+          await sleep(450);
+        }
 
         let el = null;
         const virtualMeta = parseLocatorMeta(step.locator_meta)?.context?.virtual_scroll;
         const hasVirtualContext = virtualMeta && ['maybe', 'true'].includes(String(virtualMeta.hint || ''));
+        const treeTarget = await findTreeInteractionWithScroll(step.locator_meta, 6000);
+        if (treeTarget) el = treeTarget;
         if (looksLikeOverlay && step.value) {
-          el = await waitForOverlayOption(step.value, 6000);
+          el = el || await waitForOverlayOption(step.value, 2200);
+          if (!el) el = await findOverlayOptionByScrolling(step.value, 3800);
           if (!el) el = findVirtualScrollTarget(step, { overlayOnly: true });
         }
         if (!el && !(looksLikeOverlay && hasVirtualContext)) {
@@ -2128,9 +3113,18 @@
           const virtualTarget = findVirtualScrollTarget(step, { overlayOnly: false });
           if (virtualTarget) el = virtualTarget;
         }
+        const nativeToggle = actionType === 'click' ? getNativeToggleControl(el) : null;
+        const expectedChecked = nativeToggle
+          ? expectedToggleState(step, nativeToggle)
+          : null;
         scrollIntoView(el);
         await sleep(200);
-        dispatchMouseLike(el, actionType);
+        el = preferTopmostSemanticClickTarget(el);
+        dispatchMouseLike(el, actionType, step.locator_meta);
+        if (nativeToggle) {
+          // 保留短暂等待以采集异步组件的最终状态，但不以此阻断后续步骤。
+          await waitForNativeToggleState(nativeToggle, expectedChecked, 250);
+        }
         if (step.is_overlay) await sleep(300);
         break;
       }
@@ -2236,11 +3230,37 @@
       case 'hover': {
         const el = await waitForElement(step.target_selector, step.target_xpath, '', 5000, false, step.locator_meta);
         if (!el) throw new Error(formatElementNotFound(step));
-        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        const pointer = parseLocatorMeta(step.locator_meta)?.context?.pointer;
+        const hasRecordedPoint = pointer?.use_recorded_point === true
+          && Number.isFinite(Number(pointer.x_ratio))
+          && Number.isFinite(Number(pointer.y_ratio));
+        let hoverAnchor = null;
+        if (!hasRecordedPoint && el.querySelector) {
+          try {
+            hoverAnchor = el.querySelector(
+              ':scope > .el-submenu__title, :scope > .ivu-menu-submenu-title, :scope > .ant-menu-submenu-title',
+            );
+            if (hoverAnchor) {
+              const ar = hoverAnchor.getBoundingClientRect();
+              if (ar.width <= 0 || ar.height <= 0) hoverAnchor = null;
+            }
+          } catch (e) { /* ignore unsupported :scope selectors */ }
+        }
+        (hoverAnchor || el).scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
         await sleep(80);
         const r = el.getBoundingClientRect();
-        const cx = Math.round(r.left + r.width / 2);
-        const cy = Math.round(r.top + r.height / 2);
+        let cx = r.left + r.width / 2;
+        let cy = r.top + r.height / 2;
+        if (hasRecordedPoint) {
+          cx = r.left + r.width * Math.min(1, Math.max(0, Number(pointer.x_ratio)));
+          cy = r.top + r.height * Math.min(1, Math.max(0, Number(pointer.y_ratio)));
+        } else if (hoverAnchor) {
+          const ar = hoverAnchor.getBoundingClientRect();
+          cx = ar.left + ar.width / 2;
+          cy = ar.top + ar.height / 2;
+        }
+        cx = Math.round(cx);
+        cy = Math.round(cy);
         const common = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
         try {
           el.dispatchEvent(new PointerEvent('pointerover', { ...common, pointerId: 1, pointerType: 'mouse' }));
@@ -2262,32 +3282,31 @@
         }
 
         if (assertion.target === 'error') {
-          const actual = await waitForPageErrorText(10000);
-          const hit = matchAssertionText(actual, expected, assertion.match);
+          const evaluation = await waitForTextAssertion(assertion, expected, collectFailurePromptText);
           try {
             chrome.runtime.sendMessage({
               type: 'AT_ASSERT_TEXT_DEBUG',
               payload: {
-                mode: `error_${assertion.match}`,
+                mode: `failure_prompt_${assertion.match}_${assertion.waitMode}`,
                 needleLen: expected.length,
                 needlePreview: expected.length > PREVIEW_MAX ? expected.slice(0, PREVIEW_MAX) + '\n…(已截断)' : expected,
-                pageLen: actual.length,
-                pagePreview: actual.length > PREVIEW_MAX ? actual.slice(0, PREVIEW_MAX) + '\n…(已截断)' : actual,
-                hit,
+                pageLen: evaluation.actual.length,
+                pagePreview: evaluation.actual.length > PREVIEW_MAX ? evaluation.actual.slice(0, PREVIEW_MAX) + '\n…(已截断)' : evaluation.actual,
+                hit: evaluation.hit,
                 css: '',
                 xpath: '',
-                note: '错误提示断言：匹配常见 toast/message/dialog 错误区域',
+                note: '失败提示断言：匹配常见 toast/message/notice/alert 的错误或警告区域',
               },
             }).catch(() => {});
           } catch (e) {
             /* ignore */
           }
-          if (!hit) {
+          if (!evaluation.hit) {
             throw new Error(formatAssertionFailure({
               target: assertion.target,
               match: assertion.match,
               expected,
-              actual,
+              actual: evaluation.actual,
               css: '',
               xpath: '',
             }));
@@ -2296,14 +3315,13 @@
         }
 
         if (assertion.target === 'url') {
-          const actual = String(window.location.href || '');
-          const hit = matchAssertionText(actual, expected, assertion.match);
-          if (!hit) {
+          const evaluation = await waitForTextAssertion(assertion, expected, () => window.location.href || '');
+          if (!evaluation.hit) {
             throw new Error(formatAssertionFailure({
               target: assertion.target,
               match: assertion.match,
               expected,
-              actual,
+              actual: evaluation.actual,
               css: '',
               xpath: '',
             }));
@@ -2312,38 +3330,33 @@
         }
 
         if (assertion.target === 'element') {
-          const el = await waitForElement(step.target_selector, step.target_xpath, '', 10000, false, step.locator_meta, true);
-          if (!el) {
+          const evaluation = await waitForElementAssertion(step, assertion, expected);
+          if (!evaluation.found) {
             throw new Error(tr(
               `断言失败：找不到目标元素${formatTreeWaitDiagnostic(step.locator_meta)}\n  CSS: ${step.target_selector || '—'}\n  XPath: ${step.target_xpath || '—'}`,
               `Assertion failed: target element not found\n  CSS: ${step.target_selector || '—'}\n  XPath: ${step.target_xpath || '—'}`,
             ));
           }
-          if (assertion.match === 'visible') {
-            break;
-          }
-          const actual = getElementRawTextForAssert(el);
-          const hit = matchAssertionText(actual, expected, assertion.match);
 
           console.log(
             '[AT assert_text] 元素断言 · 完整日志见扩展 Service Worker。预期',
             expected.length,
             '字 / 实际',
-            actual.length,
-            '字 / 全等',
-            hit,
+            evaluation.actual.length,
+            '字 / 匹配',
+            evaluation.hit,
           );
 
           try {
             chrome.runtime.sendMessage({
               type: 'AT_ASSERT_TEXT_DEBUG',
               payload: {
-                mode: 'element',
+                mode: `element_${assertion.waitMode}`,
                 needleLen: expected.length,
                 needlePreview: expected.length > PREVIEW_MAX ? expected.slice(0, PREVIEW_MAX) + '\n…(已截断)' : expected,
-                pageLen: actual.length,
-                pagePreview: actual.length > PREVIEW_MAX ? actual.slice(0, PREVIEW_MAX) + '\n…(已截断)' : actual,
-                hit,
+                pageLen: evaluation.actual.length,
+                pagePreview: evaluation.actual.length > PREVIEW_MAX ? evaluation.actual.slice(0, PREVIEW_MAX) + '\n…(已截断)' : evaluation.actual,
+                hit: evaluation.hit,
                 css: step.target_selector || '',
                 xpath: step.target_xpath || '',
                 note: '已按 CSS/XPath 定位元素；textarea/input 取 value，其它取 textContent；按断言匹配方式比对',
@@ -2353,12 +3366,12 @@
             /* ignore */
           }
 
-          if (!hit) {
+          if (!evaluation.hit) {
             throw new Error(formatAssertionFailure({
               target: assertion.target,
               match: assertion.match,
               expected,
-              actual,
+              actual: evaluation.actual,
               css: step.target_selector || '',
               xpath: step.target_xpath || '',
             }));
@@ -2367,12 +3380,13 @@
         }
 
         // 未填选择器：兼容旧行为 — 整页 innerText 是否包含预期子串
-        const pageText = document.body.innerText || '';
+        const evaluation = await waitForTextAssertion(assertion, expected, () => document.body?.innerText || '');
+        const pageText = evaluation.actual;
         const needlePreview = expected.length > PREVIEW_MAX ? expected.slice(0, PREVIEW_MAX) + '\n…(已截断)' : expected;
         const pagePreview = pageText.length > PREVIEW_MAX
           ? pageText.slice(0, PREVIEW_MAX) + '\n…(已截断，共 ' + pageText.length + ' 字)'
           : pageText;
-        const finalHit = matchAssertionText(pageText, expected, assertion.match);
+        const finalHit = evaluation.hit;
 
         console.log(
           '[AT assert_text] 整页子串 · 完整日志见扩展 Service Worker。预期',
@@ -2453,6 +3467,61 @@
 
   // 监听来自 background 的消息
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === 'AT_PROBE_STEP_VISIBILITY') {
+      const step = message.step && typeof message.step === 'object' ? message.step : null;
+      if (!step) {
+        sendResponse({ observed: null, evidence: 'invalid_step' });
+        return false;
+      }
+      try {
+        const { target, visibleTarget } = probeVisibleTarget(step);
+        if (visibleTarget) {
+          sendResponse({
+            observed: true,
+            actual: describeProbeTarget(visibleTarget),
+            evidence: visibleTarget === target ? 'target_visible' : 'semantic_target_visible',
+          });
+        } else {
+          sendResponse({ observed: false, evidence: 'target_not_visible' });
+        }
+      } catch (e) {
+        sendResponse({ observed: null, evidence: 'probe_failed' });
+      }
+      return false;
+    }
+    if (message.type === 'AT_PROBE_REVEAL_DEPENDENCY') {
+      const step = message.step && typeof message.step === 'object' ? message.step : null;
+      const timeoutMs = Math.max(500, Math.min(3500, Number(message.timeoutMs) || 2200));
+      (async () => {
+        if (!step) {
+          sendResponse({ observed: null, evidence: 'invalid_step' });
+          return;
+        }
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          const { target, visibleTarget } = probeVisibleTarget(step);
+          if (visibleTarget) {
+            sendResponse({
+              observed: true,
+              actual: describeProbeTarget(visibleTarget),
+              evidence: visibleTarget === target ? 'target_visible' : 'semantic_target_visible',
+            });
+            return;
+          }
+          await sleep(160);
+        }
+        sendResponse({ observed: false, evidence: 'target_not_visible_within_timeout' });
+      })().catch(() => sendResponse({ observed: null, evidence: 'probe_failed' }));
+      return true;
+    }
+    if (message.type === 'AT_PROBE_OVERLAY_SELECTION') {
+      try {
+        sendResponse(probeOverlaySelection(message.step));
+      } catch {
+        sendResponse({ observed: null, evidence: 'probe_failed' });
+      }
+      return false;
+    }
     if (message.type === 'AT_EXECUTE_STEP') {
       currentLocale = normalizeLocale(message.locale);
       pageErrorCheckEnabled = message.pageErrorCheckEnabled === true;
@@ -2471,11 +3540,32 @@
       };
       (async () => {
         try {
-          await executeStep(step, nextStep);
-          done({ ok: true });
+          // executeStep 内部也会解析变量；这里提前解析一份仅用于回传观察证据，
+          // 避免 detail.step_outcomes 中保存的是 {{变量}} 而非本次实际输入值。
+          const resolvedStep = resolveStepRuntimeVariables(step);
+          const resolvedNextStep = resolveStepRuntimeVariables(nextStep);
+          await executeStep(resolvedStep, resolvedNextStep);
+          const stepOutcome = collectStepOutcome(resolvedStep);
+          if (stepOutcome?.effect?.mode === 'required' && stepOutcome.effect.observed === false) {
+            done({
+              ok: false,
+              error: tr(
+                '选择控件未保持录制时的目标值，请检查页面联动、选项状态或录制值。',
+                'The select control did not retain the recorded target value. Check page dependencies, option state, or the recorded value.',
+              ),
+              step_outcome: stepOutcome,
+            });
+            return;
+          }
+          done({ ok: true, step_outcome: stepOutcome });
         } catch (err) {
           const msg = err && err.message != null ? String(err.message) : String(err);
-          done({ ok: false, error: msg, variable_extraction_error: err?.variableExtraction || null });
+          done({
+            ok: false,
+            error: msg,
+            variable_extraction_error: err?.variableExtraction || null,
+            step_outcome: err?.stepOutcome || null,
+          });
         }
       })();
       return true; // 异步响应
@@ -2502,6 +3592,7 @@
 
     if (message.type === 'AT_PLAYER_CLEANUP') {
       document.querySelectorAll('.__at_playing__').forEach(el => el.classList.remove('__at_playing__'));
+      document.removeEventListener('click', preventPlaybackFilePicker, true);
       for (const key of Object.keys(runtimeVariables)) delete runtimeVariables[key];
       window.__AT_PLAYER_ACTIVE__ = false;
       sendResponse({ ok: true });

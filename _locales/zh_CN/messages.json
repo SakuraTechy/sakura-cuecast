@@ -1,0 +1,42 @@
+{
+  "extensionName": {
+    "message": "回演 CueCast – 零代码 Web 自动化测试",
+    "description": "Chrome 和 Chrome 应用商店中展示的扩展名称。"
+  },
+  "extensionDescription": {
+    "message": "在真实网页上零代码录制和回放 Web UI 自动化测试用例。",
+    "description": "扩展短描述。"
+  },
+  "extensionTitle": {
+    "message": "回演 CueCast"
+  },
+  "popupSubtitle": {
+    "message": "Chrome 扩展"
+  },
+  "popupIntro": {
+    "message": "在真实网页上零代码录制和回放测试步骤，由回演 CueCast 提供支持。"
+  },
+  "popupPointManage": {
+    "message": "在回演 CueCast 中台创建和管理测试用例"
+  },
+  "popupPointRun": {
+    "message": "在目标页面录制、回放并查看执行结果"
+  },
+  "popupOpenDashboard": {
+    "message": "打开工作台"
+  },
+  "popupInstanceAddress": { "message": "CueCast 实例地址" },
+  "popupSave": { "message": "保存" },
+  "popupInstanceHint": { "message": "可先填写 IP，部署域名后再修改。" },
+  "popupEnterAddress": { "message": "请输入 CueCast 实例地址" },
+  "popupHttpOnly": { "message": "仅支持 HTTP/HTTPS 地址" },
+  "popupInvalidInstance": { "message": "该地址不是可识别的 CueCast 实例" },
+  "popupConnecting": { "message": "正在连接并验证实例…" },
+  "popupConnected": {
+    "message": "已连接：$ORIGIN$",
+    "placeholders": { "origin": { "content": "$1" } }
+  },
+  "popupDifferentInstance": { "message": "新地址属于另一套 CueCast 实例，确定切换吗？" },
+  "popupTimeout": { "message": "连接超时，请检查地址和网络" },
+  "popupConnectionFailed": { "message": "连接失败" }
+}

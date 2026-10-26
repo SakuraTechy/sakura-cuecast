@@ -52,9 +52,37 @@ export class ApiClient {
     }
   }
 
-  getTestCase(id) { return this.request('GET', `/testcases/${id}?raw_values=1`); }
+  // Used before recording and playback. It is idempotent, so retry one
+  // transient network/timeout failure without risking duplicate mutations.
+  async getTestCase(id) {
+    try {
+      return await this.request('GET', `/testcases/${id}?raw_values=1`, null, { timeoutMs: 30000 });
+    } catch (error) {
+      const message = String(error?.message || '');
+      if (!/请求超时|timeout|network|failed to fetch|fetch failed/i.test(message)) throw error;
+      return this.request('GET', `/testcases/${id}?raw_values=1`, null, { timeoutMs: 30000 });
+    }
+  }
+  getPlan(id) { return this.request('GET', `/plans/${id}`); }
+  savePlanResult(id, result) { return this.request('POST', `/plans/${id}/results`, result, { timeoutMs: 30000 }); }
+  async downloadStepFileAsset(caseId, stepId) {
+    const headers = {};
+    const token = this._getToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`${this.base}/testcases/${caseId}/steps/${stepId}/file-asset/download`, { headers });
+    if (!res.ok) {
+      let message = '下载测试文件失败';
+      try { message = (await res.json())?.message || message; } catch { /* non-JSON response */ }
+      throw new Error(message);
+    }
+    return {
+      name: decodeURIComponent((res.headers.get('content-disposition') || '').split("filename*=UTF-8''")[1] || 'test-file'),
+      mimeType: res.headers.get('content-type') || 'application/octet-stream',
+      buffer: await res.arrayBuffer(),
+    };
+  }
   saveSteps(id, steps) { return this.request('POST', `/testcases/${id}/steps`, { steps }); }
-  createRecordingSession(id, body) { return this.request('POST', `/testcases/${id}/recording-sessions`, body || {}); }
+  createRecordingSession(id, body) { return this.request('POST', `/testcases/${id}/recording-sessions`, body || {}, { timeoutMs: 30000 }); }
   saveRecordingSessionStep(id, sessionId, body) {
     return this.request('POST', `/testcases/${id}/recording-sessions/${encodeURIComponent(sessionId)}/steps`, body || {});
   }

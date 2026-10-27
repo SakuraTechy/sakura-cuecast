@@ -9,12 +9,91 @@ import { ApiClient } from './modules/api-client.js';
 import { CdpBatchSessionManager } from './modules/cdp-batch-session-manager.js';
 import { CurrentProfileBatchSessionManager } from './modules/current-profile-batch-session-manager.js';
 import { BatchVariableContexts } from './modules/batch-variable-context.js';
+import { RunnerWindowRegistry } from './modules/runner-windows.js';
+import { runExecutionPlan } from './modules/plan-runner.js';
+import { executeAgentRecordingCommand } from './modules/agent-recording-browser.js';
+import { ensurePlaybackWindowMaximized } from './modules/playback-window.js';
+import { RunnerRunContext, normalizeRunnerCaseResult } from './modules/runner-run-context.js';
+
+function normalizeExtensionLocale(locale) {
+  return String(locale || '').trim().toLowerCase().startsWith('zh') ? 'zh' : 'en';
+}
+
+const PLATFORM_CONFIG_STORAGE_KEY = 'cc-platform-config-v1';
+let configuredPlatformOrigin = '';
+
+function normalizePlatformOrigin(input) {
+  try {
+    const url = new URL(String(input || ''));
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return '';
+    return url.origin;
+  } catch {
+    return '';
+  }
+}
+
+function isTrustedPlatformUrl(input) {
+  try {
+    const url = new URL(String(input || ''));
+    // 一旦用户显式配置实例，只信任该精确 origin；换址后旧地址立即失效。
+    if (configuredPlatformOrigin) return url.origin === configuredPlatformOrigin;
+    // 支持通过 Hosts 将正式域名映射至本机的 HTTP 调试环境。
+    if (
+      (url.hostname === 'app.icuecast.com' || url.hostname === 'app.icuecast.ai')
+      && (url.protocol === 'https:' || url.protocol === 'http:')
+    ) return true;
+    return url.protocol === 'http:' && (url.hostname === 'localhost' || url.hostname === '127.0.0.1');
+  } catch {
+    return false;
+  }
+}
+
+async function loadPlatformConfig() {
+  const stored = await chrome.storage.local.get(PLATFORM_CONFIG_STORAGE_KEY);
+  const config = stored?.[PLATFORM_CONFIG_STORAGE_KEY] || null;
+  configuredPlatformOrigin = normalizePlatformOrigin(config?.origin);
+  if (configuredPlatformOrigin) {
+    const nextApiBase = `${configuredPlatformOrigin}/api`;
+    if (activeRunnerRun && activeRunnerRun.config.apiBase !== nextApiBase) {
+      await activeRunnerRun.invalidate('CueCast 实例已切换，原执行任务已终止')
+        .catch((error) => console.warn('[CueCast Runner] could not report instance switch:', error?.message || error));
+    }
+    await suspendRunnerConfigForContext(nextApiBase, state.organizationUuid);
+    state.apiBase = nextApiBase;
+  }
+  return config;
+}
+
+function resolvePlatformApiBase(input, senderUrl) {
+  if (!isTrustedPlatformUrl(senderUrl)) return '';
+  try {
+    const senderOrigin = new URL(senderUrl).origin;
+    const apiUrl = new URL(String(input || '/api'), `${senderOrigin}/`);
+    const sender = new URL(senderUrl);
+    // Admin 可能使用 /api、/dev-api 或部署自定义前缀，保留完整 API base 路径。
+    const normalizedPath = apiUrl.pathname.replace(/\/+$/, '') || '/';
+    if (
+      !(
+        apiUrl.origin === senderOrigin
+        || (apiUrl.protocol === sender.protocol && apiUrl.hostname === sender.hostname)
+      )
+      || apiUrl.username
+      || apiUrl.password
+      || apiUrl.search
+      || apiUrl.hash
+    ) return '';
+    return normalizedPath === '/' ? apiUrl.origin : `${apiUrl.origin}${normalizedPath}`;
+  } catch {
+    return '';
+  }
+}
 
 const state = {
   mode: 'idle',       // idle | recording（回放中仅用 activePlayCount 表示，见 AT_GET_STATE）
   testCaseId: null,
-  apiBase: 'http://localhost:3000/api',
+  apiBase: 'https://app.icuecast.com/api',
   authToken: '',
+  organizationUuid: '',
   recordedSteps: [],
   currentTabId: null,
   /** 本次录制是否由扩展新开标签页（停止录制后自动关闭） */
@@ -29,6 +108,7 @@ const state = {
   recordingSaveError: '',
   recordingPaused: false,
   recordingStartedAt: 0,
+  recordingLocale: normalizeExtensionLocale(chrome.i18n.getUILanguage()),
   recordingSessionId: '',
   recordingSessionEnabled: false,
   recordingSessionHealthy: false,
@@ -67,7 +147,605 @@ const player = new PlayerManager(state, api);
 const cdpBatchSessions = new CdpBatchSessionManager(chrome);
 const currentProfileBatchSessions = new CurrentProfileBatchSessionManager(chrome);
 const batchVariables = new BatchVariableContexts();
+let activeRunnerPlayer = null;
+let activeRunnerRun = null;
+const runnerWindows = new RunnerWindowRegistry(chrome.storage.local, chrome.windows);
+const trackRunnerWindow = (runId, windowId, tabId) => runnerWindows.track(runId, windowId, tabId);
+const closeRunnerWindows = (runId) => runnerWindows.close(runId);
+const startupEventWindow = new Promise((resolve) => setTimeout(resolve, 100));
+let startupCleanup = Promise.resolve();
 const RECORDING_KEEPALIVE_ALARM = 'cc-recording-keepalive';
+const RUNNER_POLL_ALARM = 'cc-runner-poll';
+const RUNNER_POLL_PERIOD_MINUTES = 0.5;
+const RUNNER_STORAGE_KEY = 'cc-extension-runner-v1';
+const AGENT_RECORDING_STORAGE_KEY = 'cc-agent-recording-v1';
+let runnerPollInFlight = false;
+let agentRecordingCommandInFlight = false;
+let agentRecordingPollTimer = null;
+let lastRunnerAuthToken = '';
+let runnerRegistrationInFlight = null;
+let runnerRegistrationKey = '';
+
+function armRunnerPolling() {
+  chrome.alarms.create(RUNNER_POLL_ALARM, {
+    delayInMinutes: 0.05,
+    periodInMinutes: RUNNER_POLL_PERIOD_MINUTES,
+  });
+}
+
+async function getRunnerConfig() {
+  const stored = await chrome.storage.local.get(RUNNER_STORAGE_KEY);
+  let config = stored?.[RUNNER_STORAGE_KEY];
+  if (!config?.deviceId) {
+    config = {
+      deviceId: crypto.randomUUID(),
+      apiBase: '',
+      token: '',
+      runnerId: '',
+      platformAuthToken: '',
+      organizationUuid: '',
+    };
+    await chrome.storage.local.set({ [RUNNER_STORAGE_KEY]: config });
+  }
+  return config;
+}
+
+async function suspendRunnerConfigForContext(apiBase, organizationUuid) {
+  const config = await getRunnerConfig();
+  if (!config.apiBase || (config.apiBase === apiBase
+    && (!organizationUuid || config.organizationUuid === organizationUuid))) return;
+  await chrome.storage.local.set({
+    [RUNNER_STORAGE_KEY]: {
+      ...config, apiBase, organizationUuid: organizationUuid || config.organizationUuid,
+      token: '', runnerId: '', platformAuthToken: '',
+    },
+  });
+  lastRunnerAuthToken = '';
+}
+
+async function clearRunnerPlaybackContext() {
+  const config = await getRunnerConfig();
+  if (!config.platformAuthToken) return;
+  await chrome.storage.local.set({
+    [RUNNER_STORAGE_KEY]: { ...config, platformAuthToken: '' },
+  });
+  lastRunnerAuthToken = '';
+}
+
+async function restoreRunnerPlaybackContext() {
+  const config = await getRunnerConfig();
+  if (!config.apiBase || !config.token) throw new Error('Runner is not registered');
+  if (!config.platformAuthToken) {
+    throw new Error('Runner 回放凭证不可用，请打开已登录的 CueCast 页面刷新连接');
+  }
+  state.apiBase = config.apiBase;
+  state.authToken = config.platformAuthToken;
+  return config;
+}
+
+async function runnerFetch(path, options = {}) {
+  const config = options.config || await getRunnerConfig();
+  if (!config.token || !config.apiBase) throw new Error('Runner is not registered');
+  const requestToken = config.token;
+  const response = await fetch(`${config.apiBase.replace(/\/api$/, '')}/api/runner-agent${path}`, {
+    method: options.method || 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CueCast-Runner-Token': requestToken },
+    ...(options.body ? { body: JSON.stringify(options.body) } : {}),
+  });
+  if (response.status === 401 && options.config && options.retryCredential !== false) {
+    // A same-organization page login rotates the Runner token. A request
+    // already in flight can reach the server after the old token is revoked.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    if (config.token && config.token !== requestToken) {
+      return runnerFetch(path, { ...options, retryCredential: false });
+    }
+  }
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || body.code !== 0) throw new Error(body.message || `Runner request failed (${response.status})`);
+  return body.data;
+}
+
+async function completeRunnerTask(taskId, result, config = null) {
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      return await runnerFetch(`/runs/${encodeURIComponent(taskId)}/complete`, {
+        body: result,
+        config,
+      });
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+  throw lastError;
+}
+
+async function getActiveAgentRecording() {
+  const stored = await chrome.storage.local.get(AGENT_RECORDING_STORAGE_KEY);
+  return stored?.[AGENT_RECORDING_STORAGE_KEY] || null;
+}
+
+async function saveActiveAgentRecording(value) {
+  await chrome.storage.local.set({ [AGENT_RECORDING_STORAGE_KEY]: value });
+}
+
+async function clearActiveAgentRecording() {
+  await chrome.storage.local.remove(AGENT_RECORDING_STORAGE_KEY);
+  if (agentRecordingPollTimer) clearInterval(agentRecordingPollTimer);
+  agentRecordingPollTimer = null;
+}
+
+function armAgentRecordingPolling() {
+  if (agentRecordingPollTimer) return;
+  agentRecordingPollTimer = setInterval(() => { void pollAgentRecordingOnce().catch(() => {}); }, 750);
+}
+
+async function reportAgentRecordingComplete(active, outcome) {
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      return await runnerFetch(`/recordings/${encodeURIComponent(active.id)}/complete`, { body: outcome });
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+  throw lastError;
+}
+
+async function finishAgentRecordingCommand(active, command, outcome) {
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      return await runnerFetch(
+        `/recordings/${encodeURIComponent(active.id)}/commands/${encodeURIComponent(command.id)}/complete`,
+        { body: outcome },
+      );
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+  throw lastError;
+}
+
+async function stopAgentRecordingFromControl(active, status = 'cancelled') {
+  const result = status === 'cancelled'
+    ? await recorder.cancel(active.tabId).catch((error) => ({ ok: false, error: error?.message || String(error) }))
+    : { ok: false };
+  await reportAgentRecordingComplete(active, {
+    status,
+    step_count: result?.discardedCount || 0,
+    message: status === 'cancelled' ? '录制已取消' : '录制已终止',
+  }).catch(() => {});
+  await clearActiveAgentRecording();
+}
+
+async function pollAgentRecordingOnce() {
+  let active = await getActiveAgentRecording();
+  if (agentRecordingCommandInFlight) return Boolean(active);
+  agentRecordingCommandInFlight = true;
+  try {
+    await restoreRunnerPlaybackContext();
+    active = await getActiveAgentRecording();
+    if (!active) {
+      if (state.mode === 'recording' || (state.activePlayCount || 0) > 0) return false;
+      const recovered = await recorder.heartbeat(null).catch(() => null);
+      if (recovered?.active === true) return false;
+      const task = await runnerFetch('/recordings/claim');
+      if (!task) return false;
+      const started = await recorder.start(task.test_case_id, task.start_url || '', null, {
+        locale: normalizeExtensionLocale(chrome.i18n.getUILanguage()),
+      });
+      if (!started?.ok) {
+        await reportAgentRecordingComplete(task, {
+          status: 'failed',
+          step_count: 0,
+          message: started?.error || 'Runner 启动录制失败',
+        }).catch(() => {});
+        return true;
+      }
+      active = {
+        id: task.id,
+        testCaseId: task.test_case_id,
+        tabId: started.tabId,
+        lastHeartbeatAt: 0,
+        startConfirmed: false,
+      };
+      await saveActiveAgentRecording(active);
+      armAgentRecordingPolling();
+      try {
+        await runnerFetch(`/recordings/${encodeURIComponent(active.id)}/start`);
+        active.startConfirmed = true;
+        await saveActiveAgentRecording(active);
+      } catch {
+        // active 已持久化，让后续轮询重试幂等的 /start。
+      }
+      return true;
+    }
+
+    armAgentRecordingPolling();
+    if (state.mode !== 'recording') {
+      const recovered = await recorder.heartbeat(active.tabId).catch(() => null);
+      if (!recovered?.active) {
+        await reportAgentRecordingComplete(active, { status: 'failed', step_count: 0, message: '录制页面或本地录制上下文已丢失' }).catch(() => {});
+        await clearActiveAgentRecording();
+        return true;
+      }
+    }
+    active.tabId = state.currentTabId || active.tabId;
+    if (active.startConfirmed !== true) {
+      try {
+        await runnerFetch(`/recordings/${encodeURIComponent(active.id)}/start`);
+        active.startConfirmed = true;
+        await saveActiveAgentRecording(active);
+      } catch {
+        // 启动租约若已失效，heartbeat 会返回 stop 并清理本地录制。
+        const control = await runnerFetch(`/recordings/${encodeURIComponent(active.id)}/heartbeat`).catch(() => null);
+        if (control?.stop) await stopAgentRecordingFromControl(active, 'cancelled');
+        return true;
+      }
+    }
+    const now = Date.now();
+    if (!active.lastHeartbeatAt || now - active.lastHeartbeatAt >= 5000) {
+      const control = await runnerFetch(`/recordings/${encodeURIComponent(active.id)}/heartbeat`);
+      if (control?.stop) {
+        await stopAgentRecordingFromControl(active, 'cancelled');
+        return true;
+      }
+      active.lastHeartbeatAt = now;
+      await saveActiveAgentRecording(active);
+    }
+
+    const command = await runnerFetch(`/recordings/${encodeURIComponent(active.id)}/commands/claim`);
+    if (!command) return true;
+    try {
+      if (command.type === 'finish') {
+        const recordedSteps = Array.isArray(state.recordedSteps) ? state.recordedSteps : [];
+        if (recordedSteps.length === 0) throw new Error('录制中没有可提交的步骤');
+        if (!recordedSteps.some((step) => String(step?.action_type || '').startsWith('assert_'))) {
+          throw new Error('自动录制至少需要一个明确断言，请先调用 add_recording_assertion');
+        }
+        const result = await recorder.stop(active.tabId);
+        if (!result?.ok) throw new Error(result?.error || '提交录制失败');
+        const response = { test_case_id: active.testCaseId, step_count: result.stepCount || 0 };
+        await reportAgentRecordingComplete(active, {
+          status: 'completed', step_count: result.stepCount || 0, message: '录制已提交',
+          command_id: command.id, command_ok: true, command_data: response,
+        });
+        await clearActiveAgentRecording();
+        return true;
+      }
+      if (command.type === 'cancel') {
+        const result = await recorder.cancel(active.tabId);
+        const response = { test_case_id: active.testCaseId, discarded_step_count: result?.discardedCount || 0 };
+        await reportAgentRecordingComplete(active, {
+          status: 'cancelled', step_count: 0, message: '录制已取消',
+          command_id: command.id, command_ok: true, command_data: response,
+        });
+        await clearActiveAgentRecording();
+        return true;
+      }
+      let commandStopRequested = false;
+      const commandHeartbeat = setInterval(() => {
+        void runnerFetch(`/recordings/${encodeURIComponent(active.id)}/heartbeat`)
+          .then((control) => { if (control?.stop) commandStopRequested = true; })
+          .catch(() => {});
+      }, 5000);
+      let data;
+      try {
+        data = await executeAgentRecordingCommand({
+          command,
+          recordingId: active.id,
+          tabId: state.currentTabId || active.tabId,
+          recorder,
+          shouldStop: () => commandStopRequested,
+        });
+      } finally {
+        clearInterval(commandHeartbeat);
+      }
+      active.tabId = state.currentTabId || active.tabId;
+      await saveActiveAgentRecording(active);
+      await finishAgentRecordingCommand(active, command, { ok: true, data });
+    } catch (error) {
+      await finishAgentRecordingCommand(active, command, { ok: false, error: error?.message || String(error) }).catch(() => {});
+    }
+    return true;
+  } finally {
+    agentRecordingCommandInFlight = false;
+  }
+}
+
+async function ensureExtensionRunner() {
+  const authToken = String(state.authToken || '');
+  const apiBase = String(state.apiBase || '').replace(/\/$/, '');
+  const organizationUuid = String(state.organizationUuid || '');
+  if (!authToken) throw new Error('页面登录凭证为空，请重新登录 CueCast 后刷新页面');
+  if (!apiBase) throw new Error('CueCast API 地址为空');
+
+  const config = await getRunnerConfig();
+  if (lastRunnerAuthToken === authToken && config.apiBase === apiBase
+    && config.organizationUuid === organizationUuid && config.token) {
+    armRunnerPolling();
+    return { id: config.runnerId, reused: true };
+  }
+
+  const registrationKey = `${apiBase}\n${organizationUuid}\n${authToken}`;
+  if (runnerRegistrationInFlight) {
+    if (runnerRegistrationKey === registrationKey) return runnerRegistrationInFlight;
+    await runnerRegistrationInFlight.catch(() => {});
+  }
+
+  // Registering is idempotent for one organization/device and rotates the
+  // device credential when a user re-authenticates. Serialize registrations
+  // so concurrent platform pings cannot leave an older rotated token stored.
+  const registration = (async () => {
+    const response = await fetch(`${apiBase}/runner/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+      body: JSON.stringify({
+        device_id: config.deviceId,
+        name: `CueCast Extension ${chrome.runtime.getManifest().version}`,
+        capabilities: {
+          browser: true,
+          replay: true,
+          plan: true,
+          schedule_cancel_recovery: true,
+          recording: true,
+          agent_recording: true,
+          extension_version: chrome.runtime.getManifest().version,
+        },
+      }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || body.code !== 0) throw new Error(body.message || `Runner 注册失败（${apiBase}，HTTP ${response.status}）`);
+    if (!body.data?.token || !body.data?.id) throw new Error('Runner 注册响应缺少凭证');
+    if (state.apiBase !== apiBase || state.organizationUuid !== organizationUuid) {
+      throw new Error('Runner 上下文已切换，忽略旧注册结果');
+    }
+    await chrome.storage.local.set({
+      [RUNNER_STORAGE_KEY]: {
+        ...config,
+        apiBase,
+        token: body.data.token,
+        runnerId: body.data.id,
+        organizationUuid,
+        // PlayerManager still uses the regular CueCast APIs in the first
+        // browser Runner implementation. Persist the page session in the
+        // extension's isolated storage so an MV3 service-worker wake can
+        // fetch the case and save its result after the page is no longer
+        // keeping the worker alive.
+        platformAuthToken: authToken,
+      },
+    });
+    const nextRunnerConfig = { ...config, apiBase, token: body.data.token,
+      runnerId: body.data.id, platformAuthToken: authToken, organizationUuid };
+    if (activeRunnerRun) {
+      await activeRunnerRun.update(nextRunnerConfig)
+        .catch((error) => console.warn('[CueCast Runner] could not report context switch:', error?.message || error));
+    }
+    lastRunnerAuthToken = authToken;
+    armRunnerPolling();
+    return body.data;
+  })();
+  runnerRegistrationInFlight = registration;
+  runnerRegistrationKey = registrationKey;
+  try {
+    return await registration;
+  } finally {
+    if (runnerRegistrationInFlight === registration) {
+      runnerRegistrationInFlight = null;
+      runnerRegistrationKey = '';
+    }
+  }
+}
+
+async function executeRunnerPlan(task, options = {}) {
+  const taskApi = options.api || api;
+  const taskPlayer = options.player || player;
+  let plan;
+  if (task.type === 'batch') {
+    const ids = Array.isArray(task.params?.case_ids) ? task.params.case_ids : [];
+    if (!ids.length) throw new Error('批量执行没有可运行的用例');
+    const cases = await Promise.all(ids.map(async (id) => (await taskApi.getTestCase(id))?.data));
+    plan = {
+      items: cases.map((item) => ({
+        ...item,
+        test_case_id: item?.id,
+        test_case_name: item?.name,
+      })),
+      stop_on_failure: false,
+      login_setup_enabled: false,
+    };
+  } else {
+    const response = await taskApi.getPlan(task.plan_id);
+    plan = response?.data;
+  }
+  if (!plan) throw new Error('执行计划不存在或无法读取');
+  const locale = normalizeExtensionLocale(chrome.i18n.getUILanguage());
+
+  return runExecutionPlan({
+    plan,
+    playCase: (item, options = {}) => taskPlayer.start(item.test_case_id, item.start_url || '', {
+      backgroundTab: true,
+      reuseTabId: options.reuseTabId ?? null,
+      locale,
+      purpose: options.kind === 'login_setup' ? 'runner_plan_login' : 'runner_plan',
+      viewportMode: item.viewport_mode,
+      viewportWidth: item.viewport_width,
+      viewportHeight: item.viewport_height,
+      executionSource: task.source || 'api',
+      runId: task.id,
+      onWindowCreated: (windowId, tabId) => trackRunnerWindow(task.id, windowId, tabId),
+    }),
+    openSharedTab: async (seedCase) => {
+      const preference = await resolveWindowPreference({
+        viewportMode: seedCase?.viewport_mode,
+        viewportWidth: seedCase?.viewport_width,
+        viewportHeight: seedCase?.viewport_height,
+      });
+      const win = await createSharedPlaybackWindow(preference);
+      await trackRunnerWindow(task.id, win?.id, win?.tabs?.[0]?.id);
+      const tabId = win?.tabs?.[0]?.id;
+      if (tabId == null) throw new Error('无法创建执行计划回放窗口');
+      return tabId;
+    },
+    closeSharedTab: (tabId) => chrome.tabs.remove(tabId),
+    checkLogin: ({ tabId, url, selector }) => checkSelectorInTab({
+      tabId,
+      url,
+      selector,
+      timeoutMs: 12000,
+    }),
+    saveResult: async (result) => {
+      if (task.type === 'batch') return null;
+      const saved = await taskApi.savePlanResult(task.plan_id, { ...result, run_id: task.id,
+        trigger_source: task.source || 'api' });
+      return saved?.data || null;
+    },
+    onProgress: (progress) => runnerFetch(`/runs/${encodeURIComponent(task.id)}/progress`, {
+      body: progress, config: options.runnerConfig,
+    }),
+    shouldStop: options.shouldStop,
+  });
+}
+
+async function executeRunnerTask(task, options = {}) {
+  if (task.type === 'plan' || task.type === 'batch') return executeRunnerPlan(task, options);
+  if (task.type !== 'testcase') throw new Error(`Runner 不支持任务类型：${task.type || 'unknown'}`);
+  const result = await (options.player || player).start(task.test_case_id, task.params?.start_url || '', {
+    backgroundTab: true,
+    locale: normalizeExtensionLocale(chrome.i18n.getUILanguage()),
+    purpose: 'runner',
+    executionSource: task.source || 'api',
+    runId: task.id,
+    onWindowCreated: (windowId, tabId) => trackRunnerWindow(task.id, windowId, tabId),
+    startStepIndex: task.params?.start_step_index || 0,
+    onProgress: (progress) => runnerFetch(`/runs/${encodeURIComponent(task.id)}/progress`, { body: progress, config: options.runnerConfig }),
+  });
+  return normalizeRunnerCaseResult(result);
+}
+
+async function pollRunnerOnce() {
+  if (runnerPollInFlight || (state.activePlayCount || 0) > 0) return;
+  runnerPollInFlight = true;
+  let task = null;
+  let taskPlayer = player;
+  let runnerRunContext = null;
+  let runnerConfig = null;
+  let remoteStopRequested = false;
+  try {
+    await startupEventWindow;
+    await startupCleanup;
+    // Restore the playback API context before claiming. A Manifest V3 service
+    // worker loses in-memory state whenever Chrome suspends it.
+    runnerConfig = await restoreRunnerPlaybackContext();
+    if (await pollAgentRecordingOnce()) return;
+    if (state.mode === 'recording') return;
+    task = await runnerFetch('/claim', { config: runnerConfig });
+    if (!task) return;
+    const latestRunnerConfig = await getRunnerConfig();
+    if (latestRunnerConfig.apiBase !== runnerConfig.apiBase
+      || latestRunnerConfig.runnerId !== runnerConfig.runnerId
+      || (latestRunnerConfig.organizationUuid && runnerConfig.organizationUuid
+        && latestRunnerConfig.organizationUuid !== runnerConfig.organizationUuid)) {
+      await completeRunnerTask(task.id, {
+        status: 'failed', message: 'CueCast 实例或组织已切换，原执行任务已终止',
+      }, runnerConfig);
+      return;
+    }
+    Object.assign(runnerConfig, latestRunnerConfig);
+    if (task.status === 'cancel_requested') {
+      await closeRunnerWindows(task.id);
+      await completeRunnerTask(task.id, { status: 'cancelled', message: 'Runner 已确认停止执行' }, runnerConfig);
+      return;
+    }
+    runnerRunContext = new RunnerRunContext(runnerConfig, async (reason) => {
+      void taskPlayer.stop(task.id).catch(() => {});
+      void closeRunnerWindows(task.id).catch(() => {});
+      await completeRunnerTask(task.id, { status: 'failed', message: reason }, runnerRunContext.config);
+    });
+    activeRunnerRun = runnerRunContext;
+    let scheduledSessionToken = '';
+    if (task.source === 'schedule') {
+      const session = await runnerFetch(`/runs/${encodeURIComponent(task.id)}/session`, { config: runnerRunContext.config });
+      scheduledSessionToken = session.token;
+    }
+    const taskApi = new ApiClient(
+      () => runnerRunContext.config.apiBase,
+      () => task.source === 'schedule' ? scheduledSessionToken : runnerRunContext.config.platformAuthToken,
+    );
+    taskPlayer = new PlayerManager(state, taskApi);
+    activeRunnerPlayer = taskPlayer;
+    let heartbeatInFlight = false;
+    const checkRunnerControl = async () => {
+      if (heartbeatInFlight || runnerRunContext.invalidated) return;
+      heartbeatInFlight = true;
+      try {
+        const control = await runnerFetch(`/runs/${encodeURIComponent(task.id)}/heartbeat`, { config: runnerRunContext.config });
+        if (control?.stop) {
+          remoteStopRequested = true;
+          await taskPlayer.stop(task.id).catch(() => {});
+        }
+      } finally { heartbeatInFlight = false; }
+    };
+    await checkRunnerControl();
+    const heartbeat = setInterval(() => { void checkRunnerControl().catch(() => {}); }, 5 * 1000);
+    try {
+      const result = remoteStopRequested || runnerRunContext.invalidated
+        ? { ok: false, resultId: null, message: '执行已取消' }
+        : await executeRunnerTask(task, { shouldStop: () => remoteStopRequested || runnerRunContext.invalidated,
+          api: taskApi, player: taskPlayer, runnerConfig: runnerRunContext.config });
+      if (remoteStopRequested) await closeRunnerWindows(task.id);
+      if (runnerRunContext.beginCompletion()) await completeRunnerTask(task.id, {
+        status: remoteStopRequested ? 'cancelled' : (result?.ok ? 'succeeded' : 'failed'),
+        result_id: result?.resultId || null,
+        message: remoteStopRequested ? '执行已取消' : (result?.message || (result?.ok ? '执行完成' : (result?.error || '执行失败'))),
+        duration_ms: result?.duration || null,
+        ...(result?.summary ? { summary: result.summary } : {}),
+      }, runnerRunContext.config);
+    } finally { clearInterval(heartbeat); }
+  } catch (error) {
+    console.warn('[CueCast Runner] poll failed:', error?.message || error);
+    if (task?.id && task.status !== 'cancel_requested' && !remoteStopRequested
+      && !runnerRunContext?.invalidated) {
+      await completeRunnerTask(task.id, {
+        status: 'failed',
+        result_id: null,
+        message: error?.message || 'Runner 执行异常',
+        duration_ms: null,
+      }, runnerRunContext?.config || runnerConfig).catch((completeError) => {
+        console.warn('[CueCast Runner] failure report failed:', completeError?.message || completeError);
+      });
+    }
+  } finally {
+    if (task && task.status !== 'cancel_requested') await closeRunnerWindows(task.id).catch(() => {});
+    if (taskPlayer !== player) taskPlayer.dispose();
+    activeRunnerPlayer = null;
+    if (activeRunnerRun === runnerRunContext) activeRunnerRun = null;
+    runnerPollInFlight = false;
+    if (task) setTimeout(() => { void pollRunnerOnce(); }, task.status === 'cancel_requested' ? 5000 : 0);
+  }
+}
+
+async function activeCueCastIncognitoWindowIds() {
+  const ids = new Set(await player.getActiveIncognitoWindowIds());
+  if (activeRunnerPlayer) {
+    for (const id of await activeRunnerPlayer.getActiveIncognitoWindowIds()) ids.add(id);
+  }
+  for (const id of await recorder.getActiveIncognitoWindowIds()) ids.add(id);
+  return [...ids].filter((id) => Number.isInteger(id) && id > 0);
+}
+
+async function closeFailedPreparedIncognitoWindow(message, response) {
+  if (
+    response?.ok !== false
+    || message.closeReusedTabAfterStop !== true
+    || !Number.isInteger(Number(message.reuseTabId))
+  ) return;
+  await player.discardPreparedIncognitoWindowForTab(Number(message.reuseTabId));
+}
 
 function finishPlaybackBatch(batchManager, method, message, sourceTabId) {
   const batch = batchManager.batch;
@@ -106,6 +784,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== 'local' || !changes[EXTENSION_SETTINGS_KEY]) return;
   applyExtensionSettings(changes[EXTENSION_SETTINGS_KEY].newValue || DEFAULT_EXTENSION_SETTINGS);
 });
+void player.reconcileIncognitoState();
 const SCREENSHOT_MODE_FULL_HD = 'full_hd';
 const VIEWPORT_MODES = new Set(['maximized', 'current', 'custom']);
 const DEFAULT_VIEWPORT_WIDTH = 1920;
@@ -305,8 +984,21 @@ function buildWindowCreateData(url, focused, preference) {
     if (preference.top != null) data.top = preference.top;
     return data;
   }
-  data.state = 'maximized';
+  data.state = focused ? 'maximized' : 'normal';
   return data;
+}
+
+async function createSharedPlaybackWindow(preference) {
+  const win = await chrome.windows.create(buildWindowCreateData('about:blank', false, preference));
+  if (win?.id != null && preference?.mode === 'maximized') {
+    try {
+      await ensurePlaybackWindowMaximized(win.id);
+    } catch (error) {
+      await chrome.windows.remove(win.id).catch(() => {});
+      throw error;
+    }
+  }
+  return win;
 }
 
 /**
@@ -396,33 +1088,136 @@ async function captureVisibleFullHd(dataUrl) {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const tabId = sender.tab?.id;
 
+  if (String(message?.type || '').startsWith('AT_PLATFORM_') && !isTrustedPlatformUrl(sender.url)) {
+    sendResponse({ ok: false, error: 'untrusted_platform_origin' });
+    return false;
+  }
+
+  const platformApiBase = resolvePlatformApiBase(message?.apiBase, sender.url);
+  if (String(message?.type || '').startsWith('AT_PLATFORM_') && message.apiBase && !platformApiBase) {
+    sendResponse({ ok: false, error: 'invalid_api_base' });
+    return false;
+  }
+
   switch (message.type) {
+    case 'AT_CONFIG_UPDATED':
+      loadPlatformConfig()
+        .then(async (config) => {
+          await injectBridgeIntoOpenTabs();
+          sendResponse({ ok: true, config });
+        })
+        .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+      return true;
+
     case 'AT_PLATFORM_PING':
-      sendResponse({
-        ok: true,
-        version: chrome.runtime.getManifest().version,
-        nonce: message.nonce,
-      });
-      return false;
+      Promise.resolve()
+        .then(async () => {
+          const organizationUuid = String(message.organizationUuid || '');
+          const instanceChanged = activeRunnerRun && platformApiBase
+            && activeRunnerRun.config.apiBase !== platformApiBase;
+          const organizationChanged = activeRunnerRun && organizationUuid
+            && activeRunnerRun.config.organizationUuid
+            && activeRunnerRun.config.organizationUuid !== organizationUuid;
+          if (instanceChanged || organizationChanged) {
+            await activeRunnerRun.invalidate('CueCast 实例或组织已切换，原执行任务已终止')
+              .catch((error) => console.warn('[CueCast Runner] could not report instance switch:', error?.message || error));
+          }
+          await suspendRunnerConfigForContext(platformApiBase || state.apiBase, organizationUuid);
+          state.apiBase = platformApiBase || state.apiBase;
+          state.authToken = String(message.authToken || '');
+          state.organizationUuid = organizationUuid;
+          if (!state.authToken) {
+            await clearRunnerPlaybackContext().catch(() => {});
+            return null;
+          }
+          return ensureExtensionRunner();
+        })
+        .then((runner) => {
+          sendResponse({
+            ok: true,
+            version: chrome.runtime.getManifest().version,
+            nonce: message.nonce,
+            runnerReady: Boolean(runner),
+            runnerId: runner?.id || '',
+          });
+          // Do not wait for the first one-minute alarm when a queued MCP task
+          // may already exist.
+          if (runner) void pollRunnerOnce();
+        })
+        .catch((error) => {
+          const messageText = error?.message || String(error);
+          console.warn('[CueCast Runner] registration failed:', messageText);
+          sendResponse({
+            ok: true,
+            version: chrome.runtime.getManifest().version,
+            nonce: message.nonce,
+            runnerReady: false,
+            runnerError: messageText,
+          });
+        });
+      return true;
+
+    case 'AT_PLATFORM_OPEN_EXTENSION_SETTINGS':
+      chrome.tabs.create({
+        url: `chrome://extensions/?id=${chrome.runtime.id}`,
+        active: true,
+      })
+        .then(() => sendResponse({ ok: true }))
+        .catch((e) => sendResponse({ ok: false, error: e?.message || 'Unable to open extension settings' }));
+      return true;
+
+    case 'AT_PLATFORM_CLOSE_INCOGNITO_WINDOWS':
+      activeCueCastIncognitoWindowIds()
+        .then(async (activeIds) => {
+          if (activeIds.length > 0) {
+            sendResponse({
+              ok: false,
+              code: 'incognito_session_active',
+              error: 'CueCast is currently using an incognito window. Stop the active recording or playback before closing incognito windows.',
+            });
+            return;
+          }
+          const preparedIds = await player.closePreparedIncognitoWindows();
+          const windows = await chrome.windows.getAll({ populate: false });
+          const ids = windows.filter((win) => win?.incognito === true && win.id != null).map((win) => win.id);
+          await Promise.all(ids.map((id) => chrome.windows.remove(id).catch(() => {})));
+          sendResponse({ ok: true, closed: preparedIds.length + ids.length });
+        })
+        .catch((e) => sendResponse({ ok: false, error: e?.message || 'Unable to close incognito windows' }));
+      return true;
 
     // 来自中台或弹窗：开始录制
     case 'AT_PLATFORM_RECORD':
-      state.apiBase = message.apiBase || state.apiBase;
-      state.authToken = message.authToken || state.authToken;
+      state.apiBase = platformApiBase || message.apiBase || state.apiBase;
+      state.authToken = String(message.authToken || state.authToken);
+      void ensureExtensionRunner().catch((error) => console.warn('[CueCast Runner] registration failed:', error?.message || error));
       (async () => {
         const windowPreference = await resolveWindowPreference(message, sender.tab?.windowId);
-        const response = await recorder.start(message.testCaseId, message.startUrl, tabId, {
-          insertAfterStepIndex: message.insertAfterStepIndex,
-          screenshotMode: message.screenshotMode,
-          recordingImport: message.recordingImport,
-          windowPreference,
-          reuseTabId: message.reuseTabId,
-          closeReusedTabAfterStop: message.closeReusedTabAfterStop === true,
-        });
-        if (response?.ok) {
-          armRecordingKeepalive();
+        try {
+          const response = await recorder.start(message.testCaseId, message.startUrl, tabId, {
+            insertAfterStepIndex: message.insertAfterStepIndex,
+            insertAfterStepId: message.insertAfterStepId,
+            screenshotMode: message.screenshotMode,
+            recordingImport: message.recordingImport,
+            windowPreference,
+            reuseTabId: message.reuseTabId,
+            closeReusedTabAfterStop: message.closeReusedTabAfterStop === true,
+            runInIncognito: message.runInIncognito === true,
+            locale: message.locale || normalizeExtensionLocale(chrome.i18n.getUILanguage()),
+          });
+          await closeFailedPreparedIncognitoWindow(message, response);
+          if (response?.ok && message.reuseTabId != null) {
+            await player.claimPreparedIncognitoWindowForTab(Number(message.reuseTabId));
+          }
+          if (response?.ok) {
+            armRecordingKeepalive();
+          }
+          sendResponse(response);
+        } catch (e) {
+          const response = { ok: false, error: e?.message || 'Unable to start recording' };
+          await closeFailedPreparedIncognitoWindow(message, response);
+          sendResponse(response);
         }
-        sendResponse(response);
       })();
       return true;
 
@@ -505,8 +1300,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     // 来自中台或弹窗：开始回放（必须在短时间内 sendResponse，否则 MV3 消息通道会关闭，表现为点击无反应）
     case 'AT_PLATFORM_PLAY': {
-      state.apiBase = message.apiBase || state.apiBase;
-      state.authToken = message.authToken || state.authToken;
+      state.apiBase = platformApiBase || message.apiBase || state.apiBase;
+      state.authToken = String(message.authToken || state.authToken);
+      void ensureExtensionRunner().catch((error) => console.warn('[CueCast Runner] registration failed:', error?.message || error));
       const batchSessionManager = message.browserSessionSource === 'managed-context'
         ? cdpBatchSessions
         : message.browserSessionSource === 'current-profile' && message.sessionMode === 'legacy-profile'
@@ -520,14 +1316,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         executionId: message.executionId,
         projectEnvironmentId: message.projectEnvironmentId,
         dataSource: message.dataSource || message.executionSource,
-        backgroundTab: message.backgroundTab === true,
+         backgroundTab: message.purpose === 'record_context_prepare'
+           ? false
+           : (message.backgroundTab === true || message.backgroundTab == null),
+         runInIncognito: message.runInIncognito === true,
         reuseTabId: message.reuseTabId ?? null,
         startStepIndex: message.startStepIndex,
         stopAfterStepIndex: message.stopAfterStepIndex,
         keepTabOpenAfterPlayback: message.keepTabOpenAfterPlayback === true,
         suppressResultSave: message.suppressResultSave === true,
         purpose: message.purpose,
-        locale: message.locale || 'zh',
+        locale: message.locale || normalizeExtensionLocale(chrome.i18n.getUILanguage()),
         viewportMode: message.viewportMode,
         viewportWidth: message.viewportWidth,
         viewportHeight: message.viewportHeight,
@@ -565,7 +1364,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // 计划批量执行：提前开好一个窗口，返回 tabId 供后续复用
     case 'AT_PLATFORM_OPEN_PLAY_TAB':
       resolveWindowPreference(message, sender.tab?.windowId)
-        .then((preference) => chrome.windows.create(buildWindowCreateData('about:blank', true, preference)))
+        .then((preference) => createSharedPlaybackWindow(preference))
         .then((win) => sendResponse({ ok: true, tabId: win.tabs[0].id }))
         .catch((e) => sendResponse({ ok: false, error: e.message }));
       return true;
@@ -589,23 +1388,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     // 来自弹窗：直接回放（同上，不可等整段回放结束再响应）
     case 'AT_POPUP_PLAY':
-      state.apiBase = message.apiBase || state.apiBase;
+      state.apiBase = platformApiBase || state.apiBase;
       state.authToken = message.authToken || state.authToken;
       void player.start(message.testCaseId, null, {
         adminCaseKey: message.adminCaseKey || message.caseKey,
         dataSource: message.dataSource || message.executionSource,
-        locale: message.locale || 'zh',
+        locale: message.locale || normalizeExtensionLocale(chrome.i18n.getUILanguage()),
+        backgroundTab: message.backgroundTab !== false,
       });
       sendResponse({ ok: true, accepted: true });
       return false;
 
     case 'AT_PLATFORM_FOCUS_PLAY_TAB':
-      player.focusPlayTab(Number(message.testCaseId)).then(sendResponse);
+      player.focusPlayTab(Number(message.testCaseId))
+        .then((result) => result.ok || !activeRunnerPlayer
+          ? result : activeRunnerPlayer.focusPlayTab(Number(message.testCaseId)))
+        .then(sendResponse);
+      return true;
+
+    case 'AT_PLATFORM_FOCUS_RUN':
+      player.focusRun(String(message.runId || ''))
+        .then((result) => result.ok || !activeRunnerPlayer
+          ? result : activeRunnerPlayer.focusRun(String(message.runId || '')))
+        .then(sendResponse);
+      return true;
+
+    case 'AT_PLATFORM_STOP_RUN':
+      Promise.all([player.stop(String(message.runId || '')), activeRunnerPlayer?.stop(String(message.runId || ''))]).then(() => sendResponse({ ok: true }));
       return true;
 
     // 来自中台：停止当前所有回放（含批量顺序执行中的当前用例）
     case 'AT_PLATFORM_STOP_PLAYBACK':
-      player.stop().then(sendResponse);
+      Promise.all([player.stop(), activeRunnerPlayer?.stop()]).then(() => sendResponse({ ok: true }));
       return true;
 
     // 来自录制页：截取当前视口内元素区域缩略图（先于 AT_STEP_CAPTURED）
@@ -654,8 +1468,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // 来自录制工具栏 / 中台：手动停止录制（保存并覆盖服务端步骤）
     case 'AT_STOP_RECORDING':
     case 'AT_PLATFORM_STOP':
-      state.apiBase = message.apiBase || state.apiBase;
-      state.authToken = message.authToken || state.authToken;
+      // AT_STOP_RECORDING 来自被录制页面，sender.url 是业务页地址，不能据此覆盖中台 API。
+      // 例如录制 localhost:5180 时，覆盖后会把未完成的 steps 和 commit 发往 localhost:5180/api。
+      if (message.type === 'AT_PLATFORM_STOP') {
+        state.apiBase = platformApiBase || state.apiBase;
+        state.authToken = String(message.authToken || '');
+      }
       recorder.stop(tabId).then((response) => {
         clearRecordingKeepalive();
         sendResponse(response);
@@ -665,8 +1483,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // 来自录制工具栏 / 中台：取消录制（不保存，服务端步骤不变）
     case 'AT_CANCEL_RECORDING':
     case 'AT_PLATFORM_CANCEL_RECORD':
-      state.apiBase = message.apiBase || state.apiBase;
-      state.authToken = message.authToken || state.authToken;
+      if (message.type === 'AT_PLATFORM_CANCEL_RECORD') {
+        state.apiBase = platformApiBase || state.apiBase;
+        state.authToken = String(message.authToken || '');
+      }
       recorder.cancel(tabId).then((response) => {
         clearRecordingKeepalive();
         sendResponse(response);
@@ -675,8 +1495,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     // 来自中台：步骤数超额后，仅保留套餐允许的前 N 步并保存
     case 'AT_PLATFORM_SAVE_RECORDING_TRIMMED':
-      state.apiBase = message.apiBase || state.apiBase;
-      state.authToken = message.authToken || state.authToken;
+      state.apiBase = platformApiBase || state.apiBase;
+      state.authToken = String(message.authToken || '');
       recorder.savePendingQuotaSteps(message.pendingSaveId, message.limit).then((response) => {
         sendResponse(response);
       });
@@ -684,6 +1504,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     // 来自中台：步骤数超额后，放弃保存本次录制
     case 'AT_PLATFORM_DISCARD_RECORDING_SAVE':
+      state.apiBase = platformApiBase || state.apiBase;
+      state.authToken = String(message.authToken || '');
       recorder.discardPendingQuotaSteps(message.pendingSaveId).then((response) => {
         sendResponse(response);
       });
@@ -692,28 +1514,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // 来自弹窗：查询状态
     case 'AT_GET_STATE':
       sendResponse({
-        ...state,
         mode:
           state.mode === 'recording'
             ? 'recording'
             : (state.activePlayCount || 0) > 0
               ? 'playing'
               : 'idle',
+        testCaseId: state.testCaseId,
         recordedSteps: state.recordedSteps.length,
+        recordingPaused: state.recordingPaused === true,
+        activePlayCount: Number(state.activePlayCount || 0),
       });
       return false;
 
     // 来自弹窗：停止所有操作（录制中 = 停止并保存）
     case 'AT_STOP_ALL':
       if (state.mode === 'recording') recorder.stop().then(sendResponse);
-      else if ((state.activePlayCount || 0) > 0) player.stop().then(sendResponse);
+      else if ((state.activePlayCount || 0) > 0) Promise.all([player.stop(), activeRunnerPlayer?.stop()]).then(() => sendResponse({ ok: true }));
       else sendResponse({ ok: true });
       return true;
 
     // 来自回放页 content/player：普通 assert_text 比对详情（在 Service Worker 打印，避免只看错控制台）
     case 'AT_ASSERT_TEXT_DEBUG': {
       const p = message.payload || {};
-      const title = p.mode === 'element'
+      const title = String(p.mode || '').startsWith('element')
         ? '普通断言（按选择器 · 元素内容与输入值全等）'
         : '普通断言（未选元素 · 整页子串包含）';
       console.log('[AT assert_text] ========== ' + title + ' ==========');
@@ -725,7 +1549,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       console.log('[AT assert_text] 预期内容:\n' + (p.needlePreview != null ? p.needlePreview : ''));
       console.log('[AT assert_text] 实际长度:', p.pageLen);
       console.log('[AT assert_text] 实际内容:\n' + (p.pagePreview != null ? p.pagePreview : ''));
-      console.log('[AT assert_text] 比对结果:', p.mode === 'element' ? '全等 ===' : '整页 includes', '=', p.hit);
+      console.log('[AT assert_text] 比对结果:', String(p.mode || '').startsWith('element') ? '元素匹配' : '整页匹配', '=', p.hit);
       console.log('[AT assert_text] ==========================================');
       sendResponse({ ok: true });
       return false;
@@ -738,7 +1562,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // =========================================================
 const BRIDGE_SCRIPT = 'content/bridge.js';
 
-function isInjectablePlatformUrl(url) {
+function isInjectableHttpUrl(url) {
   return typeof url === 'string' && (url.startsWith('http://') || url.startsWith('https://'));
 }
 
@@ -772,7 +1596,7 @@ async function injectBridgeIntoTab(tabId, { force = false } = {}) {
   if (!tabId) return false;
   try {
     const tab = await chrome.tabs.get(tabId);
-    if (!isInjectablePlatformUrl(tab.url)) return false;
+    if (!isTrustedPlatformUrl(tab.url)) return false;
     if (!force) {
       if (await isBridgeInstalledInTab(tabId)) return true;
     } else {
@@ -791,7 +1615,7 @@ async function injectBridgeIntoTab(tabId, { force = false } = {}) {
 async function injectBridgeIntoOpenTabs({ force = false } = {}) {
   let tabs = [];
   try {
-    tabs = await chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] });
+    tabs = await chrome.tabs.query({});
   } catch {
     return;
   }
@@ -819,8 +1643,8 @@ chrome.tabs.onCreated.addListener((tab) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status === 'complete' && isInjectablePlatformUrl(tab?.url)) {
-    scheduleInjectActiveTab(tabId);
+  if (changeInfo.status === 'complete' && isInjectableHttpUrl(tab?.url)) {
+    if (isTrustedPlatformUrl(tab?.url)) scheduleInjectActiveTab(tabId);
     void recorder.handleRecordingTabLoadComplete(tabId, tab?.url);
   }
 });
@@ -835,11 +1659,28 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
 chrome.runtime.onInstalled.addListener(() => {
   // 扩展升级后页面中的旧 bridge 已失效，首次回填必须清除旧版本留下的安装标记。
   void injectBridgeIntoOpenTabs({ force: true });
-  setTimeout(() => injectBridgeIntoOpenTabs(), 400);
-  setTimeout(() => injectBridgeIntoOpenTabs(), 1200);
+  void player.reconcileIncognitoState();
+  void loadPlatformConfig().then(() => injectBridgeIntoOpenTabs());
+  setTimeout(() => loadPlatformConfig().then(() => injectBridgeIntoOpenTabs()), 400);
+  setTimeout(() => loadPlatformConfig().then(() => injectBridgeIntoOpenTabs()), 1200);
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  startupCleanup = runnerWindows.clearAll();
+  void player.reconcileIncognitoState();
+  void loadPlatformConfig().then(() => injectBridgeIntoOpenTabs());
+  armRunnerPolling();
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name.startsWith('cc-prepared-incognito-window:')) {
+    void player.handlePreparedIncognitoAlarm(alarm.name.slice('cc-prepared-incognito-window:'.length));
+    return;
+  }
+  if (alarm.name === RUNNER_POLL_ALARM) {
+    void pollRunnerOnce();
+    return;
+  }
   if (alarm.name !== RECORDING_KEEPALIVE_ALARM) return;
   void recorder.keepAliveTick().then((result) => {
     if (!result?.ok || result?.active !== true) {
@@ -847,6 +1688,21 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     }
   }).catch(() => {});
 });
+
+// This module is evaluated on extension reload and on every service-worker
+// wake. Re-arm polling from persisted registration state and make one claim
+// immediately so queued MCP work does not have to wait for a page ping.
+void getRunnerConfig()
+  .then((config) => {
+    if (!config.apiBase || !config.token) return;
+    armRunnerPolling();
+    if (config.platformAuthToken) void pollRunnerOnce();
+  })
+  .catch((error) => console.warn('[CueCast Runner] bootstrap failed:', error?.message || error));
+
+void loadPlatformConfig()
+  .then(() => injectBridgeIntoOpenTabs())
+  .catch((error) => console.warn('[CueCast] platform config load failed:', error?.message || error));
 
 // =========================================================
 // 标签页关闭时清理状态
@@ -859,4 +1715,5 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
   void recorder.handleRecordingTabClosed(tabId).catch(() => {});
   void player.handlePlayTabClosed(tabId).catch(() => {});
+  if (activeRunnerPlayer) void activeRunnerPlayer.handlePlayTabClosed(tabId).catch(() => {});
 });

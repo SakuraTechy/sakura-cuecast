@@ -13,7 +13,16 @@
   let isRecording = false;
   let isPaused = false;
   let screenshotMode = 'standard';
+  let currentLocale = String(chrome.i18n?.getUILanguage?.() || '').toLowerCase().startsWith('zh') ? 'zh' : 'en';
   let highlightEl = null;
+
+  function normalizeLocale(locale) {
+    return String(locale || '').trim().toLowerCase().startsWith('zh') ? 'zh' : 'en';
+  }
+
+  function tr(zh, en) {
+    return currentLocale === 'en' ? (en || zh) : zh;
+  }
 
   // =========================================================
   // 元素选择器生成算法
@@ -259,36 +268,68 @@
 
   function getAntTreeActionInfo(el) {
     if (!el || !el.closest) return null;
-    const actionHost = el.closest('.data-source-icon, [class*="data-source-icon"]')
-      || el.closest('.action-icon-wrapper, [class*="action-icon"]');
-    if (!actionHost) return null;
-    const treeNode = actionHost.closest('.ant-tree-node-content-wrapper, .ant-tree-treenode, [role="treeitem"]');
+    const treeNode = el.closest([
+      '.ant-tree-treenode',
+      '.ec-ant-tree-treenode',
+      '[class*="-ant-tree-treenode"]',
+      '.ant-select-tree-treenode',
+      '.ec-ant-select-tree-treenode',
+      '[class*="-ant-select-tree-treenode"]',
+      '[role="treeitem"]',
+    ].join(',')) || el.closest([
+      '.ant-tree-node-content-wrapper',
+      '.ec-ant-tree-node-content-wrapper',
+      '[class*="-ant-tree-node-content-wrapper"]',
+      '.ant-select-tree-node-content-wrapper',
+      '.ec-ant-select-tree-node-content-wrapper',
+      '[class*="-ant-select-tree-node-content-wrapper"]',
+    ].join(','));
     if (!treeNode) return null;
-    const titleEl = treeNode.querySelector('.ant-tree-title') || treeNode;
+    let actionHost = el.closest('.data-source-icon, [class*="data-source-icon"]')
+      || el.closest('.action-icon-wrapper, [class*="action-icon"]')
+      || el.closest('button, [role="button"], [aria-haspopup="menu"], .teamNode > i');
+    if (actionHost && !treeNode.contains(actionHost)) actionHost = null;
+    if (actionHost?.closest?.([
+      '.ant-tree-switcher', '.ec-ant-tree-switcher', '[class*="-ant-tree-switcher"]',
+      '.ant-select-tree-switcher', '.ec-ant-select-tree-switcher', '[class*="-ant-select-tree-switcher"]',
+      '.ant-tree-checkbox', '.ec-ant-tree-checkbox', '[class*="-ant-tree-checkbox"]',
+      '.ant-select-tree-checkbox', '.ec-ant-select-tree-checkbox', '[class*="-ant-select-tree-checkbox"]',
+    ].join(','))) actionHost = null;
+    if (!actionHost) return null;
+    const titleEl = treeNode.querySelector('.ant-tree-title, .ec-ant-tree-title, [class*="-ant-tree-title"], .ant-select-tree-title, .ec-ant-select-tree-title, [class*="-ant-select-tree-title"]') || treeNode;
     const title = getTreeNodeVisibleTitle(titleEl);
     let hosts = Array.from(treeNode.querySelectorAll(
-      '.tree-node-actions .data-source-icon, .tree-node-actions [class*="data-source-icon"]',
+      '.tree-node-actions .data-source-icon, .tree-node-actions [class*="data-source-icon"], ' +
+      '.tree-node-actions .action-icon-wrapper, .tree-node-actions [class*="action-icon"], ' +
+      '[aria-haspopup="menu"], button, [role="button"], .teamNode > i',
     ));
-    if (!hosts.length) {
-      hosts = Array.from(treeNode.querySelectorAll(
-        '.tree-node-actions .action-icon-wrapper, .tree-node-actions [class*="action-icon"]',
-      ));
-    }
+    hosts = hosts.filter((node) => !node.closest?.([
+      '.ant-tree-switcher', '.ec-ant-tree-switcher', '[class*="-ant-tree-switcher"]',
+      '.ant-select-tree-switcher', '.ec-ant-select-tree-switcher', '[class*="-ant-select-tree-switcher"]',
+      '.ant-tree-checkbox', '.ec-ant-tree-checkbox', '[class*="-ant-tree-checkbox"]',
+      '.ant-select-tree-checkbox', '.ec-ant-select-tree-checkbox', '[class*="-ant-select-tree-checkbox"]',
+    ].join(',')));
+    if (!hosts.includes(actionHost)) hosts.push(actionHost);
     hosts = hosts.filter((node) => {
       const r = node.getBoundingClientRect();
       return r.width > 0 || r.height > 0 || node.contains(actionHost);
     });
     const actionIndex = Math.max(0, hosts.indexOf(actionHost));
-    const treeRoot = treeNode.closest('.ant-tree') || document;
-    let antNodes = Array.from(treeRoot.querySelectorAll('.ant-tree-treenode'));
+    const treeRoot = treeNode.closest('.ant-tree, .ec-ant-tree, [class$="-ant-tree"], .ant-select-tree, .ec-ant-select-tree, [class$="-ant-select-tree"], [role="tree"]') || document;
+    let antNodes = Array.from(treeRoot.querySelectorAll(
+      '.ant-tree-treenode, .ec-ant-tree-treenode, [class*="-ant-tree-treenode"], .ant-select-tree-treenode, .ec-ant-select-tree-treenode, [class*="-ant-select-tree-treenode"]',
+    ));
     if (!antNodes.length) {
-      antNodes = Array.from(treeRoot.querySelectorAll('.ant-tree-node-content-wrapper, [role="treeitem"]'));
+      antNodes = Array.from(treeRoot.querySelectorAll(
+        '.ant-tree-node-content-wrapper, .ec-ant-tree-node-content-wrapper, ' +
+        '[class*="-ant-tree-node-content-wrapper"], .ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"], [role="treeitem"]',
+      ));
     }
     const pathInfo = buildVisibleTreePathInfo(
       treeNode,
       antNodes,
-      (node) => getTreeNodeVisibleTitle(node.querySelector?.('.ant-tree-title') || node),
-      (node) => node.querySelector?.('.ant-tree-node-content-wrapper') || node,
+      (node) => getTreeNodeVisibleTitle(node.querySelector?.('.ant-tree-title, .ec-ant-tree-title, [class*="-ant-tree-title"], .ant-select-tree-title, .ec-ant-select-tree-title, [class*="-ant-select-tree-title"]') || node),
+      (node) => node.querySelector?.('.ant-tree-node-content-wrapper, .ec-ant-tree-node-content-wrapper, [class*="-ant-tree-node-content-wrapper"], .ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"]') || node,
     );
     return {
       treeNode,
@@ -303,27 +344,50 @@
 
   function getAntTreeNodeInfo(el) {
     if (!el || !el.closest) return null;
-    const nodeRoot = el.closest('.ant-tree-treenode');
-    const content = el.closest('.ant-tree-node-content-wrapper');
+    // Ant TreeSelect 复用 Ant Tree 的层级结构，但使用 ant-select-tree-* 类名，且
+    // 下拉层会 Teleport 到 body。两者必须走同一套节点语义，而非 nth-of-type。
+    const nodeRoot = el.closest([
+      '.ant-tree-treenode', '.ec-ant-tree-treenode', '[class*="-ant-tree-treenode"]',
+      '.ant-select-tree-treenode', '.ec-ant-select-tree-treenode', '[class*="-ant-select-tree-treenode"]',
+    ].join(','));
+    const content = el.closest([
+      '.ant-tree-node-content-wrapper', '.ec-ant-tree-node-content-wrapper', '[class*="-ant-tree-node-content-wrapper"]',
+      '.ant-select-tree-node-content-wrapper', '.ec-ant-select-tree-node-content-wrapper', '[class*="-ant-select-tree-node-content-wrapper"]',
+    ].join(','));
     if (!nodeRoot && !content) return null;
     const treeNode = nodeRoot || content;
-    const treeRoot = treeNode.closest('.ant-tree') || document;
-    const titleEl = treeNode.querySelector?.('.ant-tree-title') || treeNode;
+    const classText = Array.from(treeNode.classList || []).join(' ');
+    const isSelectTree = /(?:^|\s)[^\s]*ant-select-tree-(?:treenode|node-content-wrapper)(?:\s|$)/.test(classText);
+    const treeRoot = treeNode.closest([
+      '.ant-tree', '.ec-ant-tree', '[class$="-ant-tree"]',
+      '.ant-select-tree', '.ec-ant-select-tree', '[class$="-ant-select-tree"]', '[role="tree"]',
+    ].join(',')) || document;
+    const titleSelector = isSelectTree
+      ? '.ant-select-tree-title, .ec-ant-select-tree-title, [class*="-ant-select-tree-title"]'
+      : '.ant-tree-title, .ec-ant-tree-title, [class*="-ant-tree-title"]';
+    const contentSelector = isSelectTree
+      ? '.ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"]'
+      : '.ant-tree-node-content-wrapper, .ec-ant-tree-node-content-wrapper, [class*="-ant-tree-node-content-wrapper"]';
+    const nodeSelector = isSelectTree
+      ? '.ant-select-tree-treenode, .ec-ant-select-tree-treenode, [class*="-ant-select-tree-treenode"]'
+      : '.ant-tree-treenode, .ec-ant-tree-treenode, [class*="-ant-tree-treenode"]';
+    const titleEl = treeNode.querySelector?.(titleSelector) || treeNode;
     const title = getTreeNodeVisibleTitle(titleEl);
     if (!title) return null;
-    let nodes = Array.from(treeRoot.querySelectorAll('.ant-tree-treenode'));
-    if (!nodes.length) nodes = Array.from(treeRoot.querySelectorAll('.ant-tree-node-content-wrapper, [role="treeitem"]'));
+    let nodes = Array.from(treeRoot.querySelectorAll(nodeSelector));
+    if (!nodes.length) nodes = Array.from(treeRoot.querySelectorAll(`${contentSelector}, [role="treeitem"]`));
     const sameTitleIndex = nodes
-      .filter((node) => getTreeNodeVisibleTitle(node.querySelector?.('.ant-tree-title') || node) === title)
+      .filter((node) => getTreeNodeVisibleTitle(node.querySelector?.(titleSelector) || node) === title)
       .indexOf(treeNode);
     const pathInfo = buildVisibleTreePathInfo(
       treeNode,
       nodes,
-      (node) => getTreeNodeVisibleTitle(node.querySelector?.('.ant-tree-title') || node),
-      (node) => node.querySelector?.('.ant-tree-node-content-wrapper') || node,
+      (node) => getTreeNodeVisibleTitle(node.querySelector?.(titleSelector) || node),
+      (node) => node.querySelector?.(contentSelector) || node,
     );
     return {
       framework: 'ant-tree',
+      variant: isSelectTree ? 'select' : 'tree',
       nodeRoot: treeNode,
       title,
       sameTitleIndex: Math.max(0, sameTitleIndex),
@@ -336,6 +400,53 @@
     if (!nodeRoot) return '';
     const titleEl = nodeRoot.querySelector?.('.vtree-tree-node__title .node, .vtree-tree-node__title, .node') || nodeRoot;
     return getTreeNodeVisibleTitle(titleEl);
+  }
+
+  function getElementTreeNodeInfo(el) {
+    if (!el || !el.closest) return null;
+    const treeNode = el.closest('.el-tree-node');
+    if (!treeNode) return null;
+    const treeRoot = treeNode.closest('.el-tree') || document;
+    const titleEl = treeNode.querySelector?.('.el-tree-node__label') || treeNode;
+    const title = getTreeNodeVisibleTitle(titleEl);
+    if (!title) return null;
+    const nodes = Array.from(treeRoot.querySelectorAll('.el-tree-node'));
+    const sameTitleIndex = nodes
+      .filter((node) => getTreeNodeVisibleTitle(node.querySelector?.('.el-tree-node__label') || node) === title)
+      .indexOf(treeNode);
+    const pathInfo = buildVisibleTreePathInfo(
+      treeNode,
+      nodes,
+      (node) => getTreeNodeVisibleTitle(node.querySelector?.('.el-tree-node__label') || node),
+      (node) => node.querySelector?.('.el-tree-node__content') || node,
+    );
+    return { framework: 'element-tree', nodeRoot: treeNode, title, sameTitleIndex: Math.max(0, sameTitleIndex), ...pathInfo };
+  }
+
+  function getIviewTreeNodeInfo(el) {
+    if (!el || !el.closest) return null;
+    // View UI 的 checkbox / 展开箭头与标题是同一 li 下的兄弟节点，不能只从
+    // 事件目标向上寻找 title；否则点 checkbox 时会退回到易变的 CSS/XPath。
+    const item = el.closest('li');
+    const titleEl = el.closest('.ivu-tree-title') || item?.querySelector?.('.ivu-tree-title');
+    if (!titleEl) return null;
+    const treeRoot = titleEl.closest('.ivu-tree') || document;
+    const title = getTreeNodeVisibleTitle(titleEl);
+    if (!title) return null;
+    const nodes = Array.from(treeRoot.querySelectorAll('.ivu-tree-title'));
+    const sameTitleIndex = nodes.filter((node) => getTreeNodeVisibleTitle(node) === title).indexOf(titleEl);
+    const pathInfo = buildVisibleTreePathInfo(titleEl, nodes, getTreeNodeVisibleTitle, (node) => node);
+    return { framework: 'iview-tree', nodeRoot: titleEl, title, sameTitleIndex: Math.max(0, sameTitleIndex), ...pathInfo };
+  }
+
+  function treeCheckboxState(host) {
+    const input = host?.matches?.('input[type="checkbox"]') ? host : host?.querySelector?.('input[type="checkbox"]');
+    return Boolean(input?.checked)
+      || host?.classList?.contains('is-checked')
+      || host?.classList?.contains('ivu-checkbox-checked')
+      // View UI 会用内部 span 的 class 表示受控 checkbox 状态，input.checked
+      // 在部分版本中不会与视觉状态同步。
+      || Boolean(host?.querySelector?.('.ivu-checkbox.ivu-checkbox-checked'));
   }
 
   function getVtreeNodeInfo(el) {
@@ -381,9 +492,29 @@
     }
     const antInfo = getAntTreeNodeInfo(el);
     if (antInfo?.title) {
-      if (el.closest?.('.ant-tree-switcher')) {
+      const checkbox = el.closest?.([
+        '.ant-tree-checkbox', '.ec-ant-tree-checkbox', '[class*="-ant-tree-checkbox"]',
+        '.ant-select-tree-checkbox', '.ec-ant-select-tree-checkbox', '[class*="-ant-select-tree-checkbox"]',
+      ].join(','));
+      if (checkbox) {
+        const checkedBefore = Array.from(checkbox.classList || []).some((name) => /ant-(?:select-)?tree-checkbox-checked$/.test(name))
+          || checkbox.getAttribute('aria-checked') === 'true';
         return {
           framework: 'ant-tree',
+          variant: antInfo.variant,
+          kind: 'checkbox',
+          title: antInfo.title,
+          sameTitleIndex: antInfo.sameTitleIndex,
+          parentPath: antInfo.parentPath,
+          level: antInfo.level,
+          checkedBefore,
+          checkedAfter: !checkedBefore,
+        };
+      }
+      if (el.closest?.('.ant-tree-switcher, .ec-ant-tree-switcher, [class*="-ant-tree-switcher"], .ant-select-tree-switcher, .ec-ant-select-tree-switcher, [class*="-ant-select-tree-switcher"]')) {
+        return {
+          framework: 'ant-tree',
+          variant: antInfo.variant,
           kind: 'expand_toggle',
           title: antInfo.title,
           sameTitleIndex: antInfo.sameTitleIndex,
@@ -391,9 +522,10 @@
           level: antInfo.level,
         };
       }
-      if (el.closest?.('.ant-tree-node-content-wrapper, .ant-tree-title')) {
+      if (el.closest?.('.ant-tree-node-content-wrapper, .ec-ant-tree-node-content-wrapper, [class*="-ant-tree-node-content-wrapper"], .ant-tree-title, .ec-ant-tree-title, [class*="-ant-tree-title"], .ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"], .ant-select-tree-title, .ec-ant-select-tree-title, [class*="-ant-select-tree-title"]')) {
         return {
           framework: 'ant-tree',
+          variant: antInfo.variant,
           kind: 'node_content',
           title: antInfo.title,
           sameTitleIndex: antInfo.sameTitleIndex,
@@ -401,6 +533,30 @@
           level: antInfo.level,
         };
       }
+    }
+    const elementInfo = getElementTreeNodeInfo(el);
+    if (elementInfo?.title) {
+      const checkbox = el.closest?.('.el-checkbox');
+      const kind = checkbox ? 'checkbox'
+        : el.closest?.('.el-tree-node__expand-icon') ? 'expand_toggle'
+          : el.closest?.('.el-tree-node__content, .el-tree-node__label') ? 'node_content' : '';
+      if (kind) return {
+        framework: elementInfo.framework, kind, title: elementInfo.title,
+        sameTitleIndex: elementInfo.sameTitleIndex, parentPath: elementInfo.parentPath, level: elementInfo.level,
+        ...(checkbox ? { checkedBefore: treeCheckboxState(checkbox), checkedAfter: !treeCheckboxState(checkbox) } : {}),
+      };
+    }
+    const iviewInfo = getIviewTreeNodeInfo(el);
+    if (iviewInfo?.title) {
+      const checkbox = el.closest?.('.ivu-checkbox-wrapper, .ivu-checkbox');
+      const kind = checkbox ? 'checkbox'
+        : el.closest?.('.ivu-tree-arrow') ? 'expand_toggle'
+          : el.closest?.('.ivu-tree-title') ? 'node_content' : '';
+      if (kind) return {
+        framework: iviewInfo.framework, kind, title: iviewInfo.title,
+        sameTitleIndex: iviewInfo.sameTitleIndex, parentPath: iviewInfo.parentPath, level: iviewInfo.level,
+        ...(checkbox ? { checkedBefore: treeCheckboxState(checkbox), checkedAfter: !treeCheckboxState(checkbox) } : {}),
+      };
     }
     const vtreeInfo = getVtreeNodeInfo(el);
     if (vtreeInfo?.title) {
@@ -556,6 +712,158 @@
       cell,
       row,
     };
+  }
+
+  /**
+   * 表格中的操作不能只依赖第 N 行：排序、分页或残留数据都会让 N 失去业务含义。
+   * 按稳定 ID、业务语义单列、业务语义双列的顺序选择身份条件，
+   * 并保存候选集合及“在该行内点哪个操作”的相对信息。
+   * 找不到唯一值时返回 null，调用方仍保留旧的行号定位，避免猜测用户意图。
+   */
+  function buildTableRowSemanticLocator(el, tablePos) {
+    if (!tablePos?.row || !tablePos?.cell) return null;
+    const row = tablePos.row;
+    const section = row.closest('tbody');
+    if (!section) return null;
+    const rows = Array.from(section.querySelectorAll(':scope > tr')).filter((item) => {
+      const rect = item.getBoundingClientRect();
+      return rect.width > 0 || rect.height > 0;
+    });
+    const cellsOf = (item) => Array.from(item.querySelectorAll(
+      ':scope > td, :scope > th, :scope > .ant-table-cell, :scope > .el-table__cell, :scope > .ivu-table-cell, :scope > [role="gridcell"]',
+    ));
+    const cells = cellsOf(row);
+    if (!rows.length || !cells.length) return null;
+
+    const tableRoot = row.closest('.el-table,.ant-table,.ivu-table,table,[role="grid"]');
+    const headerRow = tableRoot?.querySelector('thead tr:last-child, [role="rowgroup"] [role="row"]');
+    const headers = headerRow ? cellsOf(headerRow).map((cell) => safeText(cell.innerText || cell.textContent || '')) : [];
+    const ignoredHeader = /^(?:序号|操作|action|index|#)$/i;
+    const normalized = (value) => safeText(value).replace(/\s+/g, ' ').trim();
+    const stableRowAttrs = ['data-row-key', 'data-key', 'data-id', 'data-row-id', 'data-record-id'];
+    const rowAttr = stableRowAttrs
+      .map((attr) => ({ attr, value: normalized(row.getAttribute(attr)) }))
+      .find((item) => item.value && item.value.length <= 160
+        && rows.filter((candidate) => normalized(candidate.getAttribute(item.attr)) === item.value).length === 1);
+    const isLowSemantic = (header, value) => (
+      /(?:状态|启用|禁用|时间|日期|金额|价格|数量|比例|percent|status|time|date|amount|price|count)/i.test(header)
+      || /^(?:true|false|是|否|启用|禁用|正常|停用|已?开启|已?关闭)$/i.test(value)
+      || /^\d{4}[-/]\d{1,2}[-/]\d{1,2}/.test(value)
+    );
+    const semanticScore = (header, value) => {
+      let score = 10;
+      if (/(?:^|[_\s])id$|编号|编码|订单号|单号|账号|唯一标识|code/i.test(header)) score += 90;
+      else if (/(?:名称|名字|角色名|用户名|标题|name)/i.test(header)) score += 80;
+      else if (/(?:组织|项目|分类|类型|部门|group|project|type)/i.test(header)) score += 40;
+      if (/^\d+$/.test(value) && !/(?:id|编号|编码|订单号|单号)/i.test(header)) score -= 18;
+      if (isLowSemantic(header, value)) score -= 80;
+      return score;
+    };
+    const columnCandidates = [];
+    for (let index = 0; index < cells.length; index += 1) {
+      const value = normalized(cells[index].innerText || cells[index].textContent || '');
+      const header = normalized(headers[index] || `col_${index + 1}`);
+      if (!value || value.length > 120 || ignoredHeader.test(header) || isLowSemantic(header, value)) continue;
+      const matches = rows.filter((candidate) => normalized(cellsOf(candidate)[index]?.innerText || cellsOf(candidate)[index]?.textContent || '') === value);
+      columnCandidates.push({ header, value, col_index: index, unique_count: matches.length, score: semanticScore(header, value) });
+    }
+    const identityCandidates = [];
+    if (rowAttr) {
+      identityCandidates.push({
+        kind: 'row_attr', fields: [{ kind: 'row_attr', attr: rowAttr.attr, value: rowAttr.value }],
+        unique_count: 1, score: 200, reason: 'stable_row_attribute',
+      });
+    }
+    columnCandidates.filter((candidate) => candidate.unique_count === 1).forEach((candidate) => {
+      identityCandidates.push({
+        kind: 'single', fields: [{ header: candidate.header, value: candidate.value, col_index: candidate.col_index }],
+        unique_count: 1, score: candidate.score, reason: 'unique_business_column',
+      });
+    });
+    const pairPool = columnCandidates.filter((candidate) => candidate.score >= 20).sort((a, b) => b.score - a.score).slice(0, 6);
+    for (let left = 0; left < pairPool.length; left += 1) {
+      for (let right = left + 1; right < pairPool.length; right += 1) {
+        const pair = [pairPool[left], pairPool[right]];
+        const count = rows.filter((candidate) => {
+          const rowCells = cellsOf(candidate);
+          return pair.every((field) => normalized(rowCells[field.col_index]?.innerText || rowCells[field.col_index]?.textContent || '') === field.value);
+        }).length;
+        if (count === 1) {
+          identityCandidates.push({
+            kind: 'pair', fields: pair.map(({ header, value, col_index }) => ({ header, value, col_index })),
+            unique_count: 1, score: Math.round((pair[0].score + pair[1].score) / 2) - 5, reason: 'unique_business_pair',
+          });
+        }
+      }
+    }
+    identityCandidates.sort((a, b) => b.score - a.score || a.fields.length - b.fields.length);
+    const selectedIdentity = identityCandidates[0];
+    if (!selectedIdentity) return null;
+
+    const relativeActionCss = relativeCssFromAncestor(row, el);
+    const actionText = safeText(el.innerText || el.textContent || '').slice(0, 120);
+    if (!relativeActionCss && !actionText) return null;
+    return {
+      version: 3,
+      collection: {
+        kind: 'table',
+        root: { framework: tablePos.framework, wrapper_index: tablePos.wrapper_index },
+        item: { selector: 'tbody > tr', role: 'row' },
+      },
+      // fields 保留在顶层，供 v2 回放兼容；统一模型优先读取 identity.selected。
+      framework: tablePos.framework,
+      wrapper_index: tablePos.wrapper_index,
+      section: 'tbody',
+      fields: selectedIdentity.fields,
+      action: {
+        css: relativeActionCss,
+        text: actionText,
+        tag: (el.tagName || '').toLowerCase(),
+        scope: row === el ? 'self' : 'descendant',
+      },
+      recorded_row_index: tablePos.row_index,
+      // 仅用于运行诊断：固定序号模式下可对比本次命中的业务项，不能参与定位。
+      recorded_item_summary: safeText(tablePos.row_text || '').slice(0, 360),
+      identity: {
+        mode: 'semantic',
+        selected: selectedIdentity.fields,
+        selected_reason: selectedIdentity.reason,
+        candidates: identityCandidates.slice(0, 8),
+      },
+      fallback: { mode: 'none' },
+    };
+  }
+
+  // 非表格集合：仅接受有明确重复项结构的 list/card，避免把普通布局容器误识别为集合。
+  function buildListCardSemanticLocator(el) {
+    if (!el?.closest || resolveTableCellPosition(el)) return null;
+    const item = el.closest('[role="menuitem"],.ant-menu-item,[class*="-ant-menu-item"],[class*="-ant-dropdown-menu-item"],.ivu-menu-item,.el-menu-item,[role="listitem"],.ant-list-item,[class*="-ant-list-item"],.el-card,.ivu-card,li,[class*="card"], [class*="list-item"], [class*="list_item"]');
+    if (!item || !item.parentElement) return null;
+    const root = item.parentElement;
+    const tag = item.tagName.toLowerCase();
+    const itemClass = cleanClasses(item).find((name) => /(?:card|item|list)/i.test(name));
+    const itemSelector = itemClass ? `${tag}.${CSS.escape(itemClass)}` : tag;
+    const items = Array.from(root.querySelectorAll(`:scope > ${itemSelector}`)).filter((node) => {
+      const rect = node.getBoundingClientRect(); return rect.width > 0 || rect.height > 0;
+    });
+    if (items.length < 2 || !items.includes(item)) return null;
+    const rootTag = root.tagName.toLowerCase();
+    const rootClass = cleanClasses(root).find((name) => /(?:list|grid|cards|content)/i.test(name));
+    const rootSelector = rootClass ? `${rootTag}.${CSS.escape(rootClass)}` : rootTag;
+    const rootIndex = Array.from(document.querySelectorAll(rootSelector)).indexOf(root);
+    const norm = (value) => safeText(value).replace(/\s+/g, ' ').trim();
+    const texts = [norm(item.getAttribute('aria-label') || ''), norm(item.innerText || item.textContent || ''), ...Array.from(item.querySelectorAll('h1,h2,h3,h4,h5,h6,[title],strong,b,.title,[class*="title"],[class*="name"]'))
+      .map((node) => norm(node.innerText || node.textContent || node.getAttribute('title') || ''))
+      ].filter((value) => value && value.length <= 120);
+    const value = texts.find((text) => items.filter((node) => norm(node.innerText || node.textContent || '').includes(text)).length === 1);
+    if (!value) return null;
+    const actionCss = relativeCssFromAncestor(item, el);
+    const actionText = safeText(el.innerText || el.textContent || '').slice(0, 120);
+    if (!actionCss && !actionText) return null;
+    const itemIndex = items.indexOf(item);
+    const fields = [{ kind: 'item_text', header: '业务对象', value }];
+    const kind = item.matches('[role="menuitem"],.ant-menu-item,[class*="-ant-menu-item"],[class*="-ant-dropdown-menu-item"],.ivu-menu-item,.el-menu-item') ? 'menu' : (/card/i.test(itemClass || '') || item.matches('.el-card,.ivu-card,[class*="card"]') ? 'card' : 'list');
+    return { version: 3, collection: { kind, root: { selector: rootSelector, index: rootIndex }, item: { selector: itemSelector } }, fields, action: { css: actionCss, text: actionText, tag: (el.tagName || '').toLowerCase(), scope: item === el ? 'self' : 'descendant' }, recorded_item_index: itemIndex, recorded_item_summary: norm(item.innerText || item.textContent || '').slice(0, 360), identity: { mode: 'semantic', selected: fields, selected_reason: 'unique_business_item_text', candidates: [{ kind: 'single', fields, unique_count: 1, score: 90, reason: 'unique_business_item_text' }] }, fallback: { mode: 'none' } };
   }
 
   function getControlRoot(el) {
@@ -715,6 +1023,8 @@
       tag: (el?.tagName || '').toLowerCase(),
       overlay: !!getOverlayAncestor(el),
       control_kind: getControlKind(el),
+      has_popup: Boolean(el?.hasAttribute?.('aria-haspopup') || root?.hasAttribute?.('aria-haspopup')),
+      popup_controls: String(el?.getAttribute?.('aria-controls') || root?.getAttribute?.('aria-controls') || ''),
       label_text: getAssociatedLabelText(el),
       container_text: getNearestContainerText(el),
       sibling_index: getSiblingIndexInScope(el),
@@ -808,7 +1118,9 @@
     }
 
     const treeNodeInfo = getGenericTreeNodeInfo(el);
-    if (treeNodeInfo?.title) {
+    // tree_node_text 表示“点击节点正文”，不能作为节点内菜单按钮、复选框等
+    // 子操作的降级目标；否则专用定位失败时会静默改成点击整行。
+    if (treeNodeInfo?.title && (!treeInteraction || treeInteraction.kind === 'node_content')) {
       pushLocatorCandidate(candidates, {
         type: 'tree_node_text',
         value: JSON.stringify({
@@ -820,12 +1132,22 @@
     }
 
     const tablePos = resolveTableCellPosition(el);
+    let tableRowSemantic = null;
     if (tablePos) {
+      tableRowSemantic = buildTableRowSemanticLocator(el, tablePos);
+      if (tableRowSemantic) {
+        tableRowSemantic._collection_locator_mode = 'semantic';
+        pushLocatorCandidate(candidates, {
+          type: 'collection_item',
+          value: JSON.stringify(tableRowSemantic),
+          score: 0.99,
+        });
+      }
       if (tablePos.scoped_xpath) {
         pushLocatorCandidate(candidates, {
           type: 'table_cell_xpath',
           value: tablePos.scoped_xpath,
-          score: 0.94,
+          score: tableRowSemantic ? 0.34 : 0.94,
         });
       }
       if (tablePos.scoped_css) {
@@ -833,9 +1155,14 @@
         pushLocatorCandidate(candidates, {
           type: 'table_cell_css',
           value: tablePos.scoped_css,
-          score: unique ? 0.93 : 0.82,
+          score: tableRowSemantic ? 0.33 : (unique ? 0.93 : 0.82),
         });
       }
+    }
+    const collectionSemantic = tableRowSemantic || buildListCardSemanticLocator(el);
+    if (collectionSemantic && !tableRowSemantic) {
+      collectionSemantic._collection_locator_mode = 'semantic';
+      pushLocatorCandidate(candidates, { type: 'collection_item', value: JSON.stringify(collectionSemantic), score: 0.99 });
     }
 
     // 文本候选：用于按钮、链接、菜单项和通知文本等语义动作的回退定位
@@ -857,11 +1184,19 @@
 
     candidates.sort((a, b) => (b.score - a.score));
     return {
-      version: 1,
+      version: collectionSemantic ? 3 : 1,
       generated_at: Date.now(),
       candidates: candidates.slice(0, 12),
       context: {
         ...buildLocatorContext(el),
+        ...(collectionSemantic ? {
+          // 新录制的集合项默认按业务对象回放；仍保留录制序号，供用户在步骤编辑中显式切换。
+          collection_item_identity: {
+            ...(collectionSemantic.identity || {}),
+            mode: 'semantic',
+            semantic_config: collectionSemantic,
+          },
+        } : {}),
         ...(treeNodeInfo && treeNodeInfo.title ? {
           tree_node: {
             title: treeNodeInfo.title,
@@ -872,6 +1207,38 @@
           tree_interaction: treeInteraction,
         } : {}),
       },
+    };
+  }
+
+  function attachPointerContext(step, el, clientX, clientY, actionType = 'click') {
+    if (!step || !el || typeof el.getBoundingClientRect !== 'function') return;
+    const rect = el.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return;
+    const vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+    const vh = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+    const clickXRatio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+    const clickYRatio = Math.min(1, Math.max(0, (clientY - rect.top) / rect.height));
+    // 坐标不是 locator，而是“已定位到同一元素后”的真实落点。对全部鼠标动作
+    // 保留元素内比例坐标；回放会先校验该点仍命中目标，否则回退到智能可点击点。
+    const useRecordedPoint = ['click', 'double_click', 'right_click', 'hover'].includes(actionType);
+
+    if (!step.locator_meta || typeof step.locator_meta !== 'object') {
+      step.locator_meta = { version: 1, candidates: [], context: {} };
+    }
+    if (!step.locator_meta.context || typeof step.locator_meta.context !== 'object') {
+      step.locator_meta.context = {};
+    }
+    step.locator_meta.context.pointer = {
+      x_ratio: Number(clickXRatio.toFixed(4)),
+      y_ratio: Number(clickYRatio.toFixed(4)),
+      client_x: Math.round(clientX),
+      client_y: Math.round(clientY),
+      target_width: Math.round(rect.width),
+      target_height: Math.round(rect.height),
+      viewport_width: vw,
+      viewport_height: vh,
+      use_recorded_point: useRecordedPoint,
+      reason: useRecordedPoint ? 'recorded_element_point' : '',
     };
   }
 
@@ -1079,12 +1446,21 @@
     '.ant-select-item-option',
     '.ant-dropdown-menu-item',
     '.ant-cascader-menu-item',
+    '[class*="-ant-select-item"]',
+    '[class*="-ant-dropdown-menu-item"]',
+    '[class*="-ant-cascader-menu-item"]',
   ].join(', ');
+
+  function isAntOverlayClass(el) {
+    return Array.from(el?.classList || []).some((name) => (
+      /(?:^|-)ant-(?:select-dropdown|dropdown|dropdown-menu|cascader-dropdown|cascader-menus)$/.test(name)
+    ));
+  }
 
   function getOverlayAncestor(el) {
     let cur = el;
     while (cur && cur !== document.body) {
-      if (OVERLAY_CLASSES.some(cls => cur.classList?.contains(cls))) return cur;
+      if (OVERLAY_CLASSES.some(cls => cur.classList?.contains(cls)) || isAntOverlayClass(cur)) return cur;
       // 兜底：body 直系子元素且 position fixed/absolute 通常是 teleport 浮层
       if (cur.parentElement === document.body) {
         const style = window.getComputedStyle(cur);
@@ -1098,7 +1474,7 @@
   function getOptionOverlayAncestor(el) {
     let cur = el;
     while (cur && cur !== document.body) {
-      if (OPTION_OVERLAY_CLASSES.some(cls => cur.classList?.contains(cls))) return cur;
+      if (OPTION_OVERLAY_CLASSES.some(cls => cur.classList?.contains(cls)) || isAntOverlayClass(cur)) return cur;
       const role = String(cur.getAttribute?.('role') || '').toLowerCase();
       if (['listbox', 'menu', 'tree', 'grid'].includes(role)) {
         const broad = getOverlayAncestor(cur);
@@ -1742,6 +2118,7 @@
   let heartbeatTimer = null;
   let variableCaptureMode = false;
   let assertionCaptureMode = false;
+  let hoverCaptureMode = false;
   let pendingVariableTarget = null;
   let pendingAssertionTarget = null;
   const recordedVariableNames = new Set();
@@ -1771,16 +2148,21 @@
 
   function setVariableCaptureMode(enabled) {
     variableCaptureMode = !!enabled;
-    if (variableCaptureMode) setAssertionCaptureMode(false);
+    if (variableCaptureMode) {
+      setAssertionCaptureMode(false);
+      setHoverCaptureMode(false);
+    }
     const btn = document.getElementById('__at_save_var_btn__');
     if (btn) {
       btn.classList.toggle('__at_active__', variableCaptureMode);
       const label = btn.querySelector('.__at_btn_label__');
-      if (label) label.textContent = '保存变量';
+      if (label) label.textContent = tr('保存变量', 'Save variable');
     }
     const dragTitle = document.querySelector('#__at_toolbar_drag__ strong');
     if (dragTitle) {
-      dragTitle.textContent = variableCaptureMode ? '选择变量来源' : (isPaused ? '录制已暂停' : '录制中');
+      dragTitle.textContent = variableCaptureMode
+        ? tr('选择变量来源', 'Select variable source')
+        : (isPaused ? tr('录制已暂停', 'Recording paused') : tr('录制中', 'Recording'));
     }
   }
 
@@ -1791,11 +2173,40 @@
       const varBtn = document.getElementById('__at_save_var_btn__');
       varBtn?.classList.toggle('__at_active__', false);
     }
+    if (assertionCaptureMode) setHoverCaptureMode(false);
     const btn = document.getElementById('__at_add_assert_btn__');
     if (btn) btn.classList.toggle('__at_active__', assertionCaptureMode);
     const dragTitle = document.querySelector('#__at_toolbar_drag__ strong');
     if (dragTitle) {
-      dragTitle.textContent = assertionCaptureMode ? '选择断言元素' : (isPaused ? '录制已暂停' : '录制中');
+      dragTitle.textContent = assertionCaptureMode
+        ? tr('选择断言元素', 'Select assertion element')
+        : (isPaused ? tr('录制已暂停', 'Recording paused') : tr('录制中', 'Recording'));
+    }
+  }
+
+  function setHoverCaptureMode(enabled) {
+    hoverCaptureMode = !!enabled;
+    if (hoverCaptureMode) {
+      if (variableCaptureMode) {
+        variableCaptureMode = false;
+        document.getElementById('__at_save_var_btn__')?.classList.toggle('__at_active__', false);
+      }
+      if (assertionCaptureMode) {
+        assertionCaptureMode = false;
+        document.getElementById('__at_add_assert_btn__')?.classList.toggle('__at_active__', false);
+      }
+      flushPendingInputFor();
+      clearPendingClickStep();
+      clearPendingTreeHover();
+      clearPendingHoverStep();
+    }
+    const btn = document.getElementById('__at_hover_btn__');
+    if (btn) btn.classList.toggle('__at_active__', hoverCaptureMode);
+    const dragTitle = document.querySelector('#__at_toolbar_drag__ strong');
+    if (dragTitle) {
+      dragTitle.textContent = hoverCaptureMode
+        ? tr('选择悬浮元素', 'Select hover element')
+        : (isPaused ? tr('录制已暂停', 'Recording paused') : tr('录制中', 'Recording'));
     }
   }
 
@@ -1874,17 +2285,17 @@
   }
 
   function assertionTargetLabel(target) {
-    if (target === 'page') return '整页文本';
+    if (target === 'page') return tr('整页文本', 'page text');
     if (target === 'url') return 'URL';
-    return '指定元素';
+    return tr('指定元素', 'selected element');
   }
 
   function assertionMatchLabel(match) {
-    if (match === 'equals') return '等于';
-    if (match === 'not_contains') return '不包含';
-    if (match === 'regex') return '正则匹配';
-    if (match === 'visible') return '元素可见';
-    return '包含';
+    if (match === 'equals') return tr('等于', 'equals');
+    if (match === 'not_contains') return tr('不包含', 'does not contain');
+    if (match === 'regex') return tr('正则匹配', 'matches regex');
+    if (match === 'visible') return tr('元素可见', 'is visible');
+    return tr('包含', 'contains');
   }
 
   function applyVariableExtraction(rawValue, extract) {
@@ -1892,19 +2303,19 @@
     const mode = String(extract?.mode || 'full');
     if (mode === 'regex') {
       const pattern = String(extract?.pattern || '');
-      if (!pattern) return { ok: false, error: '请填写正则表达式。', value: '' };
+      if (!pattern) return { ok: false, error: tr('请填写正则表达式。', 'Enter a regular expression.'), value: '' };
       const safetyError = validateRegexSafety(pattern);
       if (safetyError) return { ok: false, error: safetyError, value: '' };
       let re;
       try {
         re = new RegExp(pattern);
       } catch (e) {
-        return { ok: false, error: `正则表达式无效：${e?.message || e}`, value: '' };
+        return { ok: false, error: tr(`正则表达式无效：${e?.message || e}`, `Invalid regular expression: ${e?.message || e}`), value: '' };
       }
       const match = raw.match(re);
-      if (!match) return { ok: false, error: '当前抽取值未匹配该正则。', value: '' };
+      if (!match) return { ok: false, error: tr('当前抽取值未匹配该正则。', 'The current value does not match this regular expression.'), value: '' };
       const group = Number.isInteger(Number(extract?.group)) ? Number(extract.group) : (match.length > 1 ? 1 : 0);
-      if (match[group] == null) return { ok: false, error: `捕获组 ${group} 不存在。`, value: '' };
+      if (match[group] == null) return { ok: false, error: tr(`捕获组 ${group} 不存在。`, `Capture group ${group} does not exist.`), value: '' };
       return { ok: true, value: String(match[group]) };
     }
     return { ok: true, value: raw };
@@ -1939,10 +2350,10 @@
 
   function validateRegexSafety(pattern) {
     const source = String(pattern || '');
-    if (source.length > 300) return '正则表达式过长，请缩短后再保存。';
-    if (hasNestedRegexQuantifier(source)) return '正则存在嵌套重复结构，可能导致页面或回放卡顿，请改写后再保存。';
+    if (source.length > 300) return tr('正则表达式过长，请缩短后再保存。', 'The regular expression is too long. Shorten it before saving.');
+    if (hasNestedRegexQuantifier(source)) return tr('正则存在嵌套重复结构，可能导致页面或回放卡顿，请改写后再保存。', 'The regular expression contains nested repetition and may hang playback. Rewrite it before saving.');
     if (/(?:\.\*){2,}|(?:\.\+){2,}|\[[^\]]*\\s\\S[^\]]*\][*+][*+]?/.test(source)) {
-      return '正则过宽，可能误匹配大段文本，请增加固定上下文后再保存。';
+      return tr('正则过宽，可能误匹配大段文本，请增加固定上下文后再保存。', 'The regular expression is too broad. Add fixed context before saving.');
     }
     return '';
   }
@@ -1981,7 +2392,7 @@
             resolve({ ok: false, error: chrome.runtime.lastError.message });
             return;
           }
-          resolve(response || { ok: false, error: '智能抽取服务无响应' });
+          resolve(response || { ok: false, error: tr('智能抽取服务无响应', 'The AI extraction service did not respond.') });
         },
       );
     });
@@ -2011,7 +2422,10 @@
       value: variableName,
       value_text: raw,
       url: location.href,
-      description: `保存变量 {{${variableName}}}: "${value.trim().replace(/\s+/g, ' ').slice(0, 50)}"`,
+      description: tr(
+        `保存变量 {{${variableName}}}: "${value.trim().replace(/\s+/g, ' ').slice(0, 50)}"`,
+        `Save variable {{${variableName}}}: "${value.trim().replace(/\s+/g, ' ').slice(0, 50)}"`,
+      ),
       locator_meta: meta,
     };
   }
@@ -2030,7 +2444,9 @@
       ? buildSmartLocatorMeta(el, targetSelector, targetXpath, expected)
       : { version: 1, candidates: [], context: {} };
     if (!meta.context || typeof meta.context !== 'object') meta.context = {};
-    meta.assertion = { target: assertionTarget, match: assertionMatch };
+    // 文本断言默认采用“等待成立”语义：异步 toast / 列表刷新等目标可能先挂载后写入文本。
+    // 用户仍可在中台将 wait_mode 改为 immediate，以校验严格的瞬时状态。
+    meta.assertion = { target: assertionTarget, match: assertionMatch, wait_mode: 'eventually' };
     meta.context.assertion = {
       target: assertionTarget,
       match: assertionMatch,
@@ -2050,8 +2466,11 @@
       ...(usesElement ? { read_mode: readMode, ...(attribute ? { attribute } : {}) } : {}),
       url: location.href,
       description: assertionMatch === 'visible'
-        ? `断言${targetLabel}可见`
-        : `断言${targetLabel}${matchLabel}: "${expected.trim().replace(/\s+/g, ' ').slice(0, 50)}"`,
+        ? tr(`断言${targetLabel}可见`, `Assert ${targetLabel} is visible`)
+        : tr(
+          `断言${targetLabel}${matchLabel}: "${expected.trim().replace(/\s+/g, ' ').slice(0, 50)}"`,
+          `Assert ${targetLabel} ${matchLabel}: "${expected.trim().replace(/\s+/g, ' ').slice(0, 50)}"`,
+        ),
       locator_meta: meta,
     };
   }
@@ -2098,58 +2517,58 @@
         <div class="__at_var_head__">
           <div>
             <div class="__at_var_kicker__">Runtime variable</div>
-            <div id="__at_var_title__" class="__at_var_title__">保存变量</div>
+            <div id="__at_var_title__" class="__at_var_title__">${escapeHtml(tr('保存变量', 'Save variable'))}</div>
           </div>
-          <button type="button" class="__at_icon_btn__" id="__at_var_close__" aria-label="关闭">×</button>
+          <button type="button" class="__at_icon_btn__" id="__at_var_close__" aria-label="${escapeHtml(tr('关闭', 'Close'))}">×</button>
         </div>
         <label class="__at_var_field__">
-          <span class="__at_var_label__">变量名</span>
+          <span class="__at_var_label__">${escapeHtml(tr('变量名', 'Variable name'))}</span>
           <input id="__at_var_name__" value="${escapeHtml(defaultName)}" autocomplete="off" spellcheck="false" />
         </label>
         <div class="__at_var_preview__">
-          <span class="__at_var_label__">原始值</span>
-          <code>${escapeHtml(preview || '(empty)')}</code>
+          <span class="__at_var_label__">${escapeHtml(tr('原始值', 'Raw value'))}</span>
+          <code id="__at_assert_current_value__">${escapeHtml(preview || '(empty)')}</code>
         </div>
         <div class="__at_var_field__">
-          <span class="__at_var_label__">抽取方式</span>
+          <span class="__at_var_label__">${escapeHtml(tr('抽取方式', 'Extraction method'))}</span>
           <input id="__at_var_extract_mode__" type="hidden" value="full" />
           <div class="__at_select__" id="__at_extract_select__">
             <button type="button" class="__at_select_trigger__" id="__at_extract_select_trigger__" aria-haspopup="listbox" aria-expanded="false">
-              <span id="__at_extract_select_label__">完整值</span>
+              <span id="__at_extract_select_label__">${escapeHtml(tr('完整值', 'Full value'))}</span>
               <span class="__at_select_chevron__">⌄</span>
             </button>
             <div class="__at_select_menu__" id="__at_extract_select_menu__" role="listbox" hidden>
-              <button type="button" class="__at_select_option__ __at_selected__" data-extract-mode="full" role="option" aria-selected="true">完整值</button>
-              <button type="button" class="__at_select_option__" data-extract-mode="regex" role="option" aria-selected="false">正则匹配</button>
+              <button type="button" class="__at_select_option__ __at_selected__" data-extract-mode="full" role="option" aria-selected="true">${escapeHtml(tr('完整值', 'Full value'))}</button>
+              <button type="button" class="__at_select_option__" data-extract-mode="regex" role="option" aria-selected="false">${escapeHtml(tr('正则匹配', 'Regular expression'))}</button>
             </div>
           </div>
         </div>
         <div id="__at_var_regex_fields__" class="__at_var_extract_fields__" hidden>
           <div class="__at_var_ai_box__" id="__at_var_ai_box__">
             <label class="__at_var_field__">
-              <span class="__at_var_label__">智能抽取</span>
-              <input id="__at_var_ai_instruction__" placeholder="例如：只取括号前面的内容" autocomplete="off" spellcheck="false" />
+              <span class="__at_var_label__">${escapeHtml(tr('智能抽取', 'AI extraction'))}</span>
+              <input id="__at_var_ai_instruction__" placeholder="${escapeHtml(tr('例如：只取括号前面的内容', 'Example: extract only the text before the parentheses'))}" autocomplete="off" spellcheck="false" />
             </label>
-            <button type="button" class="__at_ai_btn__" id="__at_var_ai_generate__">生成规则</button>
+            <button type="button" class="__at_ai_btn__" id="__at_var_ai_generate__">${escapeHtml(tr('生成规则', 'Generate rule'))}</button>
           </div>
           <label class="__at_var_field__">
-            <span class="__at_var_label__">正则表达式</span>
-            <input id="__at_var_regex__" placeholder="例如：ORD-\\d+" autocomplete="off" spellcheck="false" />
+            <span class="__at_var_label__">${escapeHtml(tr('正则表达式', 'Regular expression'))}</span>
+            <input id="__at_var_regex__" placeholder="${escapeHtml(tr('例如：ORD-\\d+', 'Example: ORD-\\d+'))}" autocomplete="off" spellcheck="false" />
           </label>
           <label class="__at_var_field__">
-            <span class="__at_var_label__">捕获组</span>
+            <span class="__at_var_label__">${escapeHtml(tr('捕获组', 'Capture group'))}</span>
             <input id="__at_var_group__" value="0" inputmode="numeric" autocomplete="off" spellcheck="false" />
           </label>
         </div>
         <div class="__at_var_preview__">
-          <span class="__at_var_label__">变量值预览</span>
+          <span class="__at_var_label__">${escapeHtml(tr('变量值预览', 'Variable value preview'))}</span>
           <code id="__at_var_result__">${escapeHtml(preview || '(empty)')}</code>
         </div>
-        <div class="__at_var_usage__">后续步骤可使用 <code>{{${escapeHtml(defaultName)}}}</code></div>
+        <div class="__at_var_usage__">${escapeHtml(tr('后续步骤可使用', 'Use in later steps'))} <code>{{${escapeHtml(defaultName)}}}</code></div>
         <div class="__at_var_error__" id="__at_var_error__"></div>
         <div class="__at_var_actions__">
-          <button type="button" class="__at_secondary_btn__" id="__at_var_cancel__">取消</button>
-          <button type="button" class="__at_primary_btn__" id="__at_var_confirm__">保存变量</button>
+          <button type="button" class="__at_secondary_btn__" id="__at_var_cancel__">${escapeHtml(tr('取消', 'Cancel'))}</button>
+          <button type="button" class="__at_primary_btn__" id="__at_var_confirm__">${escapeHtml(tr('保存变量', 'Save variable'))}</button>
         </div>
       </div>
     `;
@@ -2184,7 +2603,7 @@
     };
     const setMode = (mode) => {
       modeInput.value = mode;
-      const selectedText = mode === 'regex' ? '正则匹配' : '完整值';
+      const selectedText = mode === 'regex' ? tr('正则匹配', 'Regular expression') : tr('完整值', 'Full value');
       selectLabel.textContent = selectedText;
       modeButtons.forEach((btn) => {
         const selected = btn.dataset.extractMode === mode;
@@ -2213,11 +2632,11 @@
       resultPreview.textContent = extracted.ok ? (extracted.value || '(empty)') : '—';
       error.style.color = '#dc2626';
       if (raw && !isValidVariableName(raw)) {
-        error.textContent = '变量名只能包含字母、数字、下划线或 $，且不能以数字开头。';
+        error.textContent = tr('变量名只能包含字母、数字、下划线或 $，且不能以数字开头。', 'Variable names may contain letters, numbers, underscores, or $, and cannot start with a number.');
         return;
       }
       if (recordedVariableNames.has(normalized)) {
-        error.textContent = '该变量名已在本次录制中使用，保存后会覆盖运行时变量值。';
+        error.textContent = tr('该变量名已在本次录制中使用，保存后会覆盖运行时变量值。', 'This variable name is already used in this recording. Saving it will overwrite the runtime value.');
         return;
       }
       if (!extracted.ok) {
@@ -2252,18 +2671,18 @@
     aiGenerateButton.addEventListener('click', async () => {
       const instruction = String(aiInstructionInput.value || '').trim();
       if (!instruction) {
-        error.textContent = '请描述你想保存哪一部分。';
+        error.textContent = tr('请描述你想保存哪一部分。', 'Describe which part you want to save.');
         aiInstructionInput.focus();
         return;
       }
       aiGenerateButton.disabled = true;
-      aiGenerateButton.textContent = '生成中...';
+      aiGenerateButton.textContent = tr('生成中...', 'Generating...');
       error.style.color = '#dc2626';
       error.textContent = '';
       try {
         const response = await requestVariableExtractRule(rawValue, instruction);
         if (!response?.ok) {
-          error.textContent = response?.error || '智能抽取规则生成失败。';
+          error.textContent = response?.error || tr('智能抽取规则生成失败。', 'Failed to generate an AI extraction rule.');
           return;
         }
         const applied = applyGeneratedVariableRule(response.rule, {
@@ -2271,7 +2690,7 @@
           groupInput,
         });
         if (!applied) {
-          error.textContent = '智能抽取返回了不支持的规则。';
+          error.textContent = tr('智能抽取返回了不支持的规则。', 'AI extraction returned an unsupported rule.');
           return;
         }
         setMode(response.rule?.mode === 'full' ? 'full' : 'regex');
@@ -2279,12 +2698,12 @@
         if (response.rule?.reason) {
           error.style.color = '#15803d';
           error.textContent = response.rule?.mode === 'full'
-            ? `已生成规则：${response.rule.reason}；将保存完整值。`
-            : `已生成规则：${response.rule.reason}；正则和捕获组已填入下方。`;
+            ? tr(`已生成规则：${response.rule.reason}；将保存完整值。`, `Rule generated: ${response.rule.reason}. The full value will be saved.`)
+            : tr(`已生成规则：${response.rule.reason}；正则和捕获组已填入下方。`, `Rule generated: ${response.rule.reason}. The expression and capture group are filled in below.`);
         }
       } finally {
         aiGenerateButton.disabled = false;
-        aiGenerateButton.textContent = '生成规则';
+        aiGenerateButton.textContent = tr('生成规则', 'Generate rule');
       }
     });
     input.addEventListener('keydown', (event) => {
@@ -2302,12 +2721,12 @@
     overlay.querySelector('#__at_var_confirm__')?.addEventListener('click', () => {
       const rawName = String(input.value || '').trim();
       if (!rawName) {
-        error.textContent = '请输入变量名。';
+        error.textContent = tr('请输入变量名。', 'Enter a variable name.');
         input.focus();
         return;
       }
       if (!isValidVariableName(rawName)) {
-        error.textContent = '变量名只能包含字母、数字、下划线或 $，且不能以数字开头。';
+        error.textContent = tr('变量名只能包含字母、数字、下划线或 $，且不能以数字开头。', 'Variable names may contain letters, numbers, underscores, or $, and cannot start with a number.');
         input.focus();
         return;
       }
@@ -2363,13 +2782,13 @@
         <div class="__at_var_head__">
           <div>
             <div class="__at_var_kicker__">Assertion</div>
-            <div id="__at_assert_title__" class="__at_var_title__">添加断言</div>
+            <div id="__at_assert_title__" class="__at_var_title__">${escapeHtml(tr('添加断言', 'Add assertion'))}</div>
           </div>
-          <button type="button" class="__at_icon_btn__" id="__at_assert_close__" aria-label="关闭">×</button>
+          <button type="button" class="__at_icon_btn__" id="__at_assert_close__" aria-label="${escapeHtml(tr('关闭', 'Close'))}">×</button>
         </div>
         <div class="__at_var_preview__ __at_assert_preview__">
-          <span class="__at_var_label__">当前值</span>
-          <code id="__at_assert_current_value__">${escapeHtml(preview || '(empty)')}</code>
+          <span class="__at_var_label__">${escapeHtml(tr('当前值', 'Current value'))}</span>
+          <code>${escapeHtml(preview || '(empty)')}</code>
         </div>
         <div class="__at_var_field__" id="__at_assert_read_mode_wrap__">
           <span class="__at_var_label__">读取方式</span>
@@ -2392,7 +2811,7 @@
           <input id="__at_assert_attribute__" value="" autocomplete="off" spellcheck="false" placeholder="例如：class" />
         </label>
         <div class="__at_var_field__">
-          <span class="__at_var_label__">匹配方式</span>
+          <span class="__at_var_label__">${escapeHtml(tr('匹配方式', 'Match method'))}</span>
           <input id="__at_assert_match__" type="hidden" value="${escapeHtml(defaultMatch)}" />
           <div class="__at_select__" id="__at_assert_match_select__">
             <button type="button" class="__at_select_trigger__" id="__at_assert_match_trigger__" aria-haspopup="listbox" aria-expanded="false">
@@ -2400,22 +2819,22 @@
               <span class="__at_select_chevron__">⌄</span>
             </button>
             <div class="__at_select_menu__" id="__at_assert_match_menu__" role="listbox" hidden>
-              <button type="button" class="__at_select_option__" data-assert-match="contains" role="option">包含</button>
-              <button type="button" class="__at_select_option__" data-assert-match="equals" role="option">等于</button>
-              <button type="button" class="__at_select_option__" data-assert-match="not_contains" role="option">不包含</button>
-              <button type="button" class="__at_select_option__" data-assert-match="regex" role="option">正则匹配</button>
-              <button type="button" class="__at_select_option__" data-assert-match="visible" role="option">元素可见</button>
+              <button type="button" class="__at_select_option__" data-assert-match="contains" role="option">${escapeHtml(tr('包含', 'Contains'))}</button>
+              <button type="button" class="__at_select_option__" data-assert-match="equals" role="option">${escapeHtml(tr('等于', 'Equals'))}</button>
+              <button type="button" class="__at_select_option__" data-assert-match="not_contains" role="option">${escapeHtml(tr('不包含', 'Does not contain'))}</button>
+              <button type="button" class="__at_select_option__" data-assert-match="regex" role="option">${escapeHtml(tr('正则匹配', 'Regular expression'))}</button>
+              <button type="button" class="__at_select_option__" data-assert-match="visible" role="option">${escapeHtml(tr('元素可见', 'Element is visible'))}</button>
             </div>
           </div>
         </div>
         <label class="__at_var_field__" id="__at_assert_expected_wrap__">
-          <span class="__at_var_label__">期望值</span>
+          <span class="__at_var_label__">${escapeHtml(tr('期望值', 'Expected value'))}</span>
           <input id="__at_assert_expected__" value="${escapeHtml(preview)}" autocomplete="off" spellcheck="false" />
         </label>
         <div class="__at_var_error__" id="__at_assert_error__"></div>
         <div class="__at_var_actions__">
-          <button type="button" class="__at_secondary_btn__" id="__at_assert_cancel__">取消</button>
-          <button type="button" class="__at_primary_btn__" id="__at_assert_confirm__">保存断言</button>
+          <button type="button" class="__at_secondary_btn__" id="__at_assert_cancel__">${escapeHtml(tr('取消', 'Cancel'))}</button>
+          <button type="button" class="__at_primary_btn__" id="__at_assert_confirm__">${escapeHtml(tr('保存断言', 'Save assertion'))}</button>
         </div>
       </div>
     `;
@@ -2550,7 +2969,7 @@
         return;
       }
       if (match !== 'visible' && expected.trim() === '') {
-        error.textContent = '请输入期望值，或改用元素可见断言。';
+        error.textContent = tr('请输入期望值，或改用元素可见断言。', 'Enter an expected value or use the element visibility assertion.');
         expectedInput.focus();
         return;
       }
@@ -2629,6 +3048,25 @@
     return true;
   }
 
+  function handleHoverCaptureClick(event) {
+    if (!hoverCaptureMode || !isRecording || isPaused) return false;
+    let el = normalizeToElement(event.target);
+    if (!el || el.closest?.('#__at_toolbar__')) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation?.();
+    clearPendingClickStep();
+    clearPendingTreeHover();
+    clearPendingHoverStep();
+    lastHoverDedupeAt = 0;
+    lastHoverDedupeKey = '';
+    el.classList.remove('__at_hover__');
+    setHoverCaptureMode(false);
+    recordHoverStepForTrigger(el, event.clientX, event.clientY);
+    sendPendingHoverStep(true);
+    return true;
+  }
+
   let pendingClickRecord = null;
 
   function sendPendingClickRecord(awaitScreenshot = false) {
@@ -2650,6 +3088,20 @@
     } else {
       sendStep(pending.step);
     }
+    return true;
+  }
+
+  function sendPendingHoverStep(awaitScreenshot = false) {
+    if (!pendingHoverStep) return false;
+    const pending = pendingHoverStep;
+    pendingHoverStep = null;
+    pending.sent = true;
+    void (async () => {
+      if (awaitScreenshot) {
+        try { await pending.screenshotTask; } catch (e) { /* ignore */ }
+      }
+      sendStep(pending.step);
+    })();
     return true;
   }
 
@@ -2771,16 +3223,17 @@
     const addAssertBtn = document.getElementById('__at_add_assert_btn__');
     if (stopBtn) {
       stopBtn.disabled = false;
-      stopBtn.textContent = '停止并保存';
+      stopBtn.classList.remove('__at_saving__');
+      stopBtn.textContent = tr('停止并保存', 'Stop and save');
     }
     if (cancelBtn) {
       cancelBtn.disabled = false;
-      cancelBtn.textContent = '取消录制';
+      cancelBtn.textContent = tr('取消录制', 'Cancel recording');
     }
     if (pauseBtn) {
       pauseBtn.disabled = false;
       const label = pauseBtn.querySelector('.__at_btn_label__');
-      if (label) label.textContent = isPaused ? '继续' : '暂停';
+      if (label) label.textContent = isPaused ? tr('继续', 'Resume') : tr('暂停', 'Pause');
     }
     if (saveVarBtn) {
       saveVarBtn.disabled = false;
@@ -2865,10 +3318,16 @@
       is_overlay: inOverlay,
       url: location.href,
       description: inOverlay
-        ? `选择选项: "${optionText.slice(0, 40)}"`
-        : `${actionType === 'double_click' ? '双击' : actionType === 'right_click' ? '右键点击' : '点击'} ${el.tagName.toLowerCase()}${displayText ? ': ' + displayText : ''}`,
+        ? tr(`选择选项: "${optionText.slice(0, 40)}"`, `Select option: "${optionText.slice(0, 40)}"`)
+        : `${actionType === 'double_click'
+          ? tr('双击', 'Double-click')
+          : actionType === 'right_click'
+            ? tr('右键点击', 'Right-click')
+            : tr('点击', 'Click')} ${el.tagName.toLowerCase()}${displayText ? ': ' + displayText : ''}`,
       locator_meta: buildSmartLocatorMeta(el, targetSelector, targetXpath, optionText || displayText || ''),
     };
+    if (actionType === 'click') attachNativeToggleInteractionContext(step, el, raw);
+    attachPointerContext(step, el, event.clientX, event.clientY, actionType);
     attachVirtualScrollContext(step, el, raw, optionText || displayText || '');
     if (inOverlay) {
       const reveal = getRevealDependencyForClick(el, raw, true);
@@ -2899,8 +3358,22 @@
   function handleClick(event) {
     if (!isTrustedRecordingEvent(event)) return;
     if (isRecorderUiEvent(event)) return;
+    if (handleHoverCaptureClick(event)) return;
     if (handleVariableCaptureClick(event)) return;
     if (handleAssertionCaptureClick(event)) return;
+    const rawTarget = normalizeToElement(event.target);
+    const clickTarget = rawTarget ? resolveClickTargetForRecording(rawTarget) : null;
+    const labelControl = rawTarget?.closest?.('label')?.control
+      || rawTarget?.closest?.('label')?.querySelector?.('input[type="file"]');
+    const fileInput = clickTarget?.tagName === 'INPUT' && String(clickTarget.type || '').toLowerCase() === 'file'
+      ? clickTarget
+      : labelControl;
+    if (fileInput?.tagName === 'INPUT' && String(fileInput.type || '').toLowerCase() === 'file') {
+      // 保留目标网页的原生文件选择和上传流程；真正选中文件后由 change 事件记录上传步骤。
+      // 此处只跳过普通 click 步骤，避免与随后生成的 upload_file 步骤重复。
+      clearPendingClickStep();
+      return;
+    }
     if (event.detail && event.detail > 1) return;
     const built = buildPointerStep(event, 'click');
     if (!built) return;
@@ -2910,6 +3383,9 @@
       flushPendingHoverStepForReveal(reveal, true);
       sendStep(built.step);
       return;
+    }
+    if (!built.step.is_overlay && isLikelyClickRevealTrigger(built.targetEl, built.rawEl)) {
+      rememberRevealTrigger(built.targetEl, 'click', built.clientX, built.clientY);
     }
     flushPendingHoverStepForReveal(reveal, true);
     const screenshotTask = preparePointerStepScreenshot(built.step, built.visualEl, built.clientX, built.clientY);
@@ -2939,6 +3415,12 @@
   let inputTimer = null;
   let pendingInputEl = null;
   let pendingMonacoSelectAll = null;
+  /**
+   * 原生 checkbox 的默认激活行为会在 click 事件分发前翻转 checked。
+   * click（包括 capture 阶段）中读取 checked 已经太晚，因此在按下/键盘激活
+   * 时保留点击前的状态，供随后生成 click 步骤时消费。
+   */
+  let pendingNativeToggleActivation = null;
   /** 避免 label+checkbox 连续两次 click、或同控件极短时间内重复派发 */
   let lastToggleDedupeAt = 0;
   let lastToggleDedupeKey = '';
@@ -2954,9 +3436,15 @@
   /** 已展开的下拉菜单内移动不录 hover（点选项会录 click） */
   function isInsideDropdownMenuLayer(el) {
     if (!el || !el.closest) return false;
-    return !!el.closest(
-      '.ivu-select-dropdown,.ivu-dropdown-menu,.el-select-dropdown,.ant-select-dropdown,.el-popper,.v-menu__content,.vs__dropdown-menu,.rc-virtual-list-holder,.ant-cascader-menus',
+    const knownOverlay = el.closest(
+      '.ivu-select-dropdown,.ivu-dropdown-menu,.ivu-cascader-menu,.el-select-dropdown,.el-cascader__dropdown,.ant-select-dropdown,.ant-dropdown-menu,.ant-cascader-dropdown,.ant-cascader-menus,[class*="-ant-select-dropdown"],[class*="-ant-dropdown-menu"],[class*="-ant-cascader-dropdown"],[class*="-ant-cascader-menus"],.el-popper,.v-menu__content,.vs__dropdown-menu,.rc-virtual-list-holder',
     );
+    if (knownOverlay) return true;
+
+    // role 只描述控件语义：常驻侧边栏和顶部导航同样可能使用 role=menu。
+    // 只有该 ARIA 菜单同时位于已知浮层或 body Portal 的定位容器中，才跳过内部 hover。
+    const ariaMenu = el.closest('[role="menu"],[role="listbox"]');
+    return Boolean(ariaMenu && getOverlayAncestor(ariaMenu));
   }
 
   function findTreeHoverTrigger(el) {
@@ -2964,10 +3452,10 @@
     let content = null;
     let treeNode = null;
 
-    const antNode = el.closest('.ant-tree-treenode, .ant-tree-node-content-wrapper');
-    if (antNode?.closest?.('.ant-tree')) {
-      treeNode = antNode.closest('.ant-tree-treenode') || antNode;
-      content = treeNode.querySelector('.ant-tree-node-content-wrapper') || treeNode;
+    const antNode = el.closest('.ant-tree-treenode, .ec-ant-tree-treenode, [class*="-ant-tree-treenode"], .ant-tree-node-content-wrapper, .ec-ant-tree-node-content-wrapper, [class*="-ant-tree-node-content-wrapper"]');
+    if (antNode?.closest?.('.ant-tree, .ec-ant-tree, [class$="-ant-tree"], [role="tree"]')) {
+      treeNode = antNode.closest('.ant-tree-treenode, .ec-ant-tree-treenode, [class*="-ant-tree-treenode"]') || antNode;
+      content = treeNode.querySelector('.ant-tree-node-content-wrapper, .ec-ant-tree-node-content-wrapper, [class*="-ant-tree-node-content-wrapper"]') || treeNode;
     }
 
     if (!content) {
@@ -3019,6 +3507,7 @@
         '.el-dropdown',
         '.ivu-dropdown',
         '.ant-dropdown-trigger',
+        '[class*="-ant-dropdown-trigger"]',
         '.el-dropdown-link',
         '.el-popover__reference',
       ].join(','),
@@ -3055,28 +3544,55 @@
     return rel;
   }
 
-  function buildRevealTriggerRef(el, action = 'hover') {
+  function buildRevealTriggerRef(el, action = 'hover', clientX = null, clientY = null) {
     if (!el) return null;
     try {
       const selector = ensureUniqueSelector(el, getUniqueSelector(el));
       const xpath = getXPath(el);
       if (!selector && !xpath) return null;
       const text = safeText(el.textContent || '').slice(0, 64);
-      return {
+      const ref = {
         action,
         captured_at: Date.now(),
         target_selector: selector || '',
         target_xpath: xpath || '',
         locator_meta: buildSmartLocatorMeta(el, selector || '', xpath || '', text),
       };
+      if (Number.isFinite(clientX) && Number.isFinite(clientY)) {
+        attachPointerContext(ref, el, clientX, clientY, action);
+      }
+      return ref;
     } catch {
       return null;
     }
   }
 
-  function rememberRevealTrigger(el, action = 'hover') {
-    const ref = buildRevealTriggerRef(el, action);
+  function rememberRevealTrigger(el, action = 'hover', clientX = null, clientY = null) {
+    const ref = buildRevealTriggerRef(el, action, clientX, clientY);
     if (ref) lastRevealTrigger = { ...ref, _el: el };
+  }
+
+  /**
+   * 只记住高概率会打开浮层的点击控件。后续若录到菜单/列表框选项，会把该选项
+   * 与触发点击建立显式因果关系，回放时即可校验“点击后浮层确实出现”。
+   */
+  function isLikelyClickRevealTrigger(targetEl, rawEl) {
+    const el = targetEl || rawEl;
+    if (!el || !el.closest) return false;
+    if (el.matches?.('input[type="checkbox"],input[type="radio"],select,option')) return false;
+    const host = el.closest([
+      '[aria-haspopup]', '[aria-controls]', '[aria-expanded]',
+      'button', '[role="button"]', 'summary',
+      '.ant-dropdown-trigger', '[class*="-ant-dropdown-trigger"]',
+      '.ant-select-selector', '[class*="-ant-select-selector"]',
+      '.el-dropdown', '.ivu-dropdown', '.el-popover__reference',
+      '.data-source-icon', '[class*="data-source-icon"]',
+      '.action-icon-wrapper', '[class*="action-icon"]',
+    ].join(','));
+    if (!host || host.hasAttribute?.('disabled') || host.getAttribute?.('aria-disabled') === 'true') return false;
+    const rect = host.getBoundingClientRect?.();
+    const viewportArea = window.innerWidth * window.innerHeight;
+    return !rect || viewportArea <= 0 || rect.width * rect.height <= viewportArea * 0.38;
   }
 
   function getRevealDependencyForClick(targetEl, rawEl, inOverlay = false) {
@@ -3100,6 +3616,8 @@
             locator_meta: lastRevealTrigger.locator_meta || null,
           },
           max_wait_ms: 3200,
+          // 新录制的显式 reveal 关系可作为强效果探针；历史步骤未带该字段时只保留观察语义。
+          effect_required: true,
         };
       }
       const ref = buildRevealTriggerRef(treeAction.treeNode, 'hover');
@@ -3114,6 +3632,7 @@
             locator_meta: ref.locator_meta || null,
           },
           max_wait_ms: 4200,
+          effect_required: true,
         };
       }
     }
@@ -3140,6 +3659,7 @@
         locator_meta: lastRevealTrigger.locator_meta || null,
       },
       max_wait_ms: 3200,
+      effect_required: true,
     };
   }
 
@@ -3152,12 +3672,12 @@
       const dedupeKey = `${xp}|${sel}`;
       const now = Date.now();
       if (dedupeKey === lastHoverDedupeKey && now - lastHoverDedupeAt < 550) {
-        rememberRevealTrigger(el, 'hover');
+        rememberRevealTrigger(el, 'hover', clientX, clientY);
         return;
       }
       lastHoverDedupeAt = now;
       lastHoverDedupeKey = dedupeKey;
-      rememberRevealTrigger(el, 'hover');
+      rememberRevealTrigger(el, 'hover', clientX, clientY);
 
       const displayText = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 32);
       const visualEl = resolveVisualHighlightForClick(el);
@@ -3167,9 +3687,10 @@
         target_xpath: xp,
         value: '',
         url: location.href,
-        description: `悬浮 ${el.tagName.toLowerCase()}${displayText ? ': ' + displayText : ''}`,
+        description: `${tr('悬浮', 'Hover')} ${el.tagName.toLowerCase()}${displayText ? ': ' + displayText : ''}`,
         locator_meta: buildSmartLocatorMeta(el, sel, xp, displayText || ''),
       };
+      attachPointerContext(step, el, clientX, clientY, 'hover');
 
       const crop = getThumbCropRect(visualEl);
       const screenshotTask = (async () => {
@@ -3226,7 +3747,7 @@
   }
 
   function scheduleTreeHoverRecord(trigger, event) {
-    const node = trigger?.closest?.('.ant-tree-treenode,.vtree-tree-node__indent-wrapper,.el-tree-node__content,.ivu-tree-title,.arco-tree-node,.n-tree-node,[role="treeitem"]') || trigger;
+    const node = trigger?.closest?.('.ant-tree-treenode,.ec-ant-tree-treenode,[class*="-ant-tree-treenode"],.vtree-tree-node__indent-wrapper,.el-tree-node__content,.ivu-tree-title,.arco-tree-node,.n-tree-node,[role="treeitem"]') || trigger;
     if (!node) return;
     const key = getXPath(node);
     if (!key) return;
@@ -3339,6 +3860,100 @@
     return el;
   }
 
+  function recordedToggleCheckedState(control) {
+    if (!control) return false;
+    const iviewCheckbox = control.closest?.('.ivu-checkbox');
+    if (iviewCheckbox) return iviewCheckbox.classList.contains('ivu-checkbox-checked');
+    return Boolean(control.checked);
+  }
+
+  function isNativeToggleControl(control) {
+    if (!control || control.tagName !== 'INPUT') return false;
+    const kind = String(control.type || '').toLowerCase();
+    return kind === 'checkbox' || kind === 'radio';
+  }
+
+  function rememberNativeToggleStateBeforeActivation(event) {
+    if (!isTrustedRecordingEvent(event)) return;
+    if (!isRecording || isPaused || isRecorderUiEvent(event)) return;
+    const raw = normalizeToElement(event.target);
+    const control = resolveClickTargetForRecording(raw);
+    if (!isNativeToggleControl(control)) return;
+    pendingNativeToggleActivation = {
+      control,
+      checkedBefore: recordedToggleCheckedState(control),
+      at: Date.now(),
+    };
+  }
+
+  function consumeNativeToggleStateBeforeClick(control) {
+    const snapshot = pendingNativeToggleActivation;
+    pendingNativeToggleActivation = null;
+    if (snapshot?.control === control && Date.now() - snapshot.at <= 2000) {
+      return snapshot.checkedBefore;
+    }
+    // 兼容脚本触发、历史页面行为或缺少 pointerdown 的场景。此时无法可靠
+    // 还原 pre-click 状态，仍保留现有的 best-effort 记录，而不是丢弃该步骤。
+    return recordedToggleCheckedState(control);
+  }
+
+  function visibleToggleActivationTarget(raw, control) {
+    if (!raw || !control) return null;
+    const label = raw.closest?.('label');
+    if (label && (label.control === control || label.contains(control))) return label;
+    const labels = control.labels ? Array.from(control.labels) : [];
+    const visibleLabel = labels.find((item) => {
+      if (!item || item.control !== control) return false;
+      const rect = item.getBoundingClientRect();
+      return rect.width > 2 && rect.height > 2;
+    });
+    if (visibleLabel) return visibleLabel;
+    const component = control.closest?.(
+      '.ivu-radio-wrapper, .ant-radio-wrapper, .el-radio, .ivu-checkbox-wrapper, .ant-checkbox-wrapper, .el-checkbox',
+    );
+    if (component) {
+      const rect = component.getBoundingClientRect();
+      if (rect.width > 2 && rect.height > 2) return component;
+    }
+    return control;
+  }
+
+  /**
+   * 原生 checkbox/radio 常只是状态载体，真正接收用户点击的是可见 label 或组件外壳。
+   * 两者分开保存，避免回放把隐藏 input 同时当作定位、点击和效果验证目标。
+   */
+  function attachNativeToggleInteractionContext(step, control, raw) {
+    if (!step || !control || control.tagName !== 'INPUT') return;
+    const kind = String(control.type || '').toLowerCase();
+    if (kind !== 'checkbox' && kind !== 'radio') return;
+    const activation = visibleToggleActivationTarget(raw, control);
+    const checkedBefore = consumeNativeToggleStateBeforeClick(control);
+
+    if (!step.locator_meta || typeof step.locator_meta !== 'object') {
+      step.locator_meta = { version: 1, candidates: [], context: {} };
+    }
+    if (!step.locator_meta.context || typeof step.locator_meta.context !== 'object') {
+      step.locator_meta.context = {};
+    }
+    step.locator_meta.context.activation_target = {
+      type: activation?.tagName === 'LABEL'
+        ? 'label'
+        : activation === control ? 'native_control' : 'component_root',
+      selector: activation ? ensureUniqueSelector(activation, getUniqueSelector(activation)) : '',
+      xpath: activation ? getXPath(activation) : '',
+    };
+    step.locator_meta.context.state_target = {
+      type: 'native_toggle',
+      selector: step.target_selector || '',
+      xpath: step.target_xpath || '',
+    };
+    step.locator_meta.context.toggle = {
+      kind,
+      checked_before: checkedBefore,
+      expected_checked: kind === 'radio' ? true : !checkedBefore,
+    };
+  }
+
   function isSensitivePasswordInput(el) {
     if (!el || el.tagName !== 'INPUT') return false;
     const type = String(el.type || 'text').toLowerCase();
@@ -3367,8 +3982,11 @@
       value_masked: sensitive ? 1 : 0,
       url: location.href,
       description: sensitive
-        ? `输入密码到 ${el.tagName.toLowerCase()}${nameHint}`
-        : `输入 "${String(rawValue || '').slice(0, 50)}" 到 ${isEditable ? 'contenteditable' : el.tagName.toLowerCase()}${nameHint}`,
+        ? tr(`输入密码到 ${el.tagName.toLowerCase()}${nameHint}`, `Enter password into ${el.tagName.toLowerCase()}${nameHint}`)
+        : tr(
+          `输入 "${String(rawValue || '').slice(0, 50)}" 到 ${isEditable ? 'contenteditable' : el.tagName.toLowerCase()}${nameHint}`,
+          `Enter "${String(rawValue || '').slice(0, 50)}" into ${isEditable ? 'contenteditable' : el.tagName.toLowerCase()}${nameHint}`,
+        ),
       locator_meta: buildSmartLocatorMeta(el, targetSelector, targetXpath, sensitive ? '' : rawValue),
     };
   }
@@ -3392,7 +4010,9 @@
       value,
       value_masked: 0,
       url: location.href,
-      description: value ? `输入 "${String(value).slice(0, 50)}" 到 Monaco 编辑器` : '清空 Monaco 编辑器',
+      description: value
+        ? tr(`输入 "${String(value).slice(0, 50)}" 到 Monaco 编辑器`, `Enter "${String(value).slice(0, 50)}" into the Monaco editor`)
+        : tr('清空 Monaco 编辑器', 'Clear the Monaco editor'),
       locator_meta: meta,
     };
   }
@@ -3448,6 +4068,50 @@
     })();
   }
 
+  function sendUploadFileStep(el, selectedFile = null) {
+    const file = selectedFile || el?.files?.[0] || null;
+    if (!el) return;
+    const targetSelector = ensureUniqueSelector(el, getUniqueSelector(el));
+    const targetXpath = getXPath(el);
+    const locatorMeta = buildSmartLocatorMeta(el, targetSelector, targetXpath, '');
+    if (!locatorMeta.context || typeof locatorMeta.context !== 'object') locatorMeta.context = {};
+    locatorMeta.context.upload_file = file
+      ? {
+        name: String(file.name || ''),
+        mime_type: String(file.type || 'application/octet-stream'),
+        byte_size: Number(file.size || 0),
+      }
+      : { name: '', mime_type: '', byte_size: 0 };
+    const step = {
+      action_type: 'upload_file',
+      target_selector: targetSelector,
+      target_xpath: targetXpath,
+      value: '',
+      url: location.href,
+      description: file
+        ? `选择文件 "${String(file.name || '未命名文件').slice(0, 100)}"`
+        : '选择测试文件',
+      locator_meta: locatorMeta,
+    };
+    const visualEl = resolveVisualHighlightForFormControl(el);
+    const crop = getThumbCropRect(visualEl);
+    const rect = visualEl.getBoundingClientRect();
+    void (async () => {
+      try {
+        const thumb = await captureStepThumbnail(visualEl, step);
+        if (thumb) {
+          step.screenshot = thumb;
+          if (crop) {
+            step.screenshot_focus = focusInCrop(crop, rect.left + rect.width / 2, rect.top + rect.height / 2);
+            const focusRect = focusRectInCrop(crop, visualEl, 4);
+            if (focusRect) step.screenshot_focus_rect = focusRect;
+          }
+        }
+      } catch (e) { /* ignore screenshot failures */ }
+      sendStep(step);
+    })();
+  }
+
   function flushPendingInputFor(el) {
     if (!pendingInputEl) return false;
     if (el && pendingInputEl !== el) return false;
@@ -3499,6 +4163,10 @@
     if (!isRecording || isPaused) return;
     if (isRecorderUiEvent(event)) return;
     const el = event.target;
+    if (el?.tagName === 'INPUT' && String(el.type || '').toLowerCase() === 'file') {
+      sendUploadFileStep(el);
+      return;
+    }
     if (!el || el.tagName !== 'SELECT') return;
     const targetSelector = ensureUniqueSelector(el, getUniqueSelector(el));
     const targetXpath = getXPath(el);
@@ -3509,7 +4177,10 @@
       value: el.value,
       value_text: el.options[el.selectedIndex]?.text || '',
       url: location.href,
-      description: `选择 "${el.options[el.selectedIndex]?.text}" 从 select`,
+      description: tr(
+        `选择 "${el.options[el.selectedIndex]?.text}" 从 select`,
+        `Select "${el.options[el.selectedIndex]?.text}" from select`,
+      ),
       locator_meta: buildSmartLocatorMeta(el, targetSelector, targetXpath, el.value),
     };
     const visualEl = resolveVisualHighlightForFormControl(el);
@@ -3537,6 +4208,10 @@
     if (isRecorderUiEvent(event)) return;
     if (event.isComposing) return;
     const el = event.target;
+    // Space 是原生 checkbox/radio 的键盘激活动作；在默认行为翻转状态前缓存。
+    if (event.key === ' ' || event.key === 'Spacebar' || event.key === 'Enter') {
+      rememberNativeToggleStateBeforeActivation(event);
+    }
     const monacoRoot = getMonacoEditorRoot(el);
     if (monacoRoot) {
       const k = String(event.key || '');
@@ -3572,7 +4247,7 @@
       target_xpath: targetXpath,
       value: k,
       url: location.href,
-      description: `按键 ${k}`,
+      description: tr(`按键 ${k}`, `Press ${k}`),
       locator_meta: buildSmartLocatorMeta(el, targetSelector, targetXpath, k),
     };
     const visualEl = resolveVisualHighlightForFormControl(el);
@@ -3611,7 +4286,7 @@
     if (highlightEl?.closest && !highlightEl.closest('#__at_toolbar__')) {
       highlightEl.classList.add('__at_hover__');
     }
-    handleHoverRecord(event);
+    if (!hoverCaptureMode) handleHoverRecord(event);
   }
 
   // =========================================================
@@ -3716,9 +4391,10 @@
     const blinkStyle = document.createElement('style');
     blinkStyle.textContent = `
       @keyframes at-pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.45;transform:scale(.78)} }
+      @keyframes at-spin { to { transform:rotate(360deg); } }
       #__at_toolbar__, #__at_toolbar__ * { box-sizing:border-box; letter-spacing:0 !important; }
       #__at_toolbar__ {
-        position:fixed; z-index:2147483647; width:260px; color:#f8fafc;
+        position:fixed; z-index:2147483647; width:min(320px,calc(100vw - 16px)); color:#f8fafc;
         border:1px solid rgba(148,163,184,.26); border-radius:12px;
         background:rgba(15,23,42,.94); box-shadow:0 18px 48px rgba(15,23,42,.32);
         font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
@@ -3744,21 +4420,27 @@
         padding:8px 10px; color:#cbd5e1; font-size:12px; line-height:1.2;
       }
       #__at_step_count__ b { color:#fff; font-size:18px; line-height:1; font-weight:780; }
-      .__at_btn_grid__ { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+      .__at_btn_grid__ { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+      #__at_hover_btn__ { grid-column:1 / -1; }
       .__at_btn_row__ { display:grid; grid-template-columns:1fr; gap:8px; }
       .__at_btn__ {
         min-height:36px; border:1px solid rgba(148,163,184,.24); border-radius:9px;
         background:rgba(30,41,59,.82); color:#f8fafc; cursor:pointer; pointer-events:auto;
         display:flex; align-items:center; justify-content:center; gap:6px;
-        font-size:12px; line-height:1; font-weight:720; padding:0 6px;
-        white-space:nowrap; overflow:hidden;
+        font-size:12px; line-height:1.2; font-weight:720; padding:7px 8px;
+        white-space:normal; overflow:visible; text-align:center;
       }
-      .__at_btn__ span { white-space:nowrap; flex:none; }
+      .__at_btn__ span { white-space:normal; overflow-wrap:anywhere; }
       .__at_btn__:hover { background:rgba(51,65,85,.92); border-color:rgba(203,213,225,.34); }
       .__at_btn__:disabled { cursor:not-allowed; opacity:.58; }
       .__at_btn__.__at_active__ { background:#1d4ed8; border-color:#60a5fa; color:#fff; }
       .__at_btn_primary__ { width:100%; background:#f97316; border-color:#fb923c; color:#fff; }
       .__at_btn_primary__:hover { background:#ea580c; border-color:#fdba74; }
+      .__at_btn_primary__.__at_saving__ { opacity:1; cursor:wait; }
+      .__at_btn_primary__.__at_saving__::before {
+        content:''; width:13px; height:13px; flex:none; border:2px solid rgba(255,255,255,.42);
+        border-top-color:#fff; border-radius:999px; animation:at-spin .75s linear infinite;
+      }
       .__at_btn_danger__ { width:100%; background:transparent; color:#cbd5e1; border-color:rgba(148,163,184,.22); }
       #__at_variable_dialog__, #__at_variable_dialog__ *,
       #__at_assertion_dialog__, #__at_assertion_dialog__ * { box-sizing:border-box; letter-spacing:0 !important; }
@@ -3850,24 +4532,25 @@
     toolbar._atBlinkStyleEl = blinkStyle;
     toolbar.id = '__at_toolbar__';
     toolbar.innerHTML = `
-        <div id="__at_toolbar_drag__" title="拖动移动">
+        <div id="__at_toolbar_drag__" title="${escapeHtml(tr('拖动移动', 'Drag to move'))}">
           <span class="__at_status_dot__"></span>
           <div class="__at_title_stack__">
-            <strong>录制中</strong>
+            <strong>${escapeHtml(tr('录制中', 'Recording'))}</strong>
           </div>
           <span class="__at_drag_mark__">⠿</span>
         </div>
         <div class="__at_toolbar_body__">
-          <div id="__at_step_count__"><span>已捕获步骤</span><b>0</b></div>
+          <div id="__at_step_count__"><span>${escapeHtml(tr('已捕获步骤', 'Captured steps'))}</span><b>0</b></div>
           <div class="__at_btn_row__">
-            <button id="__at_pause_btn__" class="__at_btn__" type="button"><span class="__at_btn_label__">暂停</span></button>
+            <button id="__at_pause_btn__" class="__at_btn__" type="button"><span class="__at_btn_label__">${escapeHtml(tr('暂停', 'Pause'))}</span></button>
           </div>
           <div class="__at_btn_grid__">
-            <button id="__at_save_var_btn__" class="__at_btn__" type="button"><span class="__at_btn_label__">保存变量</span></button>
-            <button id="__at_add_assert_btn__" class="__at_btn__" type="button"><span class="__at_btn_label__">添加断言</span></button>
+            <button id="__at_save_var_btn__" class="__at_btn__" type="button"><span class="__at_btn_label__">${escapeHtml(tr('保存变量', 'Save variable'))}</span></button>
+            <button id="__at_add_assert_btn__" class="__at_btn__" type="button"><span class="__at_btn_label__">${escapeHtml(tr('添加断言', 'Add assertion'))}</span></button>
+            <button id="__at_hover_btn__" class="__at_btn__" type="button"><span class="__at_btn_label__">${escapeHtml(tr('记录悬浮', 'Record hover'))}</span></button>
           </div>
-          <button id="__at_stop_btn__" class="__at_btn__ __at_btn_primary__" type="button">停止并保存</button>
-          <button id="__at_cancel_btn__" class="__at_btn__ __at_btn_danger__" type="button">取消录制</button>
+          <button id="__at_stop_btn__" class="__at_btn__ __at_btn_primary__" type="button">${escapeHtml(tr('停止并保存', 'Stop and save'))}</button>
+          <button id="__at_cancel_btn__" class="__at_btn__ __at_btn_danger__" type="button">${escapeHtml(tr('取消录制', 'Cancel recording'))}</button>
         </div>
     `;
 
@@ -3889,6 +4572,7 @@
     const pauseBtn = document.getElementById('__at_pause_btn__');
     const saveVarBtn = document.getElementById('__at_save_var_btn__');
     const addAssertBtn = document.getElementById('__at_add_assert_btn__');
+    const hoverBtn = document.getElementById('__at_hover_btn__');
     pauseBtn.addEventListener('click', () => {
       setPaused(!isPaused);
     });
@@ -3904,18 +4588,30 @@
       clearPendingClickStep();
       setAssertionCaptureMode(!assertionCaptureMode);
     });
+    hoverBtn.addEventListener('click', () => {
+      if (isPaused) return;
+      flushPendingInputFor();
+      clearPendingClickStep();
+      setHoverCaptureMode(!hoverCaptureMode);
+    });
     stopBtn.addEventListener('click', () => {
       stopBtn.disabled = true;
+      stopBtn.classList.add('__at_saving__');
+      stopBtn.textContent = tr('正在保存…', 'Saving...');
       if (cancelBtn) cancelBtn.disabled = true;
       if (pauseBtn) pauseBtn.disabled = true;
       if (saveVarBtn) saveVarBtn.disabled = true;
       if (addAssertBtn) addAssertBtn.disabled = true;
+      if (hoverBtn) hoverBtn.disabled = true;
       armToolbarActionTimeout();
       const sendStop = (retried = false) => {
         chrome.runtime.sendMessage({ type: 'AT_STOP_RECORDING' }, (response) => {
           if (chrome.runtime.lastError || response?.ok === false) {
             retryAfterHeartbeat(retried, sendStop, resetToolbarButtons);
+            return;
           }
+          clearToolbarActionTimer();
+          removeToolbar();
         });
       };
       sendStop(false);
@@ -3926,6 +4622,7 @@
       if (pauseBtn) pauseBtn.disabled = true;
       if (saveVarBtn) saveVarBtn.disabled = true;
       if (addAssertBtn) addAssertBtn.disabled = true;
+      if (hoverBtn) hoverBtn.disabled = true;
       armToolbarActionTimeout();
       const sendCancel = (retried = false) => {
         chrome.runtime.sendMessage({ type: 'AT_CANCEL_RECORDING' }, (response) => {
@@ -3941,6 +4638,7 @@
   function removeToolbar() {
     closeVariableDialog();
     closeAssertionDialog();
+    setHoverCaptureMode(false);
     const el = document.getElementById('__at_toolbar__');
     if (el?._atBlinkStyleEl?.parentNode) {
       el._atBlinkStyleEl.remove();
@@ -3955,7 +4653,7 @@
     const el = document.getElementById('__at_step_count__');
     const num = el?.querySelector?.('b');
     if (num) num.textContent = String(count);
-    else if (el) el.textContent = `已捕获: ${count} 步`;
+    else if (el) el.textContent = tr(`已捕获: ${count} 步`, `Captured: ${count} steps`);
   }
 
   function setPaused(paused) {
@@ -3968,6 +4666,7 @@
     if (isPaused) {
       setVariableCaptureMode(false);
       setAssertionCaptureMode(false);
+      setHoverCaptureMode(false);
       flushPendingInputFor();
       clearPendingClickStep();
       clearPendingTreeHover();
@@ -3981,11 +4680,11 @@
     const dragTitle = document.querySelector('#__at_toolbar_drag__ strong');
     if (pauseBtn) {
       const label = pauseBtn.querySelector('.__at_btn_label__');
-      if (label) label.textContent = isPaused ? '继续' : '暂停';
+      if (label) label.textContent = isPaused ? tr('继续', 'Resume') : tr('暂停', 'Pause');
       pauseBtn.classList.toggle('__at_active__', isPaused);
     }
     if (dragTitle) {
-      dragTitle.textContent = isPaused ? '录制已暂停' : '录制中';
+      dragTitle.textContent = isPaused ? tr('录制已暂停', 'Recording paused') : tr('录制中', 'Recording');
     }
   }
 
@@ -3995,14 +4694,17 @@
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'AT_START_RECORDING') {
       isRecording = true;
+      currentLocale = normalizeLocale(message.locale || chrome.i18n?.getUILanguage?.());
       recordedVariableNames.clear();
       closeVariableDialog();
       closeAssertionDialog();
       setVariableCaptureMode(false);
       setAssertionCaptureMode(false);
+      setHoverCaptureMode(false);
       screenshotMode = String(message.screenshotMode || '').trim().toLowerCase() === 'full_hd' ? 'full_hd' : 'standard';
       lastToggleDedupeAt = 0;
       lastToggleDedupeKey = '';
+      pendingNativeToggleActivation = null;
       lastHoverDedupeAt = 0;
       lastHoverDedupeKey = '';
       createToolbar();
@@ -4010,6 +4712,7 @@
       startHeartbeat();
       installNavigationFlushHooks();
       document.addEventListener('click', handleClick, true);
+      document.addEventListener('pointerdown', rememberNativeToggleStateBeforeActivation, true);
       document.addEventListener('dblclick', handleDoubleClick, true);
       document.addEventListener('contextmenu', handleContextMenu, true);
       document.addEventListener('input', handleInput, true);
@@ -4033,11 +4736,14 @@
       closeAssertionDialog();
       setVariableCaptureMode(false);
       setAssertionCaptureMode(false);
+      setHoverCaptureMode(false);
       flushPendingInputFor();
       clearPendingClickStep();
+      pendingNativeToggleActivation = null;
       clearPendingTreeHover();
       clearPendingHoverStep();
       document.removeEventListener('click', handleClick, true);
+      document.removeEventListener('pointerdown', rememberNativeToggleStateBeforeActivation, true);
       document.removeEventListener('dblclick', handleDoubleClick, true);
       document.removeEventListener('contextmenu', handleContextMenu, true);
       document.removeEventListener('input', handleInput, true);
@@ -4051,15 +4757,15 @@
       const stopBtn = document.getElementById('__at_stop_btn__');
       const cancelBtn = document.getElementById('__at_cancel_btn__');
       const pauseBtn = document.getElementById('__at_pause_btn__');
+      const hoverBtn = document.getElementById('__at_hover_btn__');
       if (stopBtn) {
         stopBtn.disabled = true;
-        stopBtn.textContent = '正在保存…';
+        stopBtn.classList.add('__at_saving__');
+        stopBtn.textContent = tr('正在保存…', 'Saving...');
       }
       if (cancelBtn) cancelBtn.disabled = true;
       if (pauseBtn) pauseBtn.disabled = true;
-      setTimeout(() => {
-        removeToolbar();
-      }, 450);
+      if (hoverBtn) hoverBtn.disabled = true;
       sendResponse({ ok: true });
     }
 
@@ -4073,13 +4779,16 @@
       closeAssertionDialog();
       setVariableCaptureMode(false);
       setAssertionCaptureMode(false);
+      setHoverCaptureMode(false);
       clearTimeout(inputTimer);
       inputTimer = null;
       pendingInputEl = null;
       clearPendingClickStep();
+      pendingNativeToggleActivation = null;
       clearPendingTreeHover();
       clearPendingHoverStep();
       document.removeEventListener('click', handleClick, true);
+      document.removeEventListener('pointerdown', rememberNativeToggleStateBeforeActivation, true);
       document.removeEventListener('dblclick', handleDoubleClick, true);
       document.removeEventListener('contextmenu', handleContextMenu, true);
       document.removeEventListener('input', handleInput, true);
@@ -4096,7 +4805,7 @@
       if (stopBtn2) stopBtn2.disabled = true;
       if (cancelBtn2) {
         cancelBtn2.disabled = true;
-        cancelBtn2.textContent = '已取消';
+        cancelBtn2.textContent = tr('已取消', 'Cancelled');
       }
       if (pauseBtn2) pauseBtn2.disabled = true;
       setTimeout(() => {

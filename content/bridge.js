@@ -7,6 +7,13 @@
 (function () {
   'use strict';
 
+  function isTrustedPlatformLocation() {
+    return window.location.protocol === 'http:' || window.location.protocol === 'https:';
+  }
+
+  // 本地 Hosts 调试使用正式域名的 HTTP 入口；其他站点不注册
+  // bridge，也不会接收或转发任何中台消息。
+  if (!isTrustedPlatformLocation()) return;
   if (window.__CC_BRIDGE_INSTALLED__) return;
   window.__CC_BRIDGE_INSTALLED__ = true;
 
@@ -43,20 +50,64 @@
   window.addEventListener('message', (event) => {
     if (invalidated) return;
     if (event.source !== window) return;
+    if (event.origin !== window.location.origin || !isTrustedPlatformLocation()) return;
     const data = event.data;
     if (!data || !data.type) return;
 
     if (data.type === 'AT_PLATFORM_PING') {
-      safeSend({ type: 'AT_PLATFORM_PING', nonce: data.nonce }, (response) => {
+      // A browser profile may keep domestic, overseas and local CueCast tabs
+      // open together. Only the visible platform tab may select the Runner's
+      // API/auth context; hidden tabs still report that the extension exists.
+      if (document.visibilityState === 'hidden') {
+        window.postMessage(
+          {
+            type: 'AT_PLATFORM_PONG',
+            nonce: data.nonce,
+            ok: true,
+            runnerReady: false,
+          },
+          '*',
+        );
+        return;
+      }
+      // A successful platform ping also establishes the authenticated
+      // extension Runner. Keep this on the trusted platform origin only.
+      let organizationUuid = '';
+      try { organizationUuid = String(JSON.parse(localStorage.getItem('cc_auth_user') || '{}').organization_uuid || ''); }
+      catch { /* Older or incomplete page session. */ }
+      safeSend({
+        type: 'AT_PLATFORM_PING',
+        nonce: data.nonce,
+        apiBase: `${window.location.origin}/api`,
+        authToken: localStorage.getItem('cc_auth_token') || '',
+        organizationUuid,
+      }, (response) => {
         window.postMessage(
           {
             type: 'AT_PLATFORM_PONG',
             nonce: data.nonce,
             ok: response?.ok !== false,
             version: response?.version,
+            runnerReady: response?.runnerReady === true,
+            runnerId: response?.runnerId || '',
+            runnerError: response?.runnerError || '',
           },
           '*',
         );
+      });
+      return;
+    }
+
+    if (data.type === 'AT_PLATFORM_FOCUS_RUN') {
+      safeSend({ type: 'AT_PLATFORM_FOCUS_RUN', runId: data.runId }, (response) => {
+        window.postMessage({ type: 'AT_PLATFORM_ACK', original: data.type, response }, '*');
+      });
+      return;
+    }
+
+    if (data.type === 'AT_PLATFORM_STOP_RUN') {
+      safeSend({ type: 'AT_PLATFORM_STOP_RUN', runId: data.runId }, (response) => {
+        window.postMessage({ type: 'AT_PLATFORM_ACK', original: data.type, response }, '*');
       });
       return;
     }
@@ -66,7 +117,14 @@
         { type: 'AT_PLATFORM_FOCUS_PLAY_TAB', testCaseId: data.testCaseId },
         (response) => {
           window.postMessage(
-            { type: 'AT_PLATFORM_ACK', original: data.type, nonce: data.nonce, response, testCaseId: data.testCaseId },
+            {
+              type: 'AT_PLATFORM_ACK',
+              original: data.type,
+              nonce: data.nonce,
+              requestId: data.requestId || '',
+              response,
+              testCaseId: data.testCaseId,
+            },
             '*',
           );
         },
@@ -91,12 +149,22 @@
       || data.type === 'AT_PLATFORM_END_PLAYBACK_BATCH'
       || data.type === 'AT_PLATFORM_ABORT_PLAYBACK_BATCH'
       || data.type === 'AT_PLATFORM_CHECK_SELECTOR'
+      || data.type === 'AT_PLATFORM_OPEN_EXTENSION_SETTINGS'
+      || data.type === 'AT_PLATFORM_CLOSE_INCOGNITO_WINDOWS'
     ) {
       // 统一在此注入 auth token，前端和 background 均无需感知 token 来源
       const authToken = localStorage.getItem('cc_auth_token') || '';
       safeSend({ ...data, authToken }, (response) => {
         window.postMessage(
-          { type: 'AT_PLATFORM_ACK', original: data.type, nonce: data.nonce, response, testCaseId: data.testCaseId, purpose: data.purpose || '' },
+          {
+            type: 'AT_PLATFORM_ACK',
+            original: data.type,
+            nonce: data.nonce,
+            response,
+            testCaseId: data.testCaseId,
+            purpose: data.purpose || '',
+            requestId: data.requestId || '',
+          },
           '*',
         );
       });

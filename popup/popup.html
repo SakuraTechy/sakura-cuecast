@@ -4,9 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CueCast</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
@@ -15,15 +12,15 @@
       <img src="logo.png" alt="CueCast Logo" class="logo-img" width="36" height="36" />
       <div class="brand-copy">
         <h1>CueCast</h1>
-        <p>Chrome Extension</p>
+        <p data-i18n="popupSubtitle">Chrome Extension</p>
       </div>
     </header>
 
     <section class="card">
-      <p class="intro">Record and replay codeless test steps on real web pages, powered by CueCast.</p>
+      <p class="intro" data-i18n="popupIntro">Record and replay codeless test steps on real web pages, powered by CueCast.</p>
       <ul class="points">
-        <li>Create and manage test cases in CueCast dashboard</li>
-        <li>Record, replay, and review results on target pages</li>
+        <li data-i18n="popupPointManage">Create and manage test cases in the CueCast dashboard</li>
+        <li data-i18n="popupPointRun">Record, replay, and review results on target pages</li>
       </ul>
     </section>
 
@@ -37,7 +34,13 @@
     </section>
 
     <section class="actions">
-      <button type="button" class="btn-primary" id="openDashboard">打开控制台</button>
+      <label class="field-label" for="platformUrl" data-i18n="popupInstanceAddress">CueCast Instance URL</label>
+      <div class="address-row">
+        <input id="platformUrl" class="address-input" type="text" inputmode="url" placeholder="http://192.168.1.10:31790" />
+        <button type="button" class="btn-secondary" id="savePlatform" data-i18n="popupSave">Save</button>
+      </div>
+      <p class="hint" id="platformStatus" data-i18n="popupInstanceHint">You can start with an IP address and change it to a domain later.</p>
+      <button type="button" class="btn-primary" id="openDashboard" data-i18n="popupOpenDashboard">Open Dashboard</button>
     </section>
   </div>
 

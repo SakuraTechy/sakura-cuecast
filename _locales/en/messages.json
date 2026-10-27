@@ -1,0 +1,42 @@
+{
+  "extensionName": {
+    "message": "CueCast – Codeless Web Test Automation",
+    "description": "Extension name shown in Chrome and the Chrome Web Store."
+  },
+  "extensionDescription": {
+    "message": "Record and replay web UI test cases on real pages without writing test scripts.",
+    "description": "Short extension summary."
+  },
+  "extensionTitle": {
+    "message": "CueCast"
+  },
+  "popupSubtitle": {
+    "message": "Chrome Extension"
+  },
+  "popupIntro": {
+    "message": "Record and replay codeless test steps on real web pages, powered by CueCast."
+  },
+  "popupPointManage": {
+    "message": "Create and manage test cases in the CueCast dashboard"
+  },
+  "popupPointRun": {
+    "message": "Record, replay, and review results on target pages"
+  },
+  "popupOpenDashboard": {
+    "message": "Open Dashboard"
+  },
+  "popupInstanceAddress": { "message": "CueCast Instance URL" },
+  "popupSave": { "message": "Save" },
+  "popupInstanceHint": { "message": "You can start with an IP address and change it to a domain later." },
+  "popupEnterAddress": { "message": "Enter a CueCast instance URL" },
+  "popupHttpOnly": { "message": "Only HTTP/HTTPS URLs are supported" },
+  "popupInvalidInstance": { "message": "This is not a recognizable CueCast instance" },
+  "popupConnecting": { "message": "Connecting and verifying…" },
+  "popupConnected": {
+    "message": "Connected: $ORIGIN$",
+    "placeholders": { "origin": { "content": "$1" } }
+  },
+  "popupDifferentInstance": { "message": "The new URL belongs to another CueCast instance. Switch anyway?" },
+  "popupTimeout": { "message": "Connection timed out. Check the URL and network." },
+  "popupConnectionFailed": { "message": "Connection failed" }
+}

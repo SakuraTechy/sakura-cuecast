@@ -60,7 +60,7 @@ function unwrapInfrastructureTask(response) {
 
 function normalizeLocale(locale) {
   const raw = String(locale || '').trim().toLowerCase();
-  return raw.startsWith('en') ? 'en' : 'zh';
+  return raw.startsWith('zh') ? 'zh' : 'en';
 }
 
 function trByLocale(locale, zh, en) {
@@ -107,6 +107,7 @@ function localizePlaybackError(locale, message) {
   if (normalizeLocale(locale) !== 'en' || !msg) return msg;
   let out = msg;
   const replacements = [
+    [/请求超时（(\d+)ms）/g, 'Request timed out after $1ms'],
     [/页面出现错误提示，已中止回放：/g, 'Page error detected, playback stopped: '],
     [/\[页面错误提示\]/g, '[Page Error Toast]'],
     [/摘录：/g, 'Snippet: '],
@@ -116,8 +117,9 @@ function localizePlaybackError(locale, message) {
     [/起始页为浏览器内置协议，无法注入回放脚本：/g, 'Start page uses browser internal protocol and playback script cannot be injected: '],
     [/请改为 http\(s\) 页面。/g, 'Please switch to an http(s) page.'],
     [/无法向当前页注入回放脚本（受限 URL 或第三方扩展页面）：/g, 'Cannot inject playback script into current page (restricted URL or third-party extension page): '],
-    [/找不到元素（等待超时；全页 loading 时计时会暂停）/g, 'Element not found (wait timed out; timer pauses while full-page loading is active)'],
-    [/在下拉框中找不到选项 "([^"]+)"（等待超时；全页 loading 时计时会暂停）/g, 'Option "$1" not found in dropdown (wait timed out; timer pauses while full-page loading is active)'],
+    [/找不到元素（等待超时；单步定位预算为 15 秒）/g, 'Element not found (wait timed out; step locator budget is 15 seconds)'],
+    [/页面加载未结束（单步加载等待上限为 (\d+) 秒）/g, 'Page is still loading (step loading wait limit: $1 seconds)'],
+    [/在下拉框中找不到选项 "([^"]+)"（等待超时；单步定位预算为 15 秒）/g, 'Option "$1" not found in dropdown (wait timed out; step locator budget is 15 seconds)'],
     [/下拉框中实际选项（前30条）/g, 'Actual options in dropdown (top 30)'],
     [/下拉框中未找到任何选项（可能仍在加载，或下拉框未成功打开）/g, 'No options found in dropdown (it may still be loading, or the dropdown did not open)'],
     [/断言失败：未配置断言文本（「输入值」不能为空或仅空白）/g, 'Assertion failed: expected text is not configured (input value cannot be empty or whitespace only)'],
@@ -168,6 +170,8 @@ function localizePlaybackError(locale, message) {
     [/未采集到可交互节点，请确认页面已加载完成/g, 'No interactive nodes collected, ensure page is fully loaded'],
     [/大模型未返回可执行操作：/g, 'Model returned no executable operations: '],
     [/大模型返回了无效节点 id:/g, 'Model returned an invalid node id:'],
+    [/切换标签页失败：未找到标签页/g, 'Tab switch failed: target tab not found'],
+    [/前一步可能没有打开录制时的新标签页，请检查前一步点击是否真正触发了新页或当前页跳转。/g, 'The previous step may not have opened the recorded new tab. Check whether that click actually triggered a new tab or current-page navigation.'],
   ];
   for (const [pattern, replacement] of replacements) {
     out = out.replace(pattern, replacement);
@@ -175,10 +179,25 @@ function localizePlaybackError(locale, message) {
   return out;
 }
 
+import { inspectIncognitoAvailability } from './incognito.js';
+import { PlaybackPerfTrace, PLAYBACK_PERF_ENABLED_KEY, PLAYBACK_PERF_LAST_KEY } from './playback-perf.js';
+import { ensurePlaybackWindowMaximized } from './playback-window.js';
+
 const MAX_CONCURRENT_PLAYS = 5;
-const DEFAULT_TAB_LOAD_TIMEOUT_MS = 30000;
+const DEFAULT_TAB_LOAD_TIMEOUT_MS = 60000;
 const RECORD_CONTEXT_PREPARE_TIMEOUT_MS = 45000;
+const PREPARED_INCOGNITO_WINDOW_TIMEOUT_MS = 90000;
+const INCOGNITO_ACTIVE_WINDOWS_STORAGE_KEY = 'cc-active-incognito-playback-windows-v1';
+const PREPARED_INCOGNITO_WINDOWS_STORAGE_KEY = 'cc-prepared-incognito-windows-v1';
+const PREPARED_INCOGNITO_ALARM_PREFIX = 'cc-prepared-incognito-window:';
+// 纯观察类步骤不改变页面，无需在每步执行前把回放标签页带回前台
+const OBSERVATION_STEP_TYPES = new Set(['wait', 'assert_text', 'assert_json', 'set_variable', 'switch_context']);
 const CDP_COMMAND_TIMEOUT_MS = 20000;
+// Set to false in extension storage to test the browser's native hidden-tab behavior.
+const PAGE_VISIBILITY_EMULATION_ENABLED_KEY = 'cuecastPlaybackVisiblePageEnabled';
+const RUNTIME_DIAGNOSTIC_HISTORY_MS = 30000;
+const RUNTIME_DIAGNOSTIC_FAILURE_FOLLOWUP_MS = 1000;
+const RUNTIME_DIAGNOSTIC_NETWORK_TYPES = new Set(['XHR', 'Fetch', 'Document']);
 const VIEWPORT_MODES = new Set(['maximized', 'current', 'custom']);
 const DEFAULT_VIEWPORT_WIDTH = 1920;
 const DEFAULT_VIEWPORT_HEIGHT = 1080;
@@ -229,8 +248,9 @@ async function resolveWindowPreference(input = {}) {
   return { mode: 'maximized' };
 }
 
-function buildWindowCreateData(url, focused, preference) {
+function buildWindowCreateData(url, focused, preference, options = {}) {
   const data = { url, focused };
+  if (options.incognito === true) data.incognito = true;
   if (preference?.mode === 'custom' || preference?.mode === 'current') {
     data.state = 'normal';
     data.width = preference.width;
@@ -239,7 +259,9 @@ function buildWindowCreateData(url, focused, preference) {
     if (preference.top != null) data.top = preference.top;
     return data;
   }
-  data.state = 'maximized';
+  // Chrome rejects an unfocused window with state=maximized on some desktop
+  // builds. Create it normally, then apply the requested size without focus.
+  data.state = focused ? 'maximized' : 'normal';
   return data;
 }
 
@@ -252,11 +274,10 @@ async function applyWindowPreference(windowId, preference) {
       height: preference.height,
       ...(preference.left != null ? { left: preference.left } : {}),
       ...(preference.top != null ? { top: preference.top } : {}),
-      focused: true,
     }).catch(() => {});
     return;
   }
-  await chrome.windows.update(windowId, { state: 'maximized', focused: true }).catch(() => {});
+  await ensurePlaybackWindowMaximized(windowId);
 }
 
 /**
@@ -367,6 +388,78 @@ function normalizeStopAfterStepIndex(value, stepCount) {
   return n;
 }
 
+// Runs in the page's main world so framework listeners observe the native input/change events.
+// Keep this function self-contained: chrome.scripting serializes it without module scope.
+export function assignPlaybackFileToInput(selector, xpath, name, mimeType, base64) {
+  try {
+    const asFileInput = (node) => {
+      if (!node) return null;
+      if (String(node.tagName || '').toLowerCase() === 'input' && String(node.type || '').toLowerCase() === 'file') {
+        return node;
+      }
+      try { return node.querySelector?.('input[type="file"]') || null; } catch { return null; }
+    };
+    const bySelector = (value, root = document) => {
+      if (!value) return null;
+      try { return asFileInput(root.querySelector(value)); } catch { return null; }
+    };
+    let input = bySelector(selector);
+    if (!input && xpath) {
+      try {
+        input = asFileInput(document.evaluate(
+          xpath,
+          document,
+          null,
+          XPathResult.FIRST_ORDERED_NODE_TYPE,
+          null,
+        ).singleNodeValue);
+      } catch { /* invalid XPath */ }
+    }
+    if (!input) return { ok: false, code: 'file_input_not_found', error: '未找到可上传文件的 input 元素' };
+    if (typeof globalThis.File !== 'function') {
+      return { ok: false, code: 'file_api_unavailable', error: '当前页面不支持 File API' };
+    }
+    if (typeof globalThis.DataTransfer !== 'function') {
+      return { ok: false, code: 'data_transfer_unavailable', error: '当前页面不支持 DataTransfer API' };
+    }
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    const playbackFile = new File([bytes], String(name || 'test-file'), {
+      type: mimeType || 'application/octet-stream',
+    });
+    const transfer = new DataTransfer();
+    transfer.items.add(playbackFile);
+    let owner = input;
+    let descriptor = null;
+    while (owner && !descriptor) {
+      descriptor = Object.getOwnPropertyDescriptor(owner, 'files') || null;
+      owner = Object.getPrototypeOf(owner);
+    }
+    if (!descriptor?.set) {
+      return { ok: false, code: 'files_setter_unavailable', error: '上传控件不支持写入 files' };
+    }
+    descriptor.set.call(input, transfer.files);
+    const assigned = input.files;
+    if (!assigned || assigned.length !== 1 || String(assigned[0]?.name || '') !== String(name || '')) {
+      return { ok: false, code: 'file_assignment_rejected', error: '测试文件未写入上传控件' };
+    }
+    // Some upload components clear the native input synchronously in their change handler.
+    // FileList is live, so preserve the verified result before dispatching page events.
+    const assignedName = String(assigned[0].name || '');
+    const assignedCount = assigned.length;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return { ok: true, fileName: assignedName, fileCount: assignedCount };
+  } catch (error) {
+    return {
+      ok: false,
+      code: 'file_injection_exception',
+      error: String(error?.message || error || '未知错误'),
+    };
+  }
+}
+
 export class PlayerManager {
   constructor(state, api) {
     this.state = state;
@@ -397,6 +490,63 @@ export class PlayerManager {
         }
       });
     }
+    this._incognitoPlayActive = false;
+    this._perfStepByTab = new Map();
+    this._perfTraceByTab = new Map();
+    this._locatorDeadlineByTab = new Map();
+    // 只保留失败诊断需要的最小 CDP 事件，不采集请求体、响应体、请求头或 console 参数。
+    this._cdpDiagnosticsByTab = new Map();
+    this._onDebuggerEvent = (source, method, params) => {
+      this._recordCdpDiagnosticEvent(source, method, params);
+    };
+    chrome.debugger.onEvent.addListener(this._onDebuggerEvent);
+  }
+
+  dispose() {
+    chrome.debugger.onEvent.removeListener(this._onDebuggerEvent);
+  }
+
+  async _executeUploadFileStep(tabId, testCaseId, step) {
+    const stepId = Number(step?.id);
+    if (!Number.isInteger(stepId) || stepId <= 0 || !step?.file_asset?.version_id) {
+      throw new Error('上传文件步骤尚未绑定测试文件，请在中台编辑该步骤后绑定文件');
+    }
+    const file = await this.api.downloadStepFileAsset(testCaseId, stepId);
+    if (!file?.buffer || typeof file.buffer.byteLength !== 'number') {
+      throw new Error('测试文件下载结果无效：缺少文件内容');
+    }
+    const bytes = new Uint8Array(file.buffer);
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    let results;
+    try {
+      results = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: 'MAIN',
+        func: assignPlaybackFileToInput,
+        args: [
+          step.target_selector || '',
+          step.target_xpath || '',
+          file.name,
+          file.mimeType,
+          btoa(binary),
+        ],
+      });
+    } catch (error) {
+      throw new Error(`测试文件注入失败：${String(error?.message || error || '页面脚本执行异常')}`);
+    }
+    const result = results?.[0]?.result;
+    if (result?.ok !== true) {
+      const detail = String(result?.error || results?.[0]?.error?.message || '页面脚本未返回有效结果');
+      throw new Error(`测试文件注入失败：${detail}`);
+    }
+    return {
+      fileName: String(result.fileName || file.name || ''),
+      fileCount: Number(result.fileCount || 0),
+    };
   }
 
   /** 是否为「非本扩展」的 chrome-extension:// 页面（CDP / scripting 均受限） */
@@ -464,7 +614,7 @@ export class PlayerManager {
   }
 
   /**
-   * 页面是否处于常见「接口/表格加载中」UI（iView / Ant / Element 等）。
+   * 页面是否处于常见「接口/表格加载中」UI（iView / Ant / Element / Fusion Next 等）。
    * 与 content/player.js 中 isPageLoadingUi 保持语义一致。
    */
   static PAGE_LOADING_UI_CHECK = `(function(){
@@ -474,6 +624,8 @@ export class PlayerManager {
         '.ivu-spin-fix .ivu-spin-main,.ivu-table-wrapper .ivu-spin-main,.ivu-table-with-loading .ivu-spin,' +
         '.ivu-spin.ivu-spin-fix .ivu-spin-main,.ivu-load-loop,.ant-spin-spinning,.ant-spin-nested-loading .ant-spin,' +
         '.el-loading-mask,.el-loading-spinner,.el-icon-loading,.v-loading-parent--relative .v-loading,' +
+        '.next-loading,.next-loading-mask,.next-loading-inline,.next-loading-fusion-reactor,.next-icon-loading,' +
+        '.next-spin,.next-spin-spinning,.next-spin-dot,.next-spin-icon,' +
         '[data-loading="true"]'
       );
       for (var i = 0; i < nodes.length; i++) {
@@ -488,8 +640,84 @@ export class PlayerManager {
     return false;
   })()`;
 
+  // Developer trace only: identify the matched loading marker and whether the
+  // current step's target exists. Raw selectors stay inside Runtime.evaluate.
+  static _pageLoadingUiStateCheck(selector = '', xpath = '') {
+    return `(function(){
+      var loading = ${PlayerManager.PAGE_LOADING_UI_CHECK};
+      var targetPresent = null;
+      if (${JSON.stringify(!!(selector || xpath))}) {
+        targetPresent = false;
+        var target = null;
+        try { if (${JSON.stringify(!!selector)}) target = document.querySelector(${JSON.stringify(selector)}); } catch (selectorError) {}
+        try {
+          if (!target && ${JSON.stringify(!!xpath)} && document.evaluate) {
+            target = document.evaluate(${JSON.stringify(xpath)}, document, null, 9, null).singleNodeValue;
+          }
+        } catch (xpathError) {}
+        targetPresent = !!target;
+      }
+      var busy = null;
+      var spinner = null;
+      var spinnerKind = 'none';
+      if (loading) try {
+        busy = document.querySelector('[aria-busy="true"]');
+        var groups = [
+          ['ivu_spin', '.ivu-spin-fix .ivu-spin-main,.ivu-table-wrapper .ivu-spin-main,.ivu-table-with-loading .ivu-spin,.ivu-spin.ivu-spin-fix .ivu-spin-main,.ivu-load-loop'],
+          ['ant_spin', '.ant-spin-spinning,.ant-spin-nested-loading .ant-spin'],
+          ['el_loading', '.el-loading-mask,.el-loading-spinner,.el-icon-loading,.v-loading-parent--relative .v-loading'],
+          ['next_loading', '.next-loading,.next-loading-mask,.next-loading-inline,.next-loading-fusion-reactor,.next-icon-loading,.next-spin,.next-spin-spinning,.next-spin-dot,.next-spin-icon'],
+          ['data_loading', '[data-loading="true"]'],
+        ];
+        for (var group of groups) {
+          var nodes = document.querySelectorAll(group[1]);
+          for (var node of nodes) {
+            var rect = node.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) continue;
+            var style = window.getComputedStyle(node);
+            if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) < 0.05) continue;
+            spinner = node;
+            spinnerKind = group[0];
+            break;
+          }
+          if (spinner) break;
+        }
+      } catch (markerError) {}
+      function effectivelyVisible(node) {
+        if (!node) return null;
+        try {
+          var rect = node.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) return false;
+          for (var current = node; current; current = current.parentElement) {
+            var style = window.getComputedStyle(current);
+            if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) < 0.05) return false;
+            if (current.getAttribute && current.getAttribute('aria-hidden') === 'true') return false;
+          }
+          return true;
+        } catch (visibilityError) { return null; }
+      }
+      var marker = busy || spinner;
+      return {
+        loading: loading,
+        loading_marker: !loading ? 'none' : busy ? 'aria_busy' : spinnerKind !== 'none' ? spinnerKind : 'unknown',
+        spinner_marker: spinnerKind,
+        marker_effectively_visible: effectivelyVisible(marker),
+        spinner_effectively_visible: effectivelyVisible(spinner),
+        target_present: targetPresent,
+        visibility_state: document.visibilityState,
+        document_has_focus: document.hasFocus(),
+      };
+    })()`;
+  }
+
   /** 加载态下墙钟上限（秒），防止永不结束 */
-  static LOADING_WAIT_WALL_MS = 180000;
+  static LOADING_WAIT_WALL_MS = 90000;
+
+  /** 同一步的定位共用墙钟上限，避免持续 loading 让多个定位窗口串行等待。 */
+  static STEP_LOCATOR_WALL_MS = 15000;
+
+  /** 点击目标中心点被遮挡时的短重试窗口，覆盖抽屉/浮层/loading 动画。 */
+  static CLICK_COVERED_RETRY_MS = 10000;
 
   /**
    * 命中即中止回放（正文子串匹配，英文不区分大小写）。
@@ -502,6 +730,45 @@ export class PlayerManager {
   ];
 
   static _pageErrorCheckExpr = null;
+
+  /**
+   * 供“失败提示”断言读取的可见反馈组件。它与全局页面错误检测分开：
+   * warning 只在用户显式断言失败提示时参与匹配，不会因此自动中止回放。
+   */
+  static FAILURE_PROMPT_SELECTOR = [
+    '.ivu-message-error', '.ivu-message-warning', '.ivu-notice-error', '.ivu-notice-warning', '.ivu-alert-error', '.ivu-alert-warning',
+    '.el-message--error', '.el-message--warning', '.el-notification--error', '.el-notification--warning', '.el-alert--error', '.el-alert--warning',
+    '.ant-message-error', '.ant-message-warning', '.ant-notification-notice-error', '.ant-notification-notice-warning', '.ant-alert-error', '.ant-alert-warning',
+    '.arco-message-error', '.arco-message-warning', '.arco-notification-notice-error', '.arco-notification-notice-warning', '.arco-alert-error', '.arco-alert-warning',
+    '.t-message--error', '.t-message--warning', '.t-alert--error', '.t-alert--warning',
+    '.alert-danger', '.alert-error', '.alert-warning',
+  ].join(',');
+
+  static _failurePromptTextExpr = null;
+
+  static getFailurePromptTextExpr() {
+    if (!PlayerManager._failurePromptTextExpr) {
+      const selector = JSON.stringify(PlayerManager.FAILURE_PROMPT_SELECTOR);
+      PlayerManager._failurePromptTextExpr = `(function(){
+        try {
+          var seen = new Set();
+          var texts = [];
+          var nodes = document.querySelectorAll(${selector});
+          for (var i = 0; i < nodes.length; i++) {
+            var el = nodes[i];
+            var r = el.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) continue;
+            var st = window.getComputedStyle(el);
+            if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity) < 0.05) continue;
+            var text = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 800);
+            if (text && !seen.has(text)) { seen.add(text); texts.push(text); }
+          }
+          return texts.join('\\n');
+        } catch (e) { return ''; }
+      })()`;
+    }
+    return PlayerManager._failurePromptTextExpr;
+  }
 
   static getPageErrorCheckExpr() {
     if (!PlayerManager._pageErrorCheckExpr) {
@@ -555,11 +822,8 @@ export class PlayerManager {
     });
   }
 
-  /**
-   * 将回放标签页置于前台。仅作 best-effort：部分环境下 windows.update(focused)
-   * 会触发 “Cannot access a chrome-extension:// URL of different extension”，故整体包在 try/catch 中。
-   */
-  async _bringTabToForeground(tabId) {
+  /** Keep the executing tab active inside its window; focus the window only on request. */
+  async _bringTabToForeground(tabId, { focusWindow = false } = {}) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab) return;
     try {
@@ -568,13 +832,22 @@ export class PlayerManager {
       console.warn('[Player] tabs.update(active) 失败:', e?.message || e);
       return;
     }
-    if (tab.windowId != null) {
+    if (focusWindow && tab.windowId != null) {
       try {
         await chrome.windows.update(tab.windowId, { focused: true });
       } catch (e) {
         console.warn('[Player] windows.update(focused) 失败:', e?.message || e);
       }
     }
+  }
+
+  /**
+   * CDP 可向非活动标签页派发事件，但会让执行窗口显示的页面与实际上下文
+   * 脱节。改变页面的步骤先切换窗口内的活动标签页；观察步骤不切换。
+   * 标签页切换不改变系统窗口焦点。
+   */
+  _shouldBringTabToForegroundBeforeStep(actionType) {
+    return !OBSERVATION_STEP_TYPES.has(String(actionType || '').trim().toLowerCase());
   }
 
   async focusPlayTab(testCaseId) {
@@ -587,7 +860,14 @@ export class PlayerManager {
       this._playTabByCaseId.delete(testCaseId);
       return { ok: false, error: '标签页已关闭' };
     }
-    await this._bringTabToForeground(tid);
+    await this._bringTabToForeground(tid, { focusWindow: true });
+    return { ok: true };
+  }
+
+  async focusRun(runId) {
+    const ctx = [...this._playContexts].find((item) => item.runId === String(runId || ''));
+    if (!ctx?.tabId) return { ok: false, error: '当前没有该执行的回放标签页' };
+    await this._bringTabToForeground(ctx.tabId, { focusWindow: true });
     return { ok: true };
   }
 
@@ -634,6 +914,41 @@ export class PlayerManager {
     return live;
   }
 
+  static _ownedPlaybackTabIds(tabs, rootTabId, registeredTabIds = [], ownedWindowId = null) {
+    const owned = new Set();
+    const add = (value) => {
+      if (value == null || value === '') return;
+      const id = Number(value);
+      if (Number.isInteger(id) && id >= 0) owned.add(id);
+    };
+    add(rootTabId);
+    for (const tabId of registeredTabIds) add(tabId);
+    const dedicatedWindowId = ownedWindowId == null || ownedWindowId === '' ? null : Number(ownedWindowId);
+    if (Number.isInteger(dedicatedWindowId)) {
+      for (const tab of Array.isArray(tabs) ? tabs : []) {
+        if (Number(tab?.windowId) === dedicatedWindowId) add(tab?.id);
+      }
+    }
+
+    // A newly opened background tab might never become the active playback
+    // context and therefore never enter tabRegistry. Follow openerTabId
+    // transitively so those descendants are still owned by this playback.
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const tab of Array.isArray(tabs) ? tabs : []) {
+        const id = Number(tab?.id);
+        const openerId = tab?.openerTabId == null ? null : Number(tab.openerTabId);
+        if (!Number.isInteger(id) || owned.has(id)) continue;
+        if (Number.isInteger(openerId) && owned.has(openerId)) {
+          owned.add(id);
+          changed = true;
+        }
+      }
+    }
+    return [...owned];
+  }
+
   async _ensurePlayableTabBeforeStep(ctx, playTabId, actionType, locale = 'zh') {
     const tabId = Number(playTabId);
     if (Number.isInteger(tabId) && tabId > 0) {
@@ -658,6 +973,27 @@ export class PlayerManager {
 
   async start(testCaseId, startUrl, opts = {}) {
     const runLocale = normalizeLocale(opts.locale);
+    let runId = String(opts.runId || `local_${crypto.randomUUID()}`);
+    if (this.state.mode === 'recording') {
+      return { ok: false, error: trByLocale(runLocale, '正在录制，无法回放', 'Recording in progress, playback is unavailable') };
+    }
+    if (this._playContexts.size >= MAX_CONCURRENT_PLAYS) {
+      return { ok: false, error: trByLocale(runLocale, '并发回放已达上限（5）', 'Concurrent playback limit reached (5)') };
+    }
+
+    // Storage is local to the extension. Normal runs never collect or upload a trace.
+    const perfEnabled = await chrome.storage.local.get(PLAYBACK_PERF_ENABLED_KEY)
+      .then((stored) => stored?.[PLAYBACK_PERF_ENABLED_KEY] === true)
+      .catch(() => false);
+    const perf = perfEnabled ? new PlaybackPerfTrace({
+      runId, testCaseId, source: opts.executionSource || 'web',
+    }) : null;
+    const visiblePageEmulationEnabled = await chrome.storage.local.get(PAGE_VISIBILITY_EMULATION_ENABLED_KEY)
+      .then((stored) => stored?.[PAGE_VISIBILITY_EMULATION_ENABLED_KEY] !== false)
+      .catch(() => true);
+    const measurePerf = (phase, task, step = null, nested = false) =>
+      perf ? perf.measure(phase, task, step, nested) : task();
+
     let ctx = null;
     let playTabId = null;
     let browserSessionFinalized = false;
@@ -666,6 +1002,9 @@ export class PlayerManager {
     let sessionNavigationDecision = '';
     let sessionErrorCode = '';
     let batchVariableSession = null;
+    let createdWindowId = null;
+    let incognitoLockAcquired = false;
+    let playbackStarted = false;
     let playbackEndPayload = {
       type: 'AT_PLAYBACK_END',
       testCaseId,
@@ -673,6 +1012,7 @@ export class PlayerManager {
       ok: false,
       error: '',
       purpose: String(opts.purpose || ''),
+      runId,
     };
 
     const adminCaseKey = String(opts.adminCaseKey || '').trim();
@@ -684,7 +1024,7 @@ export class PlayerManager {
     const sourceCaseKey = adminCaseKey || String(testCaseId || '').trim();
     const runStartedAt = Date.now();
     const safeCaseKey = sourceCaseKey.replace(/[^A-Za-z0-9._-]/g, '_') || 'case';
-    const runId = String(opts.executionId || '').trim() || `${safeCaseKey}-${runStartedAt}`;
+    runId = String(opts.executionId || '').trim() || `${safeCaseKey}-${runStartedAt}`;
     let playbackOutcome = null;
     let progressFinished = false;
     let progressSequence = 0;
@@ -737,9 +1077,9 @@ export class PlayerManager {
     });
 
     try {
-      const res = useAdminCase
-        ? await this.api.getAdminPlaywrightCase(sourceCaseKey, opts.projectEnvironmentId, opts.batchId, opts.executionCapability)
-        : await this.api.getTestCase(testCaseId);
+      const res = await measurePerf('fetch_case', () => useAdminCase
+        ? this.api.getAdminPlaywrightCase(sourceCaseKey, opts.projectEnvironmentId, opts.batchId, opts.executionCapability)
+        : this.api.getTestCase(testCaseId));
       const testCase = res.data;
       const steps = testCase.steps || [];
       const runtimeConfig = resolvePlaybackRuntimeConfig(testCase, { ...opts, startUrl }, useAdminCase);
@@ -774,14 +1114,15 @@ export class PlayerManager {
         log: { level: 'success', phase: 'case', message: `用例加载完成，共 ${steps.length} 个步骤` },
       });
       const windowPreference = browserBootstrap.initializeBrowser
-        ? await resolveWindowPreference({
+        ? await measurePerf('resolve_window', () => resolveWindowPreference({
             viewportMode: runtimeConfig.windowSizeMode,
             viewportWidth: runtimeConfig.viewportWidth,
             viewportHeight: runtimeConfig.viewportHeight,
             sourceWindowId: opts.sourceWindowId,
-          })
+          }))
         : { mode: 'none', width: null, height: null };
       const pageErrorCheckEnabled = runtimeConfig.pageErrorCheckEnabled;
+      const runInIncognito = Number(testCase.run_in_incognito || 0) !== 0;
       const screenshotMode = runtimeConfig.screenshotMode === 'full_hd'
         ? 'full_hd'
         : 'standard';
@@ -839,9 +1180,34 @@ export class PlayerManager {
             : runtimeConfig.startUrl || stepStartUrl, runtimeConfig.frozen ? null : testCase)
         : '';
 
+      // Recording may have started while the case configuration was loading.
+      // Check again before inspecting Incognito windows, otherwise the active
+      // recorder can be misreported as an unrelated window to close.
       if (this.state.mode === 'recording') {
         throw new Error(trByLocale(runLocale, '正在录制，无法回放', 'Recording in progress, playback is unavailable'));
       }
+
+      if (runInIncognito) {
+        if (this._incognitoPlayActive) {
+          throw new Error(trByLocale(runLocale, '已有无痕回放正在执行，请等待其结束后再启动下一条用例。', 'An incognito playback is already running. Wait for it to finish before starting another case.'));
+        }
+        // Reserve synchronously before permission/window awaits. Platform and
+        // popup messages are both fire-and-forget and may arrive together.
+        this._incognitoPlayActive = true;
+        incognitoLockAcquired = true;
+        const availability = await inspectIncognitoAvailability();
+        if (!availability.allowed) {
+          const error = new Error(trByLocale(runLocale, '此用例需要在无痕模式运行。请在 Chrome 扩展详情中开启“允许在无痕模式下运行”后重试。', 'This case requires incognito mode. Enable “Allow in Incognito” in the CueCast extension details, then try again.'));
+          error.code = 'incognito_access_required';
+          throw error;
+        }
+        if (availability.existingWindowCount > 0) {
+          const error = new Error(trByLocale(runLocale, '检测到已有无痕窗口。为保证干净的登录状态，请先关闭所有无痕窗口后再执行此用例。', 'Existing incognito windows were detected. Close all incognito windows before running this case to ensure a clean sign-in state.'));
+          error.code = 'incognito_windows_open';
+          throw error;
+        }
+      }
+
       if (this._playContexts.size >= MAX_CONCURRENT_PLAYS) {
         throw new Error(trByLocale(runLocale, '并发回放已达上限（5）', 'Concurrent playback limit reached (5)'));
       }
@@ -851,6 +1217,7 @@ export class PlayerManager {
         debuggerAttached: false,
         tabId: null,
         testCaseId,
+        runId,
         reusedTab: false,
         tabRegistry: new Map(),
         locale: runLocale,
@@ -869,14 +1236,22 @@ export class PlayerManager {
         ignoreHttpsErrors: runtimeConfig.ignoreHttpsErrors,
         executionCapability: String(opts.executionCapability || ''),
         infrastructureTaskIds: new Set(),
+        stepIndex: null,
+        stepCount: steps.length,
+        focusWindowOnStart: opts.backgroundTab === false || opts.purpose === 'record_context_prepare',
+        emulateVisiblePage: visiblePageEmulationEnabled && opts.purpose !== 'record_context_prepare',
+        visiblePageEmulationActive: false,
+        executionSource: String(opts.executionSource || 'web'),
+        runInIncognito,
+        incognitoWindowId: null,
       };
+      if (perf && ctx.emulateVisiblePage) perf.visiblePageEmulation = 'unavailable';
       this._playContexts.add(ctx);
       this.state.activePlayCount = (this.state.activePlayCount || 0) + 1;
       this.state.testCaseId = testCaseId;
       const tabLoadTimeoutMs = ctx.playbackPurpose === 'record_context_prepare'
         ? RECORD_CONTEXT_PREPARE_TIMEOUT_MS
         : DEFAULT_TAB_LOAD_TIMEOUT_MS;
-
       let cdpAvailable = false;
       if (browserBootstrap.initializeBrowser) {
         const preparedSession = typeof opts.prepareBrowserSession === 'function'
@@ -1141,7 +1516,9 @@ export class PlayerManager {
       const runtimeVariableEvents = [];
       const stepTimings = [];
       const runtimeStepTargets = [];
+      const stepOutcomes = [];
 
+      playbackStarted = true;
       for (let i = startStepIndex; i <= stopAfterStepIndex; i++) {
         const stepStartedAt = Date.now();
         if (ctx.stopped) {
@@ -1155,6 +1532,7 @@ export class PlayerManager {
         }
 
         const step = steps[i];
+        ctx.stepIndex = i;
         const executableDefinitionStep = PlayerManager._adaptRecordedStep(step);
         const runtimeVariableReferences = variableContext.describeReferencesForStep(executableDefinitionStep);
         const localResolvedStep = variableContext.resolveStep(PlayerManager._resolveDynamicStepValue(executableDefinitionStep));
@@ -1170,6 +1548,13 @@ export class PlayerManager {
             ).step
           : null;
         const at = String(runtimeStep.action_type || '').trim().toLowerCase();
+        const perfStep = perf?.beginStep(i, at, cdpAvailable ? 'cdp' : 'dom');
+        const perfActive = perfStep ? {
+          perf, step: perfStep,
+          targetSelector: String(runtimeStep.target_selector || ''),
+          targetXPath: String(runtimeStep.target_xpath || ''),
+        } : null;
+        if (perfActive && playTabId != null) this._perfStepByTab.set(playTabId, perfActive);
         const stepLine = isAiNaturalStep(step)
           ? trByLocale(ctx.locale, `#${testCaseId} 第 ${i + 1}/${steps.length} 步 · 智能步骤`, `#${testCaseId} Step ${i + 1}/${steps.length} · AI Step`)
           : at === 'assert_json'
@@ -1195,9 +1580,27 @@ export class PlayerManager {
             detail: true,
           },
         });
+        const progress = {
+          phase: 'step', run_id: runId, test_case_id: testCaseId,
+          step_index: i, step_count: steps.length,
+          completed_count: i - startStepIndex,
+          total_count: stopAfterStepIndex - startStepIndex + 1,
+          message: stepLine,
+        };
+        this._broadcastPlayback({ type: 'AT_PLAYBACK_PROGRESS', ...progress });
+        if (typeof opts.onProgress === 'function') {
+          try { await measurePerf('progress', () => opts.onProgress(progress), perfStep); } catch { /* Progress is best effort. */ }
+        }
 
         let stepEndedAt = stepStartedAt;
         let stepTimingStatus = 'success';
+        let executableStep = runtimeStep;
+        let actionType = at;
+        let stepFailureDiagnostic = null;
+        let diagnosticTabId = null;
+        let overlayNextTargetBefore = null;
+        let tabLoadWaited = false;
+        let locatorBudget = null;
         try {
           throwIfCaseTimedOut();
           let actualLocator = null;
@@ -1206,6 +1609,7 @@ export class PlayerManager {
           const executableStep = waitBefore ? { ...runtimeStep, wait_before: 0 } : runtimeStep;
           const actionType = String(executableStep.action_type || '').trim().toLowerCase();
           let stepExecutionResult = null;
+          let executionOperationAssertion = null;
 
           if (isInfrastructureStep(executableStep)) {
             const infrastructureResult = await this._executeInfrastructureStep(sourceCaseKey, executableStep, {
@@ -1285,28 +1689,53 @@ export class PlayerManager {
             this._pointerPositionByTab.delete(playTabId);
           }
 
-          const runtimeTarget = await this._collectRuntimeStepTarget(playTabId, executableStep, cdpAvailable);
-          if (runtimeTarget) {
+          if (!['assert_text', 'switch_context'].includes(actionType)) {
+            await measurePerf('page_error_check', () => this._throwIfPageError(playTabId), perfStep);
+          }
+
+          const [collectionResolution, runtimeTarget] = await measurePerf('target_diagnostics', async () => [
+            await this._collectCollectionResolution(playTabId, executableStep, cdpAvailable),
+            await this._collectRuntimeStepTarget(playTabId, executableStep, cdpAvailable),
+          ], perfStep);
+          if (runtimeTarget || collectionResolution) {
             runtimeStepTargets.push({
               step_index: i,
+              ...(collectionResolution ? { collection_resolution: collectionResolution } : {}),
               ...runtimeTarget,
             });
           }
 
+          if (PlayerManager._shouldProbeOverlayPostState(executableStep, runtimeNextStep)) {
+            overlayNextTargetBefore = await measurePerf('next_target_before',
+              () => this._probeStepVisibility(playTabId, runtimeNextStep), perfStep);
+          }
+
           if (actionType === 'switch_context') {
-            const switched = await this._switchPlaybackContext(playTabId, executableStep, ctx, cdpAvailable, screenshotMode);
+            const previousTabId = playTabId;
+            const switched = await measurePerf('action',
+              () => this._switchPlaybackContext(playTabId, executableStep, ctx, cdpAvailable, screenshotMode), perfStep);
             playTabId = switched.tabId;
+            if (this._locatorDeadlineByTab.get(previousTabId)?.ctx === ctx) this._locatorDeadlineByTab.delete(previousTabId);
+            if (playTabId != null) this._locatorDeadlineByTab.set(playTabId, locatorBudget);
+            if (perfStep) {
+              if (this._perfStepByTab.get(previousTabId)?.step === perfStep) this._perfStepByTab.delete(previousTabId);
+              this._perfStepByTab.set(playTabId, perfActive);
+              this._perfTraceByTab.delete(previousTabId);
+              if (switched.cdpAvailable) this._perfTraceByTab.set(playTabId, perf);
+            }
+            PlayerManager._syncPerfCdpState(perf, ctx, switched.cdpAvailable);
             cdpAvailable = switched.cdpAvailable;
             this._playTabByCaseId.set(testCaseId, playTabId);
-            this._broadcastPlayback({ type: 'AT_PLAYBACK_LIVE', testCaseId, tabId: playTabId });
-            await this._sleep(120);
+            this._broadcastPlayback({ type: 'AT_PLAYBACK_LIVE', testCaseId, runId, tabId: playTabId });
+            await measurePerf('post_action_pause', () => this._sleep(120), perfStep);
             appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', null, null, {
               ...(runtimeVariableReferences.length ? { variable_references: runtimeVariableReferences } : {}),
             });
             continue;
           }
           if (actionType === 'set_variable') {
-            const captured = await this._executeSetVariableStep(playTabId, executableStep, cdpAvailable, ctx.locale);
+            const captured = await measurePerf('action',
+              () => this._executeSetVariableStep(playTabId, executableStep, cdpAvailable, ctx.locale), perfStep);
             const previousValue = Object.prototype.hasOwnProperty.call(runtimeVariables, captured.name)
               ? String(runtimeVariables[captured.name] ?? '')
               : null;
@@ -1325,10 +1754,29 @@ export class PlayerManager {
               overwritten: previousValue != null,
               previous_value: previousValue == null ? '' : PlayerManager._previewRuntimeValue(previousValue),
             });
-            await this._sleep(120);
+            await measurePerf('post_action_pause', () => this._sleep(120), perfStep);
             appendStepResult(runtimeStep, i, 'passed', stepStartedAt, '', null, null, {
               variable,
               ...(runtimeVariableReferences.length ? { variable_references: runtimeVariableReferences } : {}),
+            });
+            continue;
+          }
+          if (actionType === 'upload_file') {
+            const upload = await measurePerf('action',
+              () => this._executeUploadFileStep(playTabId, testCaseId, executableStep), perfStep);
+            await measurePerf('post_action_pause', () => this._sleep(120), perfStep);
+            stepOutcomes.push({
+              step_index: i,
+              status: 'delivered',
+              action_delivered: true,
+              runtime_target: runtimeTarget || null,
+              effect: {
+                mode: 'required',
+                type: 'file_injected',
+                observed: upload?.fileCount === 1 && Boolean(upload?.fileName),
+                expected: upload?.fileName || '',
+                actual: upload?.fileName || '',
+              },
             });
             continue;
           }
@@ -1337,84 +1785,206 @@ export class PlayerManager {
             && ['click', 'double_click', 'right_click', 'hover'].includes(actionType);
           const captureCurrentStep = async () => {
             if (!cdpAvailable) return;
-            const shot = await this._capturePlaybackScreenshot(playTabId, screenshotMode);
-            if (shot) playbackScreenshots[i] = shot;
+            const shot = await measurePerf('screenshot',
+              () => this._capturePlaybackScreenshot(playTabId, screenshotMode), perfStep, true);
+            if (shot) {
+              playbackScreenshots[i] = shot;
+              perf?.noteScreenshot(perfStep, shot);
+            }
           };
 
           if (cdpAvailable && !captureInsideCdpStep) {
             await captureCurrentStep();
           }
 
-          const managedTabAction = await this._executeManagedTabAction(playTabId, executableStep, ctx, {
-            cdpAvailable,
-            useAdminCase,
-          });
-          if (managedTabAction) {
-            actualLocator = managedTabAction.locator || null;
-            if (Object.prototype.hasOwnProperty.call(managedTabAction, 'tabId')) {
-              playTabId = managedTabAction.tabId;
-              cdpAvailable = managedTabAction.cdpAvailable === true;
-              bindRuntimeConfigToTab(playTabId);
-            }
-          } else if (isAiNaturalStep(executableStep)) {
-            if (!cdpAvailable) {
-              throw new Error('AI 自然语言步骤需要 CDP（debugger）模式，请确认扩展具备调试权限且页面允许附加调试器');
-            }
-            const aiSubtasks = await this._executeAiNaturalStep(playTabId, executableStep, ctx, {
-              stepIndex: i + 1,
-              stepTotal: steps.length,
+          let executionOutcome = null;
+          await measurePerf('action', async () => {
+            const managedTabAction = await this._executeManagedTabAction(playTabId, executableStep, ctx, {
+              cdpAvailable,
+              useAdminCase,
             });
-            if (Array.isArray(aiSubtasks) && aiSubtasks.length) {
-              aiSubtasksByStep[String(i)] = aiSubtasks;
-            }
-          } else if (String(executableStep.action_type || '').trim().toLowerCase() === 'assert_json') {
-            if (!cdpAvailable) {
-              throw new Error('JSON 断言步骤需要 CDP（debugger）模式，请确认扩展具备调试权限且页面允许附加调试器');
-            }
-            await this._executeAssertJsonStep(playTabId, executableStep, testCaseId);
-          } else if (String(executableStep.action_type || '').trim().toLowerCase() === 'assert_text' && cdpAvailable) {
-            // 必须在后台用 CDP 直接断言：依赖 tabs.sendMessage 回包易丢，导致失败被当成成功
-            await this._validateStepXpathsCDP(playTabId, executableStep);
-            actualLocator = await this._executeAssertTextStepCDP(playTabId, executableStep);
-          } else if (cdpAvailable && this._canUseCDP(executableStep)) {
-            try {
-              const cdpResult = await this._executeStepCDP(playTabId, executableStep, targetUrl, ctx.locale, runtimeNextStep, {
-                beforeActionScreenshot: captureCurrentStep,
-                executionCapability: ctx.executionCapability,
-                executionBatchId: ctx.batchId,
+            if (managedTabAction) {
+              actualLocator = managedTabAction.locator || null;
+              if (Object.prototype.hasOwnProperty.call(managedTabAction, 'tabId')) {
+                playTabId = managedTabAction.tabId;
+                cdpAvailable = managedTabAction.cdpAvailable === true;
+                bindRuntimeConfigToTab(playTabId);
+              }
+              executionOutcome = managedTabAction;
+            } else if (isAiNaturalStep(executableStep)) {
+              if (!cdpAvailable) {
+                throw new Error('AI 自然语言步骤需要 CDP（debugger）模式，请确认扩展具备调试权限且页面允许附加调试器');
+              }
+              const aiSubtasks = await this._executeAiNaturalStep(playTabId, executableStep, ctx, {
+                stepIndex: i + 1,
+                stepTotal: steps.length,
               });
-              if (cdpResult?.__cdpStepResult === true) {
-                stepExecutionResult = cdpResult;
-                actualLocator = cdpResult.locator || null;
-              } else {
-                actualLocator = cdpResult;
+              if (Array.isArray(aiSubtasks) && aiSubtasks.length) {
+                aiSubtasksByStep[String(i)] = aiSubtasks;
               }
-            } catch (cdpErr) {
-              if (PlayerManager._isCdpForeignExtensionError(cdpErr) && !useAdminCase) {
-                await this._detachDebugger(playTabId, ctx);
-                cdpAvailable = false;
-                await this._executeStepDOM(playTabId, executableStep, ctx.locale, runtimeNextStep);
-              } else {
-                throw cdpErr;
+            } else if (String(executableStep.action_type || '').trim().toLowerCase() === 'assert_json') {
+              if (!cdpAvailable) {
+                throw new Error('JSON 断言步骤需要 CDP（debugger）模式，请确认扩展具备调试权限且页面允许附加调试器');
+              }
+              await this._executeAssertJsonStep(playTabId, executableStep, testCaseId, ctx.locale);
+            } else if (String(executableStep.action_type || '').trim().toLowerCase() === 'assert_text' && cdpAvailable) {
+              // 必须在后台用 CDP 直接断言：依赖 tabs.sendMessage 回包易丢，导致失败被当成成功
+              const assertionResult = await this._executeAssertTextStepCDP(playTabId, executableStep, ctx.locale);
+              actualLocator = assertionResult?.source ? assertionResult : null;
+              executionOperationAssertion = assertionResult?.operationAssertion || null;
+              executionOutcome = { effect: { mode: 'required', type: 'assertion', observed: true } };
+            } else if (cdpAvailable && this._canUseCDP(executableStep)) {
+              try {
+                const cdpResult = await this._executeStepCDP(playTabId, executableStep, targetUrl, ctx.locale, runtimeNextStep, {
+                  beforeActionScreenshot: captureCurrentStep,
+                });
+                executionOutcome = cdpResult;
+                const returnedLocator = cdpResult?.locator
+                  || (cdpResult?.source ? cdpResult : null);
+                if (returnedLocator && typeof returnedLocator === 'object') {
+                  actualLocator = returnedLocator;
+                }
+                if (cdpResult?.__cdpStepResult) stepExecutionResult = cdpResult;
+              } catch (cdpErr) {
+                if (PlayerManager._isCdpForeignExtensionError(cdpErr) && !cdpErr?.cdpClickDeliveryUncertain) {
+                  await this._detachDebugger(playTabId, ctx);
+                  cdpAvailable = false;
+                  PlayerManager._syncPerfCdpState(perf, ctx, false);
+                  if (perfStep) perfStep.engine = 'dom_fallback';
+                  executionOutcome = await this._executeStepDOM(playTabId, executableStep, ctx.locale, runtimeNextStep);
+                } else {
+                  throw cdpErr;
+                }
+              }
+            } else {
+              executionOutcome = await this._executeStepDOM(playTabId, executableStep, ctx.locale, runtimeNextStep);
+            }
+          }, perfStep);
+
+          if (!executionOperationAssertion) {
+            const returnedAssertion = executionOutcome?.operationAssertion || executionOutcome?.locator?.operationAssertion;
+            if (returnedAssertion && typeof returnedAssertion === 'object') {
+              executionOperationAssertion = returnedAssertion;
+            }
+          }
+
+          if (perfStep && cdpAvailable && playTabId != null) {
+            await measurePerf('debug_page_state',
+              () => this._isPageLoadingUi(playTabId, 'after_action'), perfStep);
+          }
+
+          await measurePerf('post_action_pause', () => this._sleep(300), perfStep);
+          await measurePerf('post_checks', async () => {
+            if (['input_value', 'select_value'].includes(String(executionOutcome?.effect?.type || ''))) {
+              const postTarget = await this._collectRuntimeStepTarget(playTabId, executableStep, cdpAvailable);
+              if (postTarget && Object.prototype.hasOwnProperty.call(postTarget, 'value')) {
+                const actual = String(postTarget.value || '');
+                const expected = String(executionOutcome.effect.expected || '');
+                const expectedCandidates = String(executionOutcome.effect.type) === 'select_value'
+                  ? [expected, String(executableStep.value || ''), String(executableStep.value_text || '')]
+                  : [expected];
+                executionOutcome.effect.actual = PlayerManager._previewRuntimeValue(actual, 240);
+                executionOutcome.effect.observed = expectedCandidates
+                  .filter((value) => value.trim() !== '')
+                  .some((value) => actual.trim() === value.trim());
+                if (String(executionOutcome.effect.type) === 'select_value' && String(postTarget.tag || '').toUpperCase() === 'SELECT') {
+                  executionOutcome.effect.mode = 'required';
+          }
               }
             }
-          } else {
-            await this._executeStepDOM(playTabId, executableStep, ctx.locale, runtimeNextStep);
-          }
+            const overlaySelectionEffect = await this._probeOverlaySelectionEffect(playTabId, executableStep);
+            if (overlaySelectionEffect) {
+              if (!executionOutcome || !executionOutcome.effect || String(executionOutcome.effect.mode || 'none') === 'none') {
+                executionOutcome = { ...(executionOutcome || {}), effect: overlaySelectionEffect };
+              } else {
+                executionOutcome.dependency = overlaySelectionEffect;
+              }
+            }
+            const overlayPostState = await this._observeOverlayPostStateWithLoadRetry(
+              playTabId,
+              executableStep,
+              runtimeNextStep,
+              overlayNextTargetBefore,
+              tabLoadTimeoutMs,
+            );
+            const overlayPostEffect = overlayPostState.effect;
+            tabLoadWaited = overlayPostState.tab_load_waited;
+            if (overlayPostEffect) {
+              if (!executionOutcome || !executionOutcome.effect || String(executionOutcome.effect.mode || 'none') === 'none') {
+                executionOutcome = { ...(executionOutcome || {}), effect: overlayPostEffect };
+              } else {
+                executionOutcome.dependency = overlayPostEffect;
+              }
+            }
+            if (executionOutcome?.effect?.mode === 'required' && executionOutcome.effect.observed === false) {
+              const err = new Error(trByLocale(
+                ctx.locale,
+                '动作未产生可确认的预期效果，请检查页面状态、控件联动或录制值。',
+                'The action did not produce the required observable effect. Check page state, control dependencies, or the recorded value.',
+              ));
+              err.stepOutcome = { effect: executionOutcome.effect };
+              throw err;
+            }
+            const revealDependency = await this._probeExplicitRevealDependency(playTabId, executableStep, runtimeNextStep);
+            if (revealDependency) {
+              if (revealDependency.mode === 'required' && revealDependency.observed === false) {
+                const err = new Error(trByLocale(
+                  ctx.locale,
+                  '动作后未出现录制时依赖的后续菜单或操作区，请检查页面状态或悬浮/点击触发条件。',
+                  'The menu or action area required by the recorded next step did not appear after this action. Check page state or hover/click prerequisites.',
+                ));
+                err.stepOutcome = { effect: revealDependency };
+                throw err;
+              }
+              if (!executionOutcome || !executionOutcome.effect || String(executionOutcome.effect.mode || 'none') === 'none') {
+                executionOutcome = { ...(executionOutcome || {}), effect: revealDependency };
+              } else {
+                executionOutcome.dependency = revealDependency;
+              }
+            }
+          }, perfStep);
+          stepOutcomes.push({
+            step_index: i,
+            status: 'delivered',
+            action_delivered: true,
+            runtime_target: runtimeTarget || null,
+            effect: executionOutcome?.effect || { mode: 'none', observed: null },
+            ...(executionOutcome?.dependency ? { dependency: executionOutcome.dependency } : {}),
+          });
 
           await this._sleep(300);
 
           const executionStatus = stepExecutionResult?.status || 'passed';
           if (executionStatus !== 'skipped' && playTabId != null && ['click', 'navigate', 'ai_natural', 'reload', 'switch_page'].includes(actionType)) {
             await this._waitForTabLoad(playTabId, tabLoadTimeoutMs);
+          } else if (!tabLoadWaited && ['click', 'navigate', 'ai_natural'].includes(actionType)) {
+            await measurePerf('post_navigation_load', () => this._waitForTabLoad(playTabId, tabLoadTimeoutMs, 100), perfStep);
           }
           throwIfCaseTimedOut();
           stepTimingStatus = executionStatus === 'skipped' ? 'skipped' : 'success';
           appendStepResult(runtimeStep, i, executionStatus, stepStartedAt, '', actualLocator, null, {
             ...(stepExecutionResult?.details && typeof stepExecutionResult.details === 'object' ? stepExecutionResult.details : {}),
+            ...(executionOperationAssertion ? { operation_assertion: executionOperationAssertion } : {}),
             ...(runtimeVariableReferences.length ? { variable_references: runtimeVariableReferences } : {}),
           });
         } catch (err) {
+          const recoveredEffect = await measurePerf('failure_recovery', () => this._recoverOverlayPostState(
+            playTabId,
+            executableStep,
+            runtimeNextStep,
+            overlayNextTargetBefore,
+            err,
+          ), perfStep);
+          if (recoveredEffect) {
+            stepOutcomes.push({
+              step_index: i,
+              status: 'delivered',
+              action_delivered: true,
+              runtime_target: runtimeStepTargets.find((item) => Number(item?.step_index) === i) || null,
+              effect: recoveredEffect,
+            });
+            continue;
+          }
           const shouldContinue = continueOnFailureEnabled(runtimeStep)
             || continueOnFailureEnabled(executableDefinitionStep);
           stepTimingStatus = shouldContinue ? 'skipped' : 'failed';
@@ -1485,7 +2055,21 @@ export class PlayerManager {
           blockingStepFailure = true;
           break;
         } finally {
+          if (perfStep && cdpAvailable && playTabId != null) {
+            await measurePerf('debug_page_state',
+              () => this._isPageLoadingUi(playTabId, 'step_end'), perfStep);
+          }
           stepEndedAt = Date.now();
+          perf?.endStep(perfStep, stepTimingStatus);
+          if (perfStep) {
+            for (const [tabId, active] of this._perfStepByTab) {
+              if (active.step === perfStep) this._perfStepByTab.delete(tabId);
+            }
+          }
+          for (const [tabId, active] of this._locatorDeadlineByTab) {
+            if (active === locatorBudget) this._locatorDeadlineByTab.delete(tabId);
+          }
+          if (diagnosticTabId != null) this._endCdpDiagnosticStep(diagnosticTabId, i, stepEndedAt);
           stepTimings.push({
             step_index: i,
             started_at: stepStartedAt,
@@ -1607,9 +2191,11 @@ export class PlayerManager {
       });
       progressFinished = true;
 
+      let savedResultId = null;
+      let resultSaveError = '';
       if (!ctx.suppressResultSave) {
         if (useAdminCase) {
-          await this.api.saveAdminPlaywrightResult(sourceCaseKey, {
+          await measurePerf('save_result', () => this.api.saveAdminPlaywrightResult(sourceCaseKey, {
             status: success ? 'passed' : 'failed',
             success,
             duration_ms: duration,
@@ -1635,15 +2221,15 @@ export class PlayerManager {
               execution_logs: progressLogs,
               ...(sessionTransitionAudit ? { session_transition: sessionTransitionAudit } : {}),
             },
-          }, opts.executionCapability);
+          }, opts.executionCapability), null);
         } else {
-          await this.api.saveResult(testCaseId, {
+          await measurePerf('save_result', () => this.api.saveResult(testCaseId, {
             status: success ? 'success' : 'failed',
             duration,
             error_message: resultError,
             error_step: resultErrorStep,
             detail: resultDetail,
-          });
+          }), null);
         }
       }
 
@@ -1652,32 +2238,51 @@ export class PlayerManager {
         opts.finalizeVariableContext?.(batchVariableSession, true);
       }
 
+      const reportOk = success && !resultSaveError;
+      const reportError = resultSaveError
+        ? trByLocale(ctx.locale, `报告保存失败：${resultSaveError}`, `Report save failed: ${resultSaveError}`)
+        : errorMsg;
       this._notifyPopup(
-        success
-          ? trByLocale(ctx.locale, `✅ #${testCaseId} 成功（${duration}ms）`, `✅ #${testCaseId} Success (${duration}ms)`)
-          : trByLocale(ctx.locale, `❌ #${testCaseId} 失败: ${errorMsg}`, `❌ #${testCaseId} Failed: ${errorMsg}`),
+        resultSaveError
+          ? trByLocale(ctx.locale, `❌ #${testCaseId} ${reportError}`, `❌ #${testCaseId} ${reportError}`)
+          : success
+            ? trByLocale(ctx.locale, `✅ #${testCaseId} 成功（${duration}ms）`, `✅ #${testCaseId} Success (${duration}ms)`)
+            : trByLocale(ctx.locale, `❌ #${testCaseId} 失败: ${errorMsg}`, `❌ #${testCaseId} Failed: ${errorMsg}`),
       );
       this._showNotification(
-        success
-          ? trByLocale(ctx.locale, '回放成功', 'Playback succeeded')
-          : trByLocale(ctx.locale, '回放失败', 'Playback failed'),
-        success
-          ? trByLocale(ctx.locale, `#${testCaseId} 用时 ${duration}ms`, `#${testCaseId} Duration ${duration}ms`)
-          : trByLocale(ctx.locale, `#${testCaseId} 第 ${(errorStep ?? 0) + 1} 步: ${errorMsg}`, `#${testCaseId} Step ${(errorStep ?? 0) + 1}: ${errorMsg}`),
+        resultSaveError
+          ? trByLocale(ctx.locale, '回放报告保存失败', 'Playback report save failed')
+          : success
+            ? trByLocale(ctx.locale, '回放成功', 'Playback succeeded')
+            : trByLocale(ctx.locale, '回放失败', 'Playback failed'),
+        resultSaveError
+          ? reportError
+          : success
+            ? trByLocale(ctx.locale, `#${testCaseId} 用时 ${duration}ms`, `#${testCaseId} Duration ${duration}ms`)
+            : trByLocale(ctx.locale, `#${testCaseId} 第 ${(errorStep ?? 0) + 1} 步: ${errorMsg}`, `#${testCaseId} Step ${(errorStep ?? 0) + 1}: ${errorMsg}`),
       );
 
       playbackEndPayload = {
         type: 'AT_PLAYBACK_END',
         testCaseId,
         tabId: playTabId,
-        ok: success,
+        ok: reportOk,
         duration,
         error: resultError,
         errorStep: resultErrorStep,
         ...(sessionErrorCode ? { errorCode: sessionErrorCode } : {}),
         finalActiveTabId: ctx.activeTabId ?? playTabId,
         ...(sessionTransition ? { sessionTransition } : {}),
+        ...(reportError && reportError !== resultError ? { reportError } : {}),
         purpose: ctx.playbackPurpose,
+        runId,
+        ...(savedResultId != null ? { resultId: savedResultId } : {}),
+        ...(resultSaveError ? { resultSaveError } : {}),
+      };
+      return {
+        ok: success, duration, error: errorMsg, executionStarted: playbackStarted,
+        ...(savedResultId != null ? { resultId: savedResultId } : {}),
+        ...(resultSaveError ? { resultSaveError } : {}),
       };
       return playbackOutcome;
     } catch (err) {
@@ -1718,8 +2323,10 @@ export class PlayerManager {
         finalActiveTabId: ctx?.activeTabId ?? playTabId,
         ...(sessionTransition ? { sessionTransition } : {}),
         ...(sessionErrorCode || err?.code ? { errorCode: sessionErrorCode || err.code } : {}),
+        ...(err?.code ? { code: err.code } : {}),
         ...(quotaDetails && typeof quotaDetails === 'object' && quotaDetails.resource ? { quotaDetails } : {}),
         purpose: ctx?.playbackPurpose || String(opts.purpose || ''),
+        runId,
       };
       broadcastProgress('case-finished', {
         status: 'failed',
@@ -1802,6 +2409,20 @@ export class PlayerManager {
         this._playContexts.delete(ctx);
         this.state.activePlayCount = Math.max(0, (this.state.activePlayCount || 0) - 1);
       }
+      if (incognitoLockAcquired) this._incognitoPlayActive = false;
+      if (perf) {
+          for (const [tabId, active] of this._perfStepByTab) {
+            if (active.perf === perf) this._perfStepByTab.delete(tabId);
+          }
+          for (const [tabId, trace] of this._perfTraceByTab) {
+            if (trace === perf) this._perfTraceByTab.delete(tabId);
+          }
+          // One machine-readable record per run, kept only in the extension's
+          // local storage and service worker console for developer inspection.
+          const snapshot = perf.snapshot(playbackEndPayload.ok ? 'passed' : 'failed');
+          console.info('[CueCast PERF]', JSON.stringify(snapshot));
+          await chrome.storage.local.set({ [PLAYBACK_PERF_LAST_KEY]: snapshot }).catch(() => {});
+      }
       // 须始终广播 END（含拉取用例失败、无步骤等），否则中台顺序回放会一直等不到结束事件。
       // 放在清理之后广播，方便“执行到这里再录制”立即接管保留的 tab。
       this._broadcastPlayback({
@@ -1817,15 +2438,33 @@ export class PlayerManager {
     }
   }
 
-  async stop() {
+  getActiveRuns() {
+    return [...this._playContexts].map((ctx) => ({
+      runId: ctx.runId,
+      testCaseId: ctx.testCaseId,
+      tabId: ctx.tabId,
+      stepIndex: ctx.stepIndex,
+      stepCount: ctx.stepCount,
+      stopping: ctx.stopped === true,
+    }));
+  }
+
+  async stop(runId = null) {
+    const tabsToClose = new Set();
     for (const ctx of this._playContexts) {
+      if (runId != null && ctx.runId !== String(runId)) continue;
       ctx.stopped = true;
       const taskIds = Array.from(ctx.infrastructureTaskIds || []);
       // 取消由 admin 转发给实际执行节点；此处不保存也不重放任何基础设施步骤内容。
       await Promise.all(taskIds.map(taskId => this.api
         .cancelInfrastructureTask(taskId, ctx.executionCapability)
         .catch(() => {})));
+      // Runner playback uses a dedicated tab/window. Closing its tab interrupts
+      // a pending browser operation that would otherwise ignore the stop flag
+      // until the current step times out.
+      if (ctx.playbackPurpose?.startsWith('runner') && ctx.tabId != null) tabsToClose.add(ctx.tabId);
     }
+    await Promise.all([...tabsToClose].map((tabId) => chrome.tabs.remove(tabId).catch(() => {})));
     return { ok: true };
   }
 
@@ -2112,9 +2751,13 @@ export class PlayerManager {
    * 回放结束时仅删除本轮创建的页面。复用页只清理注入状态，避免影响用户原有标签页。
    */
   async _cleanupPlaybackTabs(ctx, activeTabId) {
+    if (ctx?.rootTabId != null && (!ctx.managedTabIds || ctx.managedTabIds.size === 0)) {
+      ctx.managedTabIds = new Set([ctx.rootTabId]);
+    }
     const tabs = await this._refreshManagedTabs(ctx);
-    const retainedTabId = ctx.reusedTab && tabs.some((tab) => tab.id === ctx.initialManagedTabId)
-      ? ctx.initialManagedTabId
+    const retainedCandidate = ctx.initialManagedTabId ?? ctx.rootTabId;
+    const retainedTabId = ctx.reusedTab && tabs.some((tab) => tab.id === retainedCandidate)
+      ? retainedCandidate
       : null;
     const removableIds = tabs
       .map((tab) => tab.id)
@@ -2124,9 +2767,11 @@ export class PlayerManager {
       await this._detachDebugger(activeTabId, ctx).catch(() => {});
     }
 
-    await Promise.all(tabs.map((tab) => (
-      chrome.tabs.sendMessage(tab.id, { type: 'AT_PLAYER_CLEANUP' }).catch(() => {})
-    )));
+    if (typeof chrome.tabs.sendMessage === 'function') {
+      await Promise.all(tabs.map((tab) => (
+        chrome.tabs.sendMessage(tab.id, { type: 'AT_PLAYER_CLEANUP' }).catch(() => {})
+      )));
+    }
     await Promise.all(removableIds.map((tabId) => chrome.tabs.remove(tabId).catch(() => {})));
 
     for (const tabId of removableIds) this._clearTabExecutionState(tabId);
@@ -2410,11 +3055,150 @@ export class PlayerManager {
     });
   }
 
+  async _readSessionValue(key, fallback) {
+    const area = chrome.storage?.session;
+    if (!area) return fallback;
+    const stored = await area.get(key).catch(() => ({}));
+    return stored?.[key] ?? fallback;
+  }
+
+  async _writeSessionValue(key, value) {
+    const area = chrome.storage?.session;
+    if (!area) return;
+    await area.set({ [key]: value }).catch(() => {});
+  }
+
+  async _markActiveIncognitoWindow(windowId) {
+    const id = Number(windowId);
+    if (!Number.isInteger(id) || id <= 0) return;
+    const ids = new Set(await this._readSessionValue(INCOGNITO_ACTIVE_WINDOWS_STORAGE_KEY, []));
+    ids.add(id);
+    await this._writeSessionValue(INCOGNITO_ACTIVE_WINDOWS_STORAGE_KEY, [...ids]);
+  }
+
+  async _unmarkActiveIncognitoWindow(windowId) {
+    const id = Number(windowId);
+    const ids = (await this._readSessionValue(INCOGNITO_ACTIVE_WINDOWS_STORAGE_KEY, []))
+      .map(Number)
+      .filter((item) => Number.isInteger(item) && item > 0 && item !== id);
+    await this._writeSessionValue(INCOGNITO_ACTIVE_WINDOWS_STORAGE_KEY, ids);
+  }
+
+  async getActiveIncognitoWindowIds() {
+    const ids = new Set([...this._playContexts]
+      .filter((ctx) => ctx?.runInIncognito === true && ctx.incognitoWindowId != null)
+      .map((ctx) => Number(ctx.incognitoWindowId))
+      .filter((id) => Number.isInteger(id) && id > 0));
+    for (const id of await this._readSessionValue(INCOGNITO_ACTIVE_WINDOWS_STORAGE_KEY, [])) {
+      const numericId = Number(id);
+      if (Number.isInteger(numericId) && numericId > 0) ids.add(numericId);
+    }
+    const liveIds = [];
+    for (const id of ids) {
+      const win = await chrome.windows.get(id).catch(() => null);
+      if (win?.incognito === true) liveIds.push(id);
+    }
+    await this._writeSessionValue(INCOGNITO_ACTIVE_WINDOWS_STORAGE_KEY, liveIds);
+    return liveIds;
+  }
+
+  async _preparedIncognitoWindows() {
+    const raw = await this._readSessionValue(PREPARED_INCOGNITO_WINDOWS_STORAGE_KEY, {});
+    return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  }
+
+  async _retainPreparedIncognitoWindow(windowId) {
+    const id = Number(windowId);
+    if (!Number.isInteger(id) || id <= 0) return;
+    const prepared = await this._preparedIncognitoWindows();
+    const expiresAt = Date.now() + PREPARED_INCOGNITO_WINDOW_TIMEOUT_MS;
+    prepared[id] = expiresAt;
+    await this._writeSessionValue(PREPARED_INCOGNITO_WINDOWS_STORAGE_KEY, prepared);
+    chrome.alarms.create(`${PREPARED_INCOGNITO_ALARM_PREFIX}${id}`, { when: expiresAt });
+  }
+
+  async _discardPreparedIncognitoWindow(windowId, closeWindow = true) {
+    const id = Number(windowId);
+    const prepared = await this._preparedIncognitoWindows();
+    delete prepared[id];
+    await this._writeSessionValue(PREPARED_INCOGNITO_WINDOWS_STORAGE_KEY, prepared);
+    await chrome.alarms.clear(`${PREPARED_INCOGNITO_ALARM_PREFIX}${id}`).catch(() => {});
+    if (closeWindow && Number.isInteger(id) && id > 0) {
+      return chrome.windows.remove(id).catch(() => {});
+    }
+    return Promise.resolve();
+  }
+
+  async claimPreparedIncognitoWindowForTab(tabId) {
+    const tab = await chrome.tabs.get(Number(tabId)).catch(() => null);
+    if (!tab?.incognito || tab.windowId == null) return false;
+    const id = Number(tab.windowId);
+    const prepared = await this._preparedIncognitoWindows();
+    if (!Object.prototype.hasOwnProperty.call(prepared, id)) return false;
+    await this._discardPreparedIncognitoWindow(id, false);
+    return true;
+  }
+
+  async discardPreparedIncognitoWindowForTab(tabId) {
+    const tab = await chrome.tabs.get(Number(tabId)).catch(() => null);
+    if (!tab?.incognito || tab.windowId == null) return false;
+    const id = Number(tab.windowId);
+    const prepared = await this._preparedIncognitoWindows();
+    if (!Object.prototype.hasOwnProperty.call(prepared, id)) return false;
+    await this._discardPreparedIncognitoWindow(id, true);
+    return true;
+  }
+
+  async closePreparedIncognitoWindows() {
+    const ids = Object.keys(await this._preparedIncognitoWindows()).map(Number)
+      .filter((id) => Number.isInteger(id) && id > 0);
+    await Promise.all(ids.map((id) => this._discardPreparedIncognitoWindow(id, true)));
+    return ids;
+  }
+
+  async handlePreparedIncognitoAlarm(windowId) {
+    const id = Number(windowId);
+    const prepared = await this._preparedIncognitoWindows();
+    const expiresAt = Number(prepared[id] || 0);
+    if (!expiresAt) return;
+    if (expiresAt > Date.now()) {
+      chrome.alarms.create(`${PREPARED_INCOGNITO_ALARM_PREFIX}${id}`, { when: expiresAt });
+      return;
+    }
+    await this._discardPreparedIncognitoWindow(id, true);
+  }
+
+  async reconcileIncognitoState() {
+    await this.getActiveIncognitoWindowIds();
+    const prepared = await this._preparedIncognitoWindows();
+    await Promise.all(Object.entries(prepared).map(async ([rawId, rawExpiresAt]) => {
+      const id = Number(rawId);
+      const expiresAt = Number(rawExpiresAt);
+      if (!Number.isInteger(id) || id <= 0 || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+        await this._discardPreparedIncognitoWindow(id, true);
+        return;
+      }
+      const win = await chrome.windows.get(id).catch(() => null);
+      if (win?.incognito !== true) {
+        await this._discardPreparedIncognitoWindow(id, false);
+        return;
+      }
+      chrome.alarms.create(`${PREPARED_INCOGNITO_ALARM_PREFIX}${id}`, { when: expiresAt });
+    }));
+  }
+
   // =========================================================
   // CDP 相关
   // =========================================================
   _canUseCDP(step) {
     return isCuecastCdpAction(step?.action_type);
+  }
+
+  static _syncPerfCdpState(perf, ctx, cdpAvailable) {
+    if (!perf) return;
+    perf.networkCaptureEnabled = cdpAvailable && ctx.networkDiagnosticsEnabled === true;
+    perf.visiblePageEmulation = cdpAvailable && ctx.visiblePageEmulationActive
+      ? 'enabled' : ctx.emulateVisiblePage ? 'unavailable' : 'disabled';
   }
 
   async _attachDebugger(tabId, ctx) {
@@ -2444,8 +3228,36 @@ export class PlayerManager {
 
     try {
       await this._configureCertificateErrors(tabId, ctx);
-      // 开启 Page 域以接收 javascriptDialogOpening；即使该订阅失败，后续仍会直接尝试 handleJavaScriptDialog。
+      ctx.networkDiagnosticsEnabled = false;
+      ctx.visiblePageEmulationActive = false;
+      if (ctx.emulateVisiblePage) {
+        try {
+          // Chromium treats visibly captured pages as renderer-visible, so
+          // requestAnimationFrame can progress even after the user changes tabs.
+          await this._cdpSend(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+          ctx.visiblePageEmulationActive = true;
+        } catch (error) {
+          // This experimental CDP command is not available in every browser.
+          console.warn('[Player] 后台可见性模拟不可用:', error?.message || error);
+        }
+      }
+      this._cdpDiagnosticsByTab.set(Number(tabId), {
+        network: [],
+        console: [],
+        active_step: null,
+        last_step: null,
+      });
+      const [networkEnabled] = await Promise.all([
+        this._cdpSend(tabId, 'Network.enable').then(() => true, () => false),
+        this._cdpSend(tabId, 'Runtime.enable').catch(() => {}),
+        this._cdpSend(tabId, 'Log.enable').catch(() => {}),
+      ]);
+      ctx.networkDiagnosticsEnabled = networkEnabled;
+      // Keep the page's trusted upload-button click, but suppress the native
+      // chooser. The following upload_file step injects the bound file. The
+      // content-script click guard remains the fallback when CDP is unavailable.
       await this._cdpSend(tabId, 'Page.enable').catch(() => {});
+      await this._cdpSend(tabId, 'Page.setInterceptFileChooserDialog', { enabled: true }).catch(() => {});
       return true;
     } catch (e) {
       ctx.cdpAttachError = `CDP 初始化失败：${e?.message || String(e)}`;
@@ -2462,10 +3274,171 @@ export class PlayerManager {
       chrome.debugger.onEvent.removeListener(ctx.certificateErrorListener);
       ctx.certificateErrorListener = null;
     }
+    if (ctx.visiblePageEmulationActive) {
+      await this._cdpSend(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: false }).catch(() => {});
+    }
     try {
       await chrome.debugger.detach({ tabId });
     } catch (e) {}
     ctx.debuggerAttached = false;
+    ctx.visiblePageEmulationActive = false;
+    this._cdpDiagnosticsByTab.delete(Number(tabId));
+    this._perfTraceByTab.delete(Number(tabId));
+  }
+
+  static _diagnosticUrl(rawUrl) {
+    const raw = String(rawUrl || '').trim();
+    if (!raw) return '';
+    try {
+      const url = new URL(raw);
+      return `${url.origin}${url.pathname}`.slice(0, 360);
+    } catch {
+      return raw.replace(/[?#].*$/, '').slice(0, 360);
+    }
+  }
+
+  static _diagnosticText(value, max = 320) {
+    return String(value || '').replace(/https?:\/\/[^\s)]+/g, (url) => PlayerManager._diagnosticUrl(url)).replace(/\s+/g, ' ').trim().slice(0, max);
+  }
+
+  _beginCdpDiagnosticStep(tabId, stepIndex, startedAt = Date.now()) {
+    const bucket = this._cdpDiagnosticsByTab.get(Number(tabId));
+    if (!bucket || !Number.isInteger(Number(stepIndex))) return;
+    bucket.active_step = {
+      step_index: Number(stepIndex),
+      started_at: Number(startedAt) || Date.now(),
+    };
+  }
+
+  _endCdpDiagnosticStep(tabId, stepIndex, endedAt = Date.now()) {
+    const bucket = this._cdpDiagnosticsByTab.get(Number(tabId));
+    if (!bucket || !bucket.active_step || Number(bucket.active_step.step_index) !== Number(stepIndex)) return;
+    bucket.last_step = {
+      ...bucket.active_step,
+      ended_at: Number(endedAt) || Date.now(),
+    };
+    bucket.active_step = null;
+  }
+
+  _diagnosticStepMeta(bucket, at) {
+    const active = bucket?.active_step;
+    if (active && Number.isInteger(Number(active.step_index))) {
+      return {
+        step_index: Number(active.step_index),
+        step_started_at: Number(active.started_at) || 0,
+      };
+    }
+    const last = bucket?.last_step;
+    if (
+      last
+      && Number.isInteger(Number(last.step_index))
+      && Number(at) - Number(last.ended_at || 0) <= RUNTIME_DIAGNOSTIC_FAILURE_FOLLOWUP_MS
+    ) {
+      return {
+        step_index: Number(last.step_index),
+        step_started_at: Number(last.started_at) || 0,
+        step_ended_at: Number(last.ended_at) || 0,
+      };
+    }
+    return {};
+  }
+
+  _recordCdpDiagnosticEvent(source, method, params = {}) {
+    const tabId = Number(source?.tabId);
+    if (!Number.isInteger(tabId)) return;
+    const bucket = this._cdpDiagnosticsByTab.get(tabId);
+    if (!bucket) return;
+    const perf = this._perfTraceByTab.get(tabId);
+    if (perf) {
+      if (method === 'Network.requestWillBeSent') {
+        perf.noteNetworkStart(tabId, params, this._perfStepByTab.get(tabId)?.step?.index ?? null);
+      } else if (method === 'Network.responseReceived') {
+        perf.noteNetworkResponse(tabId, params);
+      } else if (method === 'Network.loadingFinished' || method === 'Network.loadingFailed') {
+        perf.noteNetworkEnd(tabId, params, method === 'Network.loadingFailed');
+      } else if (method === 'Runtime.exceptionThrown') {
+        perf.noteScriptException(this._perfStepByTab.get(tabId)?.step?.index ?? null, params?.exceptionDetails);
+      }
+    }
+    const at = Date.now();
+    const push = (collection, value, max = 12) => {
+      collection.push({ at, ...this._diagnosticStepMeta(bucket, at), ...value });
+      if (collection.length > max) collection.splice(0, collection.length - max);
+    };
+    if (method === 'Network.responseReceived') {
+      const response = params?.response || {};
+      const status = Number(response.status || 0);
+      const type = String(params?.type || '');
+      if (status >= 400 && RUNTIME_DIAGNOSTIC_NETWORK_TYPES.has(type)) {
+        push(bucket.network, {
+          kind: 'http_status',
+          status,
+          method: String(params?.request?.method || ''),
+          type,
+          url: PlayerManager._diagnosticUrl(response.url),
+        });
+      }
+      return;
+    }
+    if (method === 'Network.loadingFailed') {
+      const type = String(params?.type || '');
+      if (!RUNTIME_DIAGNOSTIC_NETWORK_TYPES.has(type)) return;
+      push(bucket.network, {
+        kind: 'loading_failed',
+        error_text: PlayerManager._diagnosticText(params?.errorText || 'Network loading failed'),
+        type,
+        canceled: params?.canceled === true,
+      });
+      return;
+    }
+    if (method === 'Runtime.exceptionThrown') {
+      const detail = params?.exceptionDetails || {};
+      const exception = detail.exception || {};
+      push(bucket.console, {
+        kind: 'exception',
+        text: PlayerManager._diagnosticText(exception.description || exception.className || detail.text || 'Uncaught exception'),
+        line: Number(detail.lineNumber || 0) || 0,
+        column: Number(detail.columnNumber || 0) || 0,
+      });
+      return;
+    }
+  }
+
+  _failureRuntimeDiagnostics(tabId, scope = null) {
+    const bucket = this._cdpDiagnosticsByTab.get(Number(tabId));
+    if (!bucket) return null;
+    const now = Date.now();
+    const since = now - RUNTIME_DIAGNOSTIC_HISTORY_MS;
+    const network = bucket.network.filter((item) => Number(item?.at || 0) >= since);
+    const console = bucket.console.filter((item) => Number(item?.at || 0) >= since);
+    const failedStepIndex = Number(scope?.failed_step_index);
+    if (!Number.isInteger(failedStepIndex) || failedStepIndex < 0) {
+      return network.length || console.length ? { network, console } : null;
+    }
+    const stepStartedAt = Number(scope?.step_started_at) || now;
+    const failedAt = Number(scope?.failed_at) || now;
+    const followupMs = Math.max(0, Math.min(2000, Number(scope?.followup_ms) || 0));
+    const relevant = (items) => items.filter((item) => {
+      if (Number(item?.step_index) === failedStepIndex) return true;
+      // 历史/其他客户端没有 step_index 时，仅在失败步骤的窄时窗内作为兼容证据。
+      return item?.step_index == null
+        && Number(item?.at || 0) >= stepStartedAt
+        && Number(item?.at || 0) <= failedAt + followupMs;
+    });
+    const relevantNetwork = relevant(network);
+    const relevantConsole = relevant(console);
+    return {
+      network,
+      console,
+      relevant_network: relevantNetwork,
+      relevant_console: relevantConsole,
+      failure_scope: {
+        step_index: failedStepIndex,
+        step_started_at: stepStartedAt,
+        failed_at: failedAt,
+        followup_ms: followupMs,
+      },
+    };
   }
 
   async _configureCertificateErrors(tabId, ctx) {
@@ -2562,6 +3535,68 @@ export class PlayerManager {
     return null;
   }
 
+  static _stepDiagnosticSummary(step, stepIndex = null) {
+    if (!step || typeof step !== 'object') return null;
+    return {
+      step_index: Number.isInteger(stepIndex) ? stepIndex : Number(step.step_index),
+      action_type: String(step.action_type || '').trim(),
+      description: String(step.description || '').trim().slice(0, 300),
+      target_selector: String(step.target_selector || '').trim().slice(0, 800),
+      target_xpath: String(step.target_xpath || '').trim().slice(0, 800),
+      value: String(step.value || '').trim().slice(0, 300),
+      url: String(step.url || '').trim().slice(0, 1000),
+      wait_before: Number(step.wait_before) || 0,
+    };
+  }
+
+  async _collectTabSwitchDiagnostic(ctx, currentTabId, step, previousStep = null, stepIndex = null) {
+    const tabContext = this._extractTabContext(step);
+    const currentTab = currentTabId != null ? await chrome.tabs.get(currentTabId).catch(() => null) : null;
+    const windowId = currentTab?.windowId;
+    const tabs = await chrome.tabs.query(windowId != null ? { windowId } : {}).catch(() => []);
+    const registry = ctx?.tabRegistry && typeof ctx.tabRegistry.entries === 'function'
+      ? [...ctx.tabRegistry.entries()].map(([index, item]) => ({
+        index,
+        tab_id: item?.tabId,
+        url: String(item?.url || '').slice(0, 1000),
+        opener_index: item?.openerIndex,
+      }))
+      : [];
+    const snapshot = tabs
+      .filter((tab) => tab?.id != null)
+      .map((tab, idx) => ({
+        order: idx,
+        tab_id: tab.id,
+        active: tab.active === true,
+        current: Number(tab.id) === Number(currentTabId),
+        status: tab.status || '',
+        title: String(tab.title || '').slice(0, 300),
+        url: String(tab.url || '').slice(0, 1000),
+        pending_url: String(tab.pendingUrl || '').slice(0, 1000),
+      }));
+    const expectedUrl = String(tabContext?.url || step?.url || '').trim();
+    const matchedTabs = expectedUrl
+      ? snapshot.filter((tab) => this._sameUrlForTabContext(tab.url, expectedUrl) || this._sameUrlForTabContext(tab.pending_url, expectedUrl))
+      : [];
+    return {
+      type: 'switch_context',
+      expected_tab_index: tabContext?.index,
+      expected_url: expectedUrl,
+      opener_index: tabContext?.opener_index ?? tabContext?.openerIndex,
+      current_tab_id: currentTabId,
+      current_url: String(currentTab?.url || '').slice(0, 1000),
+      current_title: String(currentTab?.title || '').slice(0, 300),
+      tabs: snapshot,
+      tab_registry: registry,
+      matched_tabs: matchedTabs,
+      likely_reason: matchedTabs.length
+        ? 'target_tab_exists_but_not_registered'
+        : 'previous_step_did_not_open_expected_tab',
+      failed_step: PlayerManager._stepDiagnosticSummary(step, stepIndex),
+      previous_step: PlayerManager._stepDiagnosticSummary(previousStep, Number.isInteger(stepIndex) ? stepIndex - 1 : null),
+    };
+  }
+
   async _switchPlaybackContext(currentTabId, step, ctx, cdpAvailable, screenshotMode) {
     const tabContext = this._extractTabContext(step);
     if (!tabContext) throw new Error('切换标签页失败：步骤缺少 tab context');
@@ -2576,9 +3611,12 @@ export class PlayerManager {
       throw new Error(`切换标签页失败：未找到标签页 #${tabContext.index}${tabContext.url ? ` (${tabContext.url})` : ''}`);
     }
 
-    if (ctx.debuggerAttached && currentTabId != null) await this._detachDebugger(currentTabId, ctx).catch(() => {});
+    if (ctx.debuggerAttached && currentTabId != null) {
+      const perf = this._perfTraceByTab.get(currentTabId);
+      await this._detachDebugger(currentTabId, ctx).catch(() => {});
+      PlayerManager._syncPerfCdpState(perf, ctx, false);
+    }
     await chrome.tabs.update(targetTab.id, { active: true }).catch(() => {});
-    if (targetTab.windowId != null) await chrome.windows.update(targetTab.windowId, { focused: true }).catch(() => {});
     await this._waitForTabLoad(targetTab.id);
     await chrome.scripting.executeScript({
       target: { tabId: targetTab.id },
@@ -3545,130 +4583,13 @@ export class PlayerManager {
     }
   }
 
-  // 判断元素是否处于 disabled 状态。组件库 class 禁用只作用于交互组件根，避免普通祖先容器误伤内部按钮。
-  static _disabledInfoCode(elVar) {
-    return `(function(el){
-      function brief(node) {
-        if (!node) return '';
-        var tag = String(node.tagName || '').toLowerCase();
-        var id = node.id ? '#' + node.id : '';
-        var cls = String(node.className || '').trim().replace(/\\s+/g, '.');
-        return tag + id + (cls ? '.' + cls : '');
-      }
-      if (!el) return { disabled: false };
-      const disabledClassRe = /(?:^|\\s)(?:[a-z]+-)?disabled(?:\\s|$)/i;
-      const loadingClassRe = /(?:^|\\s)(?:is-)?(?:loading|spinning|pending|btn-loading|button-loading|ant-btn-loading|ivu-btn-loading|el-button--loading|arco-btn-loading)(?:\\s|$)/i;
-      const loadingIndicatorSel = [
-        '.el-icon-loading', '.el-loading-spinner', '.is-loading',
-        '.ivu-load-loop', '.ivu-icon-ios-loading', '.ivu-spin',
-        '.ant-btn-loading-icon', '.anticon-loading', '.ant-spin-spinning',
-        '.arco-icon-loading', '.arco-spin', '.n-spin',
-        '[data-loading="true"]', '[aria-busy="true"]'
-      ].join(',');
-      const formControlSel = 'button,input,select,textarea,option,optgroup';
-      const componentRootSel = [
-        '.el-select', '.ivu-select', '.ant-select', '.v-select', '.vs__dropdown-toggle', '[role="combobox"]',
-        '.el-button', '.ivu-btn', '.ant-btn', '[role="button"]',
-        '.el-radio', '.ivu-radio-wrapper', '.ant-radio-wrapper',
-        '.el-checkbox', '.ivu-checkbox-wrapper', '.ant-checkbox-wrapper',
-        '.el-input', '.ivu-input-wrapper', '.ant-input-affix-wrapper',
-        '.el-cascader', '.ivu-cascader', '.ant-cascader', '.ant-cascader-picker',
-        '.el-switch', '.ivu-switch', '.ant-switch',
-        '.el-slider', '.ivu-slider', '.ant-slider',
-        '.el-date-editor', '.ivu-date-picker', '.ant-picker',
-        '.el-input-number', '.ivu-input-number', '.ant-input-number',
-        '.el-autocomplete', '.el-upload',
-        '.t-select', '.t-button', '.t-radio', '.t-checkbox', '.t-switch',
-        '.arco-select', '.arco-btn', '.arco-radio', '.arco-checkbox', '.arco-switch',
-        '.n-select', '.n-button', '.n-radio', '.n-checkbox', '.n-switch',
-        '.MuiButton-root', '.MuiSelect-root', '.MuiInputBase-root', '.MuiSwitch-root'
-      ].join(',');
-      function hasVisibleLoadingIndicator(root) {
-        if (!root || !root.querySelectorAll) return false;
-        var list = root.querySelectorAll(loadingIndicatorSel);
-        for (var i = 0; i < list.length; i++) {
-          var item = list[i];
-          if (!item || item === root) continue;
-          if (item.getAttribute && item.getAttribute('aria-hidden') === 'true') continue;
-          var st = window.getComputedStyle ? window.getComputedStyle(item) : null;
-          if (st && (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || 1) === 0)) continue;
-          var r = item.getBoundingClientRect ? item.getBoundingClientRect() : null;
-          if (r && (r.width > 0 || r.height > 0)) return true;
-        }
-        return false;
-      }
-      if (el.disabled || (el.getAttribute && el.getAttribute('disabled') !== null)) {
-        return { disabled: true, reason: 'native-disabled', by: brief(el) };
-      }
-      if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') {
-        return { disabled: true, reason: 'aria-disabled', by: brief(el) };
-      }
-      if (el.getAttribute && (el.getAttribute('aria-busy') === 'true' || el.getAttribute('data-loading') === 'true')) {
-        return { disabled: true, reason: 'target-loading-attr', by: brief(el) };
-      }
-      if (loadingClassRe.test(String(el.className || ''))) {
-        return { disabled: true, reason: 'target-loading-class', by: brief(el) };
-      }
-      const ownerControl = el.closest && el.closest(formControlSel);
-      if (ownerControl) {
-        if (ownerControl.disabled || (ownerControl.getAttribute && ownerControl.getAttribute('disabled') !== null)) {
-          return { disabled: true, reason: 'owner-native-disabled', by: brief(ownerControl) };
-        }
-        if (ownerControl.getAttribute && ownerControl.getAttribute('aria-disabled') === 'true') {
-          return { disabled: true, reason: 'owner-aria-disabled', by: brief(ownerControl) };
-        }
-        if (ownerControl.getAttribute && (ownerControl.getAttribute('aria-busy') === 'true' || ownerControl.getAttribute('data-loading') === 'true')) {
-          return { disabled: true, reason: 'owner-loading-attr', by: brief(ownerControl) };
-        }
-        if (loadingClassRe.test(String(ownerControl.className || ''))) {
-          return { disabled: true, reason: 'owner-loading-class', by: brief(ownerControl) };
-        }
-        if (hasVisibleLoadingIndicator(ownerControl)) {
-          return { disabled: true, reason: 'owner-loading-indicator', by: brief(ownerControl) };
-        }
-        const fieldset = ownerControl.closest && ownerControl.closest('fieldset[disabled]');
-        if (fieldset) return { disabled: true, reason: 'fieldset-disabled', by: brief(fieldset) };
-      }
-      let cur = el;
-      while (cur && cur !== document.body) {
-        if (cur.matches && cur.matches(componentRootSel)) {
-          if (cur.disabled || (cur.getAttribute && cur.getAttribute('disabled') !== null)) {
-            return { disabled: true, reason: 'component-native-disabled', by: brief(cur) };
-          }
-          if (cur.getAttribute && cur.getAttribute('aria-disabled') === 'true') {
-            return { disabled: true, reason: 'component-aria-disabled', by: brief(cur) };
-          }
-          if (disabledClassRe.test(String(cur.className || ''))) {
-            return { disabled: true, reason: 'component-disabled-class', by: brief(cur) };
-          }
-          if (cur.getAttribute && (cur.getAttribute('aria-busy') === 'true' || cur.getAttribute('data-loading') === 'true')) {
-            return { disabled: true, reason: 'component-loading-attr', by: brief(cur) };
-          }
-          if (loadingClassRe.test(String(cur.className || ''))) {
-            return { disabled: true, reason: 'component-loading-class', by: brief(cur) };
-          }
-          if (hasVisibleLoadingIndicator(cur)) {
-            return { disabled: true, reason: 'component-loading-indicator', by: brief(cur) };
-          }
-        }
-        cur = cur.parentElement;
-      }
-      if (disabledClassRe.test(String(el.className || ''))) {
-        return { disabled: true, reason: 'target-disabled-class', by: brief(el) };
-      }
-      return { disabled: false };
-    })(${elVar})`;
-  }
-
-  static _isDisabledCode(elVar) {
-    return `(${PlayerManager._disabledInfoCode(elVar)}).disabled`;
-  }
-
   // 常见下拉浮层容器的选择器（iView / Element UI / Ant Design / Vuetify 等）
   static OVERLAY_CONTAINER_SEL = [
     '.ivu-select-dropdown', '.el-select-dropdown',
     '.ant-select-dropdown', '.v-menu__content',
     '.vs__dropdown-menu', '.el-popper',
+    '.ivu-cascader-menu', '.el-cascader__dropdown',
+    '.ant-cascader-dropdown', '.ant-cascader-menus',
   ].join(',');
 
   /** Teleport + Transition 内层 fixed 面板；与 recorder getVisibleCustomOverlayRoots 一致 */
@@ -3761,7 +4682,7 @@ export class PlayerManager {
       let order = 0;
       for (const container of containers) {
         const cz = zIndex(container);
-        const items = container.querySelectorAll('li, [role="option"], [role="menuitem"], .ivu-select-item, .el-select-dropdown__item, .el-option, .ant-select-item, .ant-select-item-option-content');
+        const items = container.querySelectorAll('li, [role="option"], [role="menuitem"], .ivu-select-item, .el-select-dropdown__item, .el-option, .ant-select-item, .ant-select-item-option-content, .ivu-cascader-menu-item, .el-cascader-node, .ant-cascader-menu-item');
         for (const item of items) {
           const t2 = item.textContent.trim().replace(/\\s+/g, ' ');
           const exact = t2 === needle;
@@ -4085,6 +5006,7 @@ export class PlayerManager {
   }
 
   async _validateStepXpathsCDP(tabId, step) {
+    if (typeof chrome.debugger?.sendCommand !== 'function') return;
     const allCandidates = PlayerManager._normalizeLocatorMetaCandidates(step?.locator_meta);
     const locatorValues = [
       { value: step?.target_selector, source: 'target_selector' },
@@ -4739,7 +5661,9 @@ export class PlayerManager {
     let recordedCandidate = null;
     if (source.startsWith('meta-')) {
       const sourceType = source.slice(5);
-      const candidate = sourceType === 'xpath'
+      const candidate = sourceType === 'collection-item'
+        ? PlayerManager._collectionItemCandidate(step?.locator_meta)
+        : sourceType === 'xpath'
         ? candidates.find((item) => ['table_cell_xpath', 'xpath_fallback'].includes(String(item?.type || '')))
         : sourceType === 'text'
           ? candidates.find((item) => String(item?.type || '') === 'text_exact')
@@ -4925,7 +5849,22 @@ export class PlayerManager {
 
   static _buildCdpLocatorDiagnostics(step, actualLocator, status, durationMs) {
     if (!actualLocator?.source) return null;
-    const configuredLocators = PlayerManager._normalizeLocatorMetaCandidates(step?.locator_meta);
+    const locatorMeta = PlayerManager._parseLocatorMetaObject(step?.locator_meta);
+    const configuredLocators = (Array.isArray(locatorMeta?.candidates) ? locatorMeta.candidates : [])
+      .map((candidate) => ({
+        type: String(candidate?.type || ''),
+        value: String(candidate?.value || ''),
+        score: Number(candidate?.score),
+      }))
+      .filter((candidate) => candidate.type && candidate.value)
+      .slice(0, 16);
+    // 历史步骤可能只在 context 中保存集合语义配置；恢复为报告和执行器都能识别的候选，避免退回固定 CSS/XPath。
+    const collectionCandidate = PlayerManager._collectionItemCandidate(locatorMeta);
+    if (collectionCandidate && !configuredLocators.some((candidate) => (
+      ['collection_item', 'table_row_semantic'].includes(candidate.type)
+    ))) {
+      configuredLocators.unshift(collectionCandidate);
+    }
     [
       { type: 'css', value: step?.target_selector },
       { type: 'xpath', value: step?.target_xpath },
@@ -4940,6 +5879,11 @@ export class PlayerManager {
       mode: 'cdp-ordered-candidate',
       outcome: status === 'passed' ? 'resolved' : status === 'skipped' ? 'skipped' : 'action-failed',
       configured_candidate_count: configuredLocators.length,
+      configured_locators: configuredLocators.map((candidate) => ({
+        type: candidate.type,
+        value: candidate.value,
+        ...(Number.isFinite(candidate.score) ? { score: candidate.score } : {}),
+      })),
       selected: {
         source: actualLocator.source || '',
         execution_source: actualLocator.executionSource || '',
@@ -4955,6 +5899,25 @@ export class PlayerManager {
     };
   }
 
+  static _orderedLocatorMetaCandidates(locatorMeta) {
+    const candidates = PlayerManager._normalizeLocatorMetaCandidates(locatorMeta);
+    const meta = PlayerManager._parseLocatorMetaObject(locatorMeta);
+    if (meta?.context?.overlay !== true) return candidates;
+    const priority = (candidate) => {
+      const type = String(candidate?.type || '');
+      if (type === 'text_exact_tag') return 0;
+      if (type === 'text_exact') return 1;
+      if (type === 'table_cell_xpath' || type === 'xpath_fallback') return 2;
+      if (type.startsWith('css_') || type === 'table_cell_css') return 3;
+      if (type.startsWith('component_root_')) return 9;
+      return 4;
+    };
+    return candidates
+      .map((candidate, index) => ({ candidate, index }))
+      .sort((a, b) => priority(a.candidate) - priority(b.candidate) || a.index - b.index)
+      .map(({ candidate }) => candidate);
+  }
+
   static _parseLocatorMetaObject(locatorMeta) {
     if (locatorMeta == null || locatorMeta === '') return null;
     if (typeof locatorMeta === 'object') return locatorMeta;
@@ -4965,6 +5928,416 @@ export class PlayerManager {
     } catch {
       return null;
     }
+  }
+
+  static _recordedModalScope(selector, locatorMeta) {
+    const meta = PlayerManager._parseLocatorMetaObject(locatorMeta);
+    // 下拉选项可能被挂到 body，不能用其所在弹窗限制选项本身。
+    if (meta?.context?.overlay === true) return false;
+    const modalPath = /(?:\.ant-modal(?:-[\w-]+)?|\.el-dialog(?:__[\w-]+)?|\.ivu-modal(?:-[\w-]+)?|\.arco-modal(?:-[\w-]+)?|\.t-dialog(?:__[\w-]+)?|\.n-dialog|\.Mui(?:Dialog|Modal)[\w-]*|\[role\s*=\s*["']?(?:alertdialog|dialog)["']?\]|(?:^|[\s>+~])dialog(?=$|[\s>+~.#:\[])|\[class\*=["']?modal-wrap["']?\])/i;
+    if (modalPath.test(String(selector || ''))) return true;
+    return PlayerManager._normalizeLocatorMetaCandidates(meta).some((candidate) =>
+      (candidate.type.startsWith('css_') || candidate.type.startsWith('component_root_') || candidate.type === 'table_cell_css')
+      && modalPath.test(candidate.value));
+  }
+
+  static _collectionItemConfig(locatorMeta) {
+    const meta = PlayerManager._parseLocatorMetaObject(locatorMeta);
+    const candidates = Array.isArray(meta?.candidates) ? meta.candidates : [];
+    const candidate = candidates.find((item) => ['collection_item', 'table_row_semantic'].includes(String(item?.type || '')));
+    const collectionIdentity = meta?.context?.collection_item_identity;
+    const tableIdentity = meta?.context?.table_row_identity;
+    const savedSemanticConfig = collectionIdentity?.mode === 'semantic'
+      ? collectionIdentity.semantic_config
+      : null;
+    const savedOrdinalConfig = collectionIdentity?.mode === 'ordinal'
+      ? collectionIdentity.semantic_config
+      : tableIdentity?.mode === 'ordinal'
+        ? tableIdentity.semantic_config
+        : null;
+    const savedConfig = savedSemanticConfig || savedOrdinalConfig;
+    if (!candidate && !savedConfig) return null;
+    try {
+      const raw = candidate?.value ?? savedConfig;
+      const config = typeof raw === 'string' ? JSON.parse(raw) : { ...raw };
+      if (!config || typeof config !== 'object') return null;
+      if (!candidate && !savedSemanticConfig) config._collection_locator_mode = 'ordinal';
+      if (Array.isArray(config.identity?.selected) && config.identity.selected.length) config.fields = config.identity.selected;
+      if (config.collection?.root) {
+        config.framework = config.collection.root.framework || config.framework;
+        config.wrapper_index = config.collection.root.wrapper_index ?? config.wrapper_index;
+      }
+      return config;
+    } catch {
+      return null;
+    }
+  }
+
+  static _collectionItemCandidate(locatorMeta) {
+    const meta = PlayerManager._parseLocatorMetaObject(locatorMeta);
+    const recorded = Array.isArray(meta?.candidates) ? meta.candidates : [];
+    const candidate = recorded.find((item) => ['collection_item', 'table_row_semantic'].includes(String(item?.type || '')));
+    if (candidate?.value) {
+      return {
+        type: String(candidate.type),
+        value: String(candidate.value),
+        score: Number(candidate.score),
+      };
+    }
+    const config = PlayerManager._collectionItemConfig(meta);
+    if (!config) return null;
+    return { type: 'collection_item', value: JSON.stringify(config), score: 0.99 };
+  }
+
+  static _collectionItemDiagnosticExpr(rawValue) {
+    const config = PlayerManager._collectionItemConfig({ candidates: [{ type: 'collection_item', value: rawValue }] });
+    if (!config || (config.collection?.kind && !['table', 'list', 'card', 'menu'].includes(config.collection.kind))) return 'null';
+    return `(function(){
+      try {
+        var cfg=${JSON.stringify(config)};
+        if(cfg.collection&&cfg.collection.kind!=='table'){
+          var rootCfg=cfg.collection.root||{},rootSelector=rootCfg.selector||'[role="list"],ul,ol,div',itemSelector=String((cfg.collection.item||{}).selector||'[role="listitem"],li');
+          var allRoots=Array.prototype.slice.call(document.querySelectorAll(rootSelector)),ri=Number(rootCfg.index),preferredRoot=Number.isInteger(ri)&&ri>=0?allRoots[ri]:null;
+          function visible(n){var r=n.getBoundingClientRect(),s=getComputedStyle(n);return(r.width>0||r.height>0)&&s.display!=='none'&&s.visibility!=='hidden';}
+          function norm(v){return String(v||'').replace(/\\s+/g,' ').trim();}
+          function preview(v){var t=norm(v);return t.length>360?t.slice(0,359)+'…':t;}
+          function semanticTexts(item){var values=[norm(item.getAttribute&&item.getAttribute('aria-label')),norm(item.innerText||item.textContent)];Array.prototype.slice.call(item.querySelectorAll('h1,h2,h3,h4,h5,h6,[title],strong,b,.title,[class*="title"],[class*="name"]')).forEach(function(node){values.push(norm(node.innerText||node.textContent||(node.getAttribute&&node.getAttribute('title'))));});return values.filter(function(value,index){return value&&values.indexOf(value)===index;});}
+          function itemMatches(item){var values=semanticTexts(item);return visible(item)&&cfg.fields.every(function(f){return f.kind==='item_text'&&values.indexOf(norm(f.value))>=0;});}
+          function itemsInRoot(root){return root?Array.prototype.slice.call(root.querySelectorAll(':scope > '+itemSelector)).filter(itemMatches):[];}
+          var preferredMatches=itemsInRoot(preferredRoot),matches=preferredMatches,searchScope='recorded_root';
+          if(!preferredRoot||preferredMatches.length===0){
+            var fallbackRoots=allRoots.filter(function(root){return root!==preferredRoot;});
+            matches=Array.prototype.slice.call(document.querySelectorAll(itemSelector)).filter(function(item){return fallbackRoots.indexOf(item.parentElement)>=0&&itemMatches(item);});
+            searchScope='fallback_roots';
+          }
+          var matchedRootIndex=matches.length===1?allRoots.indexOf(matches[0].parentElement):-1;
+          return {kind:cfg.collection.kind,mode:'semantic',status:matches.length===1?'matched':(matches.length?'ambiguous':'not_found'),match_count:matches.length,search_scope:searchScope,recorded_root_index:Number.isInteger(ri)&&ri>=0?ri:null,matched_root_index:matchedRootIndex>=0?matchedRootIndex:null,recovered_from_root_drift:matches.length===1&&searchScope==='fallback_roots'&&Number.isInteger(ri)&&ri>=0&&matchedRootIndex>=0&&matchedRootIndex!==ri,recorded_item_index:Number(cfg.recorded_item_index)+1||null,recorded_item_summary:preview(cfg.recorded_item_summary),fields:(cfg.fields||[]).map(function(f){return {header:f.header||'业务对象',value:preview(f.value)};}),matched_item_summary:matches.length===1?preview(matches[0].innerText||matches[0].textContent):''};
+        }
+        var resolution=(${PlayerManager._resolveSemanticTable.toString().replace(/^[^(]+/, 'function')})(cfg,false);
+        delete resolution.target;
+        return resolution;
+      }catch(e){return {kind:'table',mode:'semantic',status:'diagnostic_error'};}
+    })()`;
+  }
+
+  static _collectionOrdinalDiagnosticExpr(config) {
+    if (!config || (config.collection?.kind && !['table', 'list', 'card', 'menu'].includes(config.collection.kind))) return 'null';
+    const diagnosticKind = String(config.collection?.kind || 'table');
+    return `(function(){
+      try {
+        var cfg=${JSON.stringify(config)};
+        function visible(n){var r=n.getBoundingClientRect();var s=getComputedStyle(n);return (r.width>0||r.height>0)&&s.display!=='none'&&s.visibility!=='hidden';}
+        function norm(v){return String(v||'').replace(/\\s+/g,' ').trim();}
+        function preview(v){var t=norm(v);return t.length>360?t.slice(0,359)+'…':t;}
+        if(cfg.collection&&cfg.collection.kind!=='table'){
+          var kind=String(cfg.collection.kind||'list');
+          var rootCfg=cfg.collection.root||{};
+          var roots=Array.prototype.slice.call(document.querySelectorAll(rootCfg.selector||'[role="list"],ul,ol,div'));
+          var rootIndex=Number(rootCfg.index);
+          if(Number.isInteger(rootIndex)&&rootIndex>=0)roots=roots[rootIndex]?[roots[rootIndex]]:[];
+          var itemSelector=String((cfg.collection.item||{}).selector||'[role="listitem"],li');
+          var items=[];
+          roots.forEach(function(root){Array.prototype.slice.call(root.querySelectorAll(':scope > '+itemSelector)).forEach(function(item){if(visible(item)&&items.indexOf(item)<0)items.push(item);});});
+          var itemIndex=Number(cfg.recorded_item_index);
+          var item=Number.isInteger(itemIndex)&&itemIndex>=0?items[itemIndex]:null;
+          var recorded=preview(cfg.recorded_item_summary),actual=item?preview(item.innerText||item.textContent):'';
+          var fields=(cfg.identity&&cfg.identity.selected)||cfg.fields||[];
+          var comparable=fields.filter(function(field){return field.kind==='item_text'&&norm(field.value);});
+          var comparison='unavailable';
+          // Historical list/card identities do not record whether item_text came
+          // from aria-label, a title node, or the whole item. A missing substring
+          // is therefore not strong enough evidence that ordinal playback hit a
+          // different business object; mutable status/action text may have changed.
+          if(item&&comparable.length&&comparable.every(function(field){return norm(item.innerText||item.textContent).indexOf(norm(field.value))>=0;})){comparison='matched';}
+          var changed=Boolean(norm(recorded)&&norm(recorded)!==norm(actual));
+          return {kind:kind,mode:'ordinal',status:!item?'not_found':(comparison==='mismatch'?'mismatch':(changed?'content_changed':'matched')),identity_comparison:comparison,recorded_item_index:Number.isInteger(itemIndex)?itemIndex+1:null,recorded_item_summary:recorded,runtime_item_summary:actual,fields:fields.map(function(field){return {header:String(field.header||'业务对象'),value:preview(field.value)};})};
+        }
+        var framework=String(cfg.framework||'');
+        var selector=framework==='el'?'.el-table':(framework==='ant'?'.ant-table':(framework==='ivu'?'.ivu-table':'table,[role="grid"]'));
+        var all=Array.prototype.slice.call(document.querySelectorAll(selector));
+        var rootIndex=Number(cfg.wrapper_index);
+        var roots=Number.isInteger(rootIndex)&&rootIndex>=0&&all[rootIndex]?[all[rootIndex]]:all;
+        var rows=[];
+        roots.forEach(function(root){Array.prototype.slice.call(root.querySelectorAll('tbody > tr,.el-table__body-wrapper tbody > tr,.ant-table-tbody > tr,.ivu-table-tbody > tr,[role="rowgroup"] > [role="row"]')).forEach(function(row){if(visible(row)&&rows.indexOf(row)<0)rows.push(row);});});
+        var index=Number(cfg.recorded_row_index), row=Number.isInteger(index)&&index>=0?rows[index]:null;
+        var recorded=preview(cfg.recorded_item_summary), actual=row?preview(row.innerText||row.textContent):'';
+        var fields=(cfg.identity&&cfg.identity.selected)||cfg.fields||[];
+        var stableAttrs=['data-row-key','data-key','data-id','data-row-id','data-record-id'];
+        var identities=fields.filter(function(f){return f.kind==='row_attr'&&stableAttrs.indexOf(f.attr)>=0&&norm(f.value);});
+        var comparison='unavailable';
+        if(row&&identities.length&&identities.every(function(f){return norm(row.getAttribute(f.attr));})){
+          comparison=identities.every(function(f){return norm(row.getAttribute(f.attr))===norm(f.value);})?'matched':'mismatch';
+        }
+        var changed=Boolean(norm(recorded)&&norm(recorded)!==norm(actual));
+        return {kind:'table',mode:'ordinal',status:!row?'not_found':(comparison==='mismatch'?'mismatch':(changed?'content_changed':'matched')),identity_comparison:comparison,recorded_item_index:Number.isInteger(index)?index+1:null,recorded_item_summary:recorded,runtime_item_summary:actual};
+      }catch(e){return {kind:${JSON.stringify(diagnosticKind)},mode:'ordinal',status:'diagnostic_error'};}
+    })()`;
+  }
+
+  /**
+   * 在录制时选中的“业务行”内寻找动作控件。语义行定位是安全模式：
+   * 找不到或命中多行时返回 null，绝不能回落到录制时的第 N 行。
+   */
+  static _collectionItemPickExpr(rawValue) {
+    let config = null;
+    try { config = typeof rawValue === 'string' ? JSON.parse(rawValue) : rawValue; } catch { return 'null'; }
+    if (!config) return 'null';
+    if (config._collection_locator_mode === 'ordinal') return PlayerManager._collectionOrdinalPickExpr(config);
+    // v3 collection_item 与旧 table_row_semantic 归一为同一解析输入。
+    if (Array.isArray(config?.identity?.selected) && config.identity.selected.length) config.fields = config.identity.selected;
+    if (config?.collection?.root) {
+      config.framework = config.collection.root.framework || config.framework;
+      config.wrapper_index = config.collection.root.wrapper_index ?? config.wrapper_index;
+    }
+    if (config?.collection?.kind && !['table', 'list', 'card', 'menu'].includes(config.collection.kind)) return 'null';
+    if (!Array.isArray(config.fields) || !config.fields.length) return 'null';
+    return `(function(){
+      try {
+        var cfg=${JSON.stringify(config)};
+        if(cfg.collection&&cfg.collection.kind!=='table'){
+          var rootCfg=cfg.collection.root||{}, itemSelector=String((cfg.collection.item||{}).selector||'[role="listitem"],li');
+          var allRoots=Array.prototype.slice.call(document.querySelectorAll(rootCfg.selector||'[role="list"],ul,ol,div'));
+          var ri=Number(rootCfg.index), preferredRoot=Number.isInteger(ri)&&ri>=0?allRoots[ri]:null;
+          function visible(n){var r=n.getBoundingClientRect(),s=getComputedStyle(n);return (r.width>0||r.height>0)&&s.display!=='none'&&s.visibility!=='hidden';}
+          function norm(v){return String(v||'').replace(/\\s+/g,' ').trim();}
+          function semanticTexts(item){var values=[norm(item.getAttribute&&item.getAttribute('aria-label')),norm(item.innerText||item.textContent)];Array.prototype.slice.call(item.querySelectorAll('h1,h2,h3,h4,h5,h6,[title],strong,b,.title,[class*="title"],[class*="name"]')).forEach(function(node){values.push(norm(node.innerText||node.textContent||(node.getAttribute&&node.getAttribute('title'))));});return values.filter(function(value,index){return value&&values.indexOf(value)===index;});}
+          function itemMatches(item){var values=semanticTexts(item);return visible(item)&&cfg.fields.every(function(f){return f.kind==='item_text'&&values.indexOf(norm(f.value))>=0;});}
+          var found=preferredRoot?Array.prototype.slice.call(preferredRoot.querySelectorAll(':scope > '+itemSelector)).filter(itemMatches):[];
+          if(!preferredRoot||found.length===0){var fallbackRoots=allRoots.filter(function(root){return root!==preferredRoot;});found=Array.prototype.slice.call(document.querySelectorAll(itemSelector)).filter(function(item){return fallbackRoots.indexOf(item.parentElement)>=0&&itemMatches(item);});}
+          if(found.length!==1)return null; var row=found[0],action=cfg.action||{},scope=String(action.scope||''),target=null;
+          if(action.css){try{if(scope!=='descendant'&&row.matches(action.css))target=row;if(!target&&scope!=='self')target=row.querySelector(action.css);}catch(e){}}
+          if(!target&&action.text){var expected=norm(action.text),tag=String(action.tag||'').toLowerCase();if(scope!=='descendant'&&(!tag||String(row.tagName||'').toLowerCase()===tag)&&norm(row.innerText||row.textContent)===expected)target=row;if(!target&&scope!=='self')target=Array.prototype.slice.call(row.querySelectorAll('a,button,[role="button"],[role="link"],span,div')).find(function(n){return(!tag||String(n.tagName||'').toLowerCase()===tag)&&norm(n.innerText||n.textContent)===expected;})||null;}
+          return target;
+        }
+        var resolution=(${PlayerManager._resolveSemanticTable.toString().replace(/^[^(]+/, 'function')})(cfg);
+        return resolution.status==='matched'?resolution.target||null:null;
+      }catch(e){return null;}
+    })()`;
+  }
+
+  /** 将固定列中的 DOM 副本映射回唯一的主表业务行，再选择实际可点击的操作。 */
+  static _resolveSemanticTable(cfg, locateAction = true) {
+    const norm = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const preview = (value) => norm(value).slice(0, 360);
+    const result = {
+      kind: 'table',
+      mode: 'semantic',
+      recorded_item_index: Number.isInteger(Number(cfg.recorded_row_index)) ? Number(cfg.recorded_row_index) + 1 : null,
+      recorded_item_summary: preview(cfg.recorded_item_summary),
+      fields: (cfg.fields || []).map((field) => ({ header: String(field.header || field.attr || ''), value: preview(field.value) })),
+    };
+    if (!Array.isArray(cfg.fields) || !cfg.fields.length) return { ...result, status: 'invalid' };
+    const framework = String(cfg.framework || cfg.collection?.root?.framework || '');
+    const selector = framework === 'el' ? '.el-table'
+      : framework === 'ant' ? '.ant-table'
+        : framework === 'ivu' ? '.ivu-table' : 'table,[role="grid"]';
+    const allRoots = [...document.querySelectorAll(selector)];
+    const rootIndex = Number(cfg.wrapper_index ?? cfg.collection?.root?.wrapper_index);
+    const roots = Number.isInteger(rootIndex) && rootIndex >= 0 && allRoots[rootIndex]
+      ? [allRoots[rootIndex]] : allRoots;
+    const fixedSelector = '.ivu-table-fixed,.ivu-table-fixed-right,.el-table__fixed,.el-table__fixed-right,.ant-table-fixed-left,.ant-table-fixed-right';
+    const visible = (node) => {
+      const rect = node.getBoundingClientRect();
+      const style = getComputedStyle(node);
+      return (rect.width > 0 || rect.height > 0) && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const fixedOwner = (row) => row.closest?.(fixedSelector) || null;
+    const cells = (row) => [...row.querySelectorAll(':scope > td,:scope > th,:scope > .ant-table-cell,:scope > .el-table__cell,:scope > .ivu-table-cell,:scope > [role="gridcell"]')];
+    const matchesIdentity = (row) => {
+      const rowCells = cells(row);
+      return cfg.fields.every((field) => {
+        if (field.kind === 'row_attr') return norm(row.getAttribute(field.attr)) === norm(field.value);
+        const index = Number(field.col_index);
+        return Number.isInteger(index) && norm(rowCells[index]?.innerText || rowCells[index]?.textContent) === norm(field.value);
+      });
+    };
+    const rootRows = roots.map((root) => ({
+      root,
+      rows: [...root.querySelectorAll('tbody > tr,.el-table__body-wrapper tbody > tr,.ant-table-tbody > tr,.ivu-table-tbody > tr,[role="rowgroup"] > [role="row"]')]
+        .filter((row) => visible(row) && (!row.closest || row.closest(selector) === root)),
+    }));
+    const keyAttrs = ['data-row-key', 'data-key', 'data-id', 'data-row-id', 'data-record-id'];
+    const groups = [];
+    const mappedRows = new Set();
+    for (const { rows } of rootRows) {
+      const mainRows = rows.filter((item) => !fixedOwner(item));
+      const owners = [...new Set(rows.map(fixedOwner).filter(Boolean))];
+      const rootGroups = mainRows.map((row) => ({ row, peers: [row] }));
+      mainRows.forEach((row) => mappedRows.add(row));
+      // A table without fixed panes has one DOM row per business row.
+      for (const owner of owners) {
+        const copies = rows.filter((candidate) => fixedOwner(candidate) === owner);
+        for (const [index, copy] of copies.entries()) {
+          const keyed = rootGroups.filter(({ row }) => keyAttrs.some((attr) => row.getAttribute(attr)
+            && copy.getAttribute(attr) && row.getAttribute(attr) === copy.getAttribute(attr)));
+          const candidate = keyed.length === 1 ? keyed[0]
+            : keyed.length ? null : copies.length === mainRows.length ? rootGroups[index] : null;
+          if (!candidate) continue;
+          const row = candidate.row;
+          if (keyAttrs.some((attr) => row.getAttribute(attr) && copy.getAttribute(attr)
+            && row.getAttribute(attr) !== copy.getAttribute(attr))) continue;
+          const a = row.getBoundingClientRect();
+          const b = copy.getBoundingClientRect();
+          if (Math.abs(a.top - b.top) > 3 || Math.abs(a.bottom - b.bottom) > 3) continue;
+          candidate.peers.push(copy);
+          mappedRows.add(copy);
+        }
+      }
+      groups.push(...rootGroups);
+    }
+    const domMatches = rootRows.flatMap(({ rows }) => rows).filter(matchesIdentity);
+    const matches = groups.filter(({ peers }) => peers.some(matchesIdentity));
+    const unmappedMatches = domMatches.filter((row) => !mappedRows.has(row));
+    result.match_count = matches.length;
+    result.dom_match_count = domMatches.length;
+    result.fixed_copy_count = domMatches.filter(fixedOwner).length;
+    result.unmapped_match_count = unmappedMatches.length;
+    result.status = unmappedMatches.length ? 'unmapped'
+      : matches.length === 1 ? 'matched' : matches.length ? 'ambiguous' : 'not_found';
+    if (result.status !== 'matched') return result;
+
+    const { row, peers } = matches[0];
+    const matchedPeer = peers.find(matchesIdentity) || row;
+    result.matched_item_summary = preview(matchedPeer.innerText || matchedPeer.textContent);
+    if (!locateAction) return result;
+    const action = cfg.action || {};
+    const scope = String(action.scope || '');
+    const expectedText = norm(action.text);
+    const tag = String(action.tag || '').toLowerCase();
+    const validAction = (node) => node && visible(node)
+      && (!tag || String(node.tagName || '').toLowerCase() === tag)
+      && (!expectedText || norm(node.innerText || node.textContent) === expectedText);
+    const actionIn = (item) => {
+      let target = null;
+      if (action.css) {
+        try {
+          if (scope !== 'descendant' && item.matches(action.css)) target = item;
+          if (!target && scope !== 'self') target = item.querySelector(action.css);
+        } catch { /* Prefer the exact action text inside this row. */ }
+      }
+      if (validAction(target)) return target;
+      if (!expectedText) return null;
+      if (scope !== 'descendant' && validAction(item)) return item;
+      const candidates = scope === 'self' ? [] : [...item.querySelectorAll('a,button,[role="button"],[role="link"],span,div')].filter(validAction);
+      return candidates.length === 1 ? candidates[0] : null;
+    };
+    for (const peer of peers) {
+      const target = actionIn(peer);
+      if (!target) continue;
+      let rect = target.getBoundingClientRect();
+      const viewport = document.documentElement;
+      if (viewport && (rect.left + rect.width / 2 < 0 || rect.top + rect.height / 2 < 0
+        || rect.left + rect.width / 2 >= viewport.clientWidth || rect.top + rect.height / 2 >= viewport.clientHeight)) {
+        target.scrollIntoView?.({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+        rect = target.getBoundingClientRect();
+      }
+      const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      if (hit === target || (hit && target.contains(hit))) {
+        result.target = target;
+        result.action_pane = peer === row ? 'main' : 'fixed';
+        break;
+      }
+    }
+    return result;
+  }
+
+  /** 固定项序号模式：仅使用录制当时的第 N 项，并在该项内继续解析动作控件。 */
+  static _collectionOrdinalPickExpr(config) {
+    if (!config) return 'null';
+    return `(function(){try{return (${PlayerManager._resolveCollectionOrdinal.toString().replace(/^[^(]+/, 'function')})(${JSON.stringify(config)});}catch(e){return null;}})()`;
+  }
+
+  static _resolveCollectionOrdinal(cfg, semanticPeers = null) {
+    const visible = (node) => {
+      const rect = node.getBoundingClientRect(); const style = getComputedStyle(node);
+      return (rect.width > 0 || rect.height > 0) && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const isNativeToggle = (node) => {
+      if (!node || String(node.tagName || '').toLowerCase() !== 'input') return false;
+      const type = String(node.type || '').toLowerCase();
+      return type === 'radio' || type === 'checkbox';
+    };
+    const norm = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const action = cfg.action || {}, scope = String(action.scope || '');
+    // 保留集合行内的隐藏原生状态控件，交给 _buildFindCode 映射到
+    // 可见 label/组件代理，同时继续以原始 input 做点击后状态校验。
+    const matchesAction = (node) => node && (visible(node) || isNativeToggle(node))
+      && (!action.tag || String(node.tagName || '').toLowerCase() === String(action.tag).toLowerCase())
+      && (!action.text || norm(node.innerText || node.textContent) === norm(action.text));
+    const targetIn = (item) => {
+      if (!item) return null;
+      let target = null;
+      if (action.css) {
+        try {
+          if (scope !== 'descendant' && item.matches(action.css)) target = item;
+          if (!target && scope !== 'self') target = item.querySelector(action.css);
+        } catch { /* Invalid recorded selector: try the recorded action text in this row only. */ }
+      }
+      if (target && matchesAction(target)) return target;
+      if (!action.text) return null;
+      if (scope !== 'descendant' && matchesAction(item)) return item;
+      const matches = scope === 'self' ? [] : [...item.querySelectorAll('a,button,[role="button"],[role="link"],span,div')].filter(matchesAction);
+      return matches.length === 1 ? matches[0] : null;
+    };
+    if (cfg?.collection?.kind && cfg.collection.kind !== 'table') {
+      const rootCfg = cfg.collection.root || {};
+      let roots = [...document.querySelectorAll(rootCfg.selector || '[role="list"],ul,ol,div')];
+      const rootIndex = Number(rootCfg.index);
+      if (Number.isInteger(rootIndex) && rootIndex >= 0) roots = roots[rootIndex] ? [roots[rootIndex]] : [];
+      const items = roots.flatMap((root) => [...root.querySelectorAll(`:scope > ${(cfg.collection.item || {}).selector || '[role="listitem"],li'}`)]).filter(visible);
+      const index = Number(cfg.recorded_item_index);
+      return targetIn(Number.isInteger(index) && index >= 0 ? items[index] : null);
+    }
+    const framework = String(cfg.collection?.root?.framework || cfg.framework || '');
+    const selector = framework === 'el' ? '.el-table' : (framework === 'ant' ? '.ant-table' : (framework === 'ivu' ? '.ivu-table' : 'table,[role="grid"]'));
+    const roots = [...document.querySelectorAll(selector)];
+    const rootIndex = Number(cfg.collection?.root?.wrapper_index ?? cfg.wrapper_index);
+    // An absent recorded wrapper must not redirect an action into another table.
+    const root = Number.isInteger(rootIndex) && rootIndex >= 0 ? roots[rootIndex] : roots.length === 1 ? roots[0] : null;
+    if (!root) return null;
+    const fixedSelector = '.ivu-table-fixed,.ivu-table-fixed-right,.el-table__fixed,.el-table__fixed-right,.ant-table-fixed-left,.ant-table-fixed-right';
+    const rows = [...root.querySelectorAll('tbody > tr,[role="rowgroup"] > [role="row"]')]
+      .filter((row) => visible(row) && (!row.closest || row.closest(selector) === root));
+    const fixedOwner = (row) => row.closest ? row.closest(fixedSelector) : null;
+    const mainRows = rows.filter((row) => !fixedOwner(row));
+    const index = Number(cfg.recorded_row_index);
+    const row = Number.isInteger(index) && index >= 0 ? mainRows[index] : null;
+    if (!row) return null;
+    if (semanticPeers && semanticPeers[0] !== row) return null;
+    const peers = semanticPeers && semanticPeers[0] === row ? semanticPeers : [row];
+    const owners = [...new Set(rows.map(fixedOwner).filter(Boolean))];
+    for (const owner of semanticPeers ? [] : owners) {
+      const copies = rows.filter((candidate) => fixedOwner(candidate) === owner);
+      // A fixed pane must represent the same row sequence, not another nested table.
+      if (copies.length !== mainRows.length) continue;
+      const copy = copies[index];
+      const attrs = ['data-row-key', 'data-key', 'data-id', 'data-row-id', 'data-record-id'];
+      if (attrs.some((attr) => row.getAttribute(attr) && copy.getAttribute(attr) && row.getAttribute(attr) !== copy.getAttribute(attr))) continue;
+      const a = row.getBoundingClientRect(), b = copy.getBoundingClientRect();
+      if (Math.abs(a.top - b.top) > 3 || Math.abs(a.bottom - b.bottom) > 3) continue;
+      peers.push(copy);
+    }
+    const targets = peers.map(targetIn).filter(Boolean);
+    if (!owners.length) return targets[0] || null;
+    // Fixed copies are separate DOM nodes. Select only a node which receives its own hit-test.
+    // Never deliver a synthetic DOM click through a real modal or to a same-label adjacent row.
+    return targets.find((target) => {
+      let hitTarget = target;
+      if (!visible(hitTarget) && isNativeToggle(target)) {
+        const labels = target.labels ? Array.from(target.labels) : [];
+        hitTarget = labels.find((label) => label?.control === target && visible(label)) || null;
+      }
+      if (!hitTarget) return false;
+      let r = hitTarget.getBoundingClientRect();
+      const viewport = document.documentElement;
+      if (viewport && (r.left + r.width / 2 < 0 || r.top + r.height / 2 < 0
+        || r.left + r.width / 2 >= viewport.clientWidth || r.top + r.height / 2 >= viewport.clientHeight)) {
+        hitTarget.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+        r = hitTarget.getBoundingClientRect();
+      }
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      return hit === hitTarget || (hit && hitTarget.contains(hit));
+    }) || null;
   }
 
   static _getTreeInteractionConfig(locatorMeta) {
@@ -4983,10 +6356,72 @@ export class PlayerManager {
     return ctxCfg && typeof ctxCfg === 'object' ? ctxCfg : null;
   }
 
+  // 为树语义定位生成最小 locator meta。树节点在虚拟列表中时，普通 CSS/XPath
+  // 尚未渲染，必须由树定位器在滚动后的 DOM 中重新匹配。
+  static _treeInteractionLocatorMeta(config) {
+    if (!config || typeof config !== 'object') return null;
+    const value = JSON.stringify(config);
+    return {
+      version: 1,
+      candidates: [{ type: 'tree_interaction', value, score: 1 }],
+      context: { tree_interaction: config },
+    };
+  }
+
+  static _treeScrollStepExpr(config) {
+    const framework = String(config?.framework || '').trim().toLowerCase();
+    if (!framework) return 'null';
+    return `(function(){
+      try {
+        var framework = ${JSON.stringify(framework)};
+        var selectors = framework === 'ant-tree'
+          ? '.ant-select-tree-list-holder, .ec-ant-select-tree-list-holder, [class*="-ant-select-tree-list-holder"], .ant-tree-list-holder, .ec-ant-tree-list-holder, [class*="-ant-tree-list-holder"], .rc-virtual-list-holder, .ant-select-tree, .ec-ant-select-tree, [class$="-ant-select-tree"], .ant-tree, .ec-ant-tree, [class$="-ant-tree"]'
+          : framework === 'element-tree'
+            ? '.el-tree .el-scrollbar__wrap, .el-tree'
+            : framework === 'iview-tree'
+              ? '.ivu-tree, .ivu-select-dropdown'
+              : '.vtree-tree, [role="tree"]';
+        function visible(el) {
+          if (!el || !el.getBoundingClientRect) return false;
+          var r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          var s = window.getComputedStyle(el);
+          return s.display !== 'none' && s.visibility !== 'hidden';
+        }
+        var candidates = [];
+        function add(el) {
+          if (!el || candidates.indexOf(el) >= 0 || !visible(el)) return;
+          if (el.scrollHeight - el.clientHeight > 2) candidates.push(el);
+        }
+        Array.prototype.slice.call(document.querySelectorAll(selectors)).forEach(function(seed) {
+          add(seed);
+          var cur = seed.parentElement;
+          for (var i = 0; cur && i < 4; i++, cur = cur.parentElement) add(cur);
+          Array.prototype.slice.call(seed.querySelectorAll('*')).forEach(add);
+        });
+        var moved = false, wrapped = false;
+        candidates.slice(0, 6).forEach(function(container) {
+          var maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+          if (maxTop <= 2) return;
+          var before = container.scrollTop;
+          var step = Math.max(48, Math.floor(container.clientHeight * 0.72));
+          var next = before + step;
+          if (next >= maxTop - 1 && before > 0) { next = 0; wrapped = true; }
+          else next = Math.min(maxTop, next);
+          container.scrollTop = next;
+          try { container.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (e) {}
+          if (container.scrollTop !== before) moved = true;
+        });
+        return { count: candidates.length, moved: moved, wrapped: wrapped };
+      } catch (e) { return { count: 0, moved: false, error: String(e && e.message || e) }; }
+    })()`;
+  }
+
   static _treeInteractionDiagnosticExpr(locatorMeta) {
     const cfg = PlayerManager._getTreeInteractionConfig(locatorMeta);
     if (!cfg) return 'null';
     const framework = String(cfg.framework || '').trim().toLowerCase();
+    const variant = String(cfg.variant || '').trim().toLowerCase();
     const kind = String(cfg.kind || '').trim().toLowerCase();
     const title = String(cfg.title || '').trim().replace(/\s+/g, ' ');
     if (!framework || !kind || !title) return 'null';
@@ -4998,6 +6433,7 @@ export class PlayerManager {
     return `(function(){
       try {
         var framework = ${JSON.stringify(framework)};
+        var variant = ${JSON.stringify(variant)};
         var kind = ${JSON.stringify(kind)};
         var title = ${JSON.stringify(title)};
         var expectedParentPath = ${JSON.stringify(parentPath)};
@@ -5067,8 +6503,20 @@ export class PlayerManager {
         function targetOf(node) {
           if (!node) return null;
           if (framework === 'ant-tree') {
-            if (kind === 'expand_toggle') return node.querySelector && node.querySelector('.ant-tree-switcher');
-            if (kind === 'node_content') return node.querySelector && node.querySelector('.ant-tree-node-content-wrapper, .ant-tree-title') || node;
+            var isSelectTree = variant === 'select' || Array.prototype.slice.call(node.classList || []).some(function(name){return /ant-select-tree-treenode$/.test(name);});
+            var contentSelector = isSelectTree
+              ? '.ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"]'
+              : '.ant-tree-node-content-wrapper, .ec-ant-tree-node-content-wrapper, [class*="-ant-tree-node-content-wrapper"]';
+            var titleSelector = isSelectTree
+              ? '.ant-select-tree-title, .ec-ant-select-tree-title, [class*="-ant-select-tree-title"]'
+              : '.ant-tree-title, .ec-ant-tree-title, [class*="-ant-tree-title"]';
+            if (kind === 'expand_toggle') return node.querySelector && node.querySelector(isSelectTree
+              ? '.ant-select-tree-switcher, .ec-ant-select-tree-switcher, [class*="-ant-select-tree-switcher"]'
+              : '.ant-tree-switcher, .ec-ant-tree-switcher, [class*="-ant-tree-switcher"]');
+            if (kind === 'node_content') return node.querySelector && node.querySelector(contentSelector + ', ' + titleSelector) || node;
+            if (kind === 'checkbox') return node.querySelector && node.querySelector(isSelectTree
+              ? '.ant-select-tree-checkbox, .ec-ant-select-tree-checkbox, [class*="-ant-select-tree-checkbox"]'
+              : '.ant-tree-checkbox, .ec-ant-tree-checkbox, [class*="-ant-tree-checkbox"]');
             if (kind === 'node_action') {
               var hosts = node.querySelectorAll('.tree-node-actions .data-source-icon, .tree-node-actions [class*="data-source-icon"]');
               if (!hosts || !hosts.length) hosts = node.querySelectorAll('.tree-node-actions .action-icon-wrapper, .tree-node-actions [class*="action-icon"]');
@@ -5079,17 +6527,55 @@ export class PlayerManager {
             if (kind === 'expand_toggle') return node.querySelector && node.querySelector('.vtree-tree-node__square.vtree-tree-node__expand');
             if (kind === 'node_content') return node.querySelector && node.querySelector('.vtree-tree-node__title, .vtree-tree-node__node-body') || node;
           }
+          if (framework === 'element-tree') {
+            if (kind === 'expand_toggle') return node.querySelector && node.querySelector('.el-tree-node__expand-icon');
+            if (kind === 'checkbox') return node.querySelector && node.querySelector('.el-checkbox');
+            if (kind === 'node_content') return node.querySelector && node.querySelector('.el-tree-node__content, .el-tree-node__label') || node;
+          }
+          if (framework === 'iview-tree') {
+            var item = node.closest && node.closest('li') || node.parentElement || node;
+            if (kind === 'expand_toggle') return item.querySelector && item.querySelector('.ivu-tree-arrow');
+            if (kind === 'checkbox') return item.querySelector && item.querySelector('.ivu-checkbox');
+            if (kind === 'node_content') return node;
+          }
           return null;
         }
         var nodes = [];
         var items = [];
         if (framework === 'ant-tree') {
-          nodes = Array.prototype.slice.call(document.querySelectorAll('.ant-tree-treenode'));
-          if (!nodes.length) nodes = Array.prototype.slice.call(document.querySelectorAll('.ant-tree-node-content-wrapper, [role="treeitem"]'));
-          items = collect(nodes, function(node){ return visibleTitle(node.querySelector && node.querySelector('.ant-tree-title') || node); }, function(node){ return node.querySelector && node.querySelector('.ant-tree-node-content-wrapper') || node; });
+          var isSelectTree = variant === 'select';
+          var nodeSelector = isSelectTree
+            ? '.ant-select-tree-treenode, .ec-ant-select-tree-treenode, [class*="-ant-select-tree-treenode"]'
+            : '.ant-tree-treenode, .ec-ant-tree-treenode, [class*="-ant-tree-treenode"]';
+          var contentSelector = isSelectTree
+            ? '.ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"]'
+            : '.ant-tree-node-content-wrapper, .ec-ant-tree-node-content-wrapper, [class*="-ant-tree-node-content-wrapper"]';
+          var titleSelector = isSelectTree
+            ? '.ant-select-tree-title, .ec-ant-select-tree-title, [class*="-ant-select-tree-title"]'
+            : '.ant-tree-title, .ec-ant-tree-title, [class*="-ant-tree-title"]';
+          nodes = Array.prototype.slice.call(document.querySelectorAll(nodeSelector));
+          if (!nodes.length && variant !== 'tree') {
+            var selectNodes = Array.prototype.slice.call(document.querySelectorAll('.ant-select-tree-treenode, .ec-ant-select-tree-treenode, [class*="-ant-select-tree-treenode"]'));
+            if (selectNodes.length) {
+              isSelectTree = true;
+              nodeSelector = '.ant-select-tree-treenode, .ec-ant-select-tree-treenode, [class*="-ant-select-tree-treenode"]';
+              contentSelector = '.ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"]';
+              titleSelector = '.ant-select-tree-title, .ec-ant-select-tree-title, [class*="-ant-select-tree-title"]';
+              nodes = selectNodes;
+            }
+          }
+          if (!nodes.length) nodes = Array.prototype.slice.call(document.querySelectorAll(contentSelector + ', [role="treeitem"]'));
+          items = collect(nodes, function(node){ return visibleTitle(node.querySelector && node.querySelector(titleSelector) || node); }, function(node){ return node.querySelector && node.querySelector(contentSelector) || node; });
         } else if (framework === 'vtree') {
           nodes = Array.prototype.slice.call(document.querySelectorAll('.vtree-tree-node__indent-wrapper'));
           items = collect(nodes, function(node){ return visibleTitle(node.querySelector && (node.querySelector('.vtree-tree-node__title .node') || node.querySelector('.vtree-tree-node__title') || node.querySelector('.node')) || node); }, function(node){ return node.querySelector && node.querySelector('.vtree-tree-node__title, .vtree-tree-node__node-body') || node; });
+        } else if (framework === 'element-tree' || framework === 'iview-tree') {
+          var isElementTree = framework === 'element-tree';
+          var nodeSelector = isElementTree ? '.el-tree-node' : '.ivu-tree-title';
+          var titleSelector = isElementTree ? '.el-tree-node__label' : '';
+          var anchorSelector = isElementTree ? '.el-tree-node__content' : '';
+          nodes = Array.prototype.slice.call(document.querySelectorAll(nodeSelector));
+          items = collect(nodes, function(node){ return visibleTitle(titleSelector && node.querySelector && node.querySelector(titleSelector) || node); }, function(node){ return anchorSelector && node.querySelector && node.querySelector(anchorSelector) || node; });
         }
         var sameTitle = items.filter(function(item){ return item.title === title; });
         var pathMatched = sameTitle.filter(function(item){ return samePath(expectedParentPath, item.parentPath || []); });
@@ -5645,7 +7131,204 @@ export class PlayerManager {
     };
   }
 
-  static _textExactTagPickExpr(rawValue) {
+  static _explicitRevealDependency(step, nextStep) {
+    const action = String(step?.action_type || '').trim().toLowerCase();
+    if (!['click', 'double_click', 'right_click', 'hover'].includes(action) || !nextStep) return null;
+    const stepMeta = PlayerManager._parseLocatorMetaObject(step?.locator_meta);
+    const nextMeta = PlayerManager._parseLocatorMetaObject(nextStep?.locator_meta);
+    const reveal = nextMeta?.context?.reveal;
+    const trigger = reveal?.trigger && typeof reveal.trigger === 'object' ? reveal.trigger : null;
+    if (!trigger) {
+      const treeInteraction = PlayerManager._getTreeInteractionConfig(step?.locator_meta);
+      const recordedTag = String(stepMeta?.context?.tag || '').trim().toLowerCase();
+      const treeChildAction = String(treeInteraction?.kind || '') === 'node_action'
+        || (stepMeta?.context?.tree_node && ['a', 'button', 'i', 'svg', 'path', 'use'].includes(recordedTag));
+      const selectorHint = `${step?.target_selector || ''} ${step?.target_xpath || ''}`;
+      const genericOverlayTrigger = ['button', 'summary'].includes(recordedTag)
+        || stepMeta?.context?.has_popup === true
+        || /(?:dropdown|popover|menu|action|operation|more|ellipsis|trigger)/i.test(selectorHint);
+      const compositePopupTrigger = String(stepMeta?.context?.control_kind || '').toLowerCase() === 'combobox'
+        || /(?:^|[.\s])(el-select|ivu-select|ant-select|v-select|el-cascader|ivu-cascader|ant-cascader|t-select|arco-select|n-select)(?:[.\s]|$)/i.test(selectorHint)
+        || /role\s*=\s*["']?combobox/i.test(selectorHint);
+      // 历史录制可能没有保存 reveal.trigger。对树节点子操作和具有明确
+      // 触发器特征的普通组件/组合框，若后续紧跟浮层项，就验证浮层出现
+      // 并将失败归到触发步骤。
+      if ((treeChildAction || genericOverlayTrigger || compositePopupTrigger) && PlayerManager._stepLooksLikeOverlay(nextStep)) {
+        return {
+          mode: 'observe',
+          wait_ms: 2200,
+          expected: String(nextStep.description || nextStep.value || nextStep.action_type || '后续菜单项').slice(0, 180),
+          inferred: true,
+        };
+      }
+      return null;
+    }
+    const sameSelector = Boolean(trigger.target_selector && step.target_selector && trigger.target_selector === step.target_selector);
+    const sameXpath = Boolean(trigger.target_xpath && step.target_xpath && trigger.target_xpath === step.target_xpath);
+    if (!sameSelector && !sameXpath) return null;
+    const waitMs = Number.isFinite(Number(reveal.max_wait_ms))
+      ? Math.max(500, Math.min(3500, Number(reveal.max_wait_ms)))
+      : 2200;
+    return {
+      // 后续目标可见性只能说明页面联动是否符合录制时上下文，不能证明
+      // 当前点击本身失败。真正缺失的目标会在下一步骤定位时自然报错。
+      mode: 'observe',
+      wait_ms: waitMs,
+      expected: String(nextStep.description || nextStep.value || nextStep.action_type || '后续目标').slice(0, 180),
+    };
+  }
+
+  async _probeExplicitRevealDependency(tabId, step, nextStep) {
+    const dependency = PlayerManager._explicitRevealDependency(step, nextStep);
+    if (!dependency) return null;
+    const response = await new Promise((resolve) => {
+      chrome.tabs.sendMessage(tabId, {
+        type: 'AT_PROBE_REVEAL_DEPENDENCY',
+        step: nextStep,
+        timeoutMs: dependency.wait_ms,
+      }, (result) => {
+        if (chrome.runtime.lastError) {
+          resolve({ observed: null, evidence: 'probe_unavailable' });
+          return;
+        }
+        resolve(result && typeof result === 'object' ? result : { observed: null, evidence: 'probe_no_response' });
+      });
+    });
+    return {
+      mode: dependency.mode,
+      type: 'dependent_target_visible',
+      observed: response.observed === true ? true : response.observed === false ? false : null,
+      expected: dependency.expected,
+      actual: response.actual || '',
+      wait_ms: dependency.wait_ms,
+      evidence: String(response.evidence || ''),
+      ...(dependency.inferred === true ? { inferred: true } : {}),
+    };
+  }
+
+  static _shouldProbeOverlayPostState(step, nextStep) {
+    if (!step || !nextStep) return false;
+    const action = String(step.action_type || '').trim().toLowerCase();
+    if (!['click', 'double_click'].includes(action)) return false;
+    if (!PlayerManager._stepLooksLikeOverlay(step)) return false;
+    return Boolean(nextStep.target_selector || nextStep.target_xpath || nextStep.locator_meta);
+  }
+
+  static _isRecoverableOverlayFailure(error) {
+    const message = String(error?.message || error || '');
+    return /(?:找不到选项|下拉框中未找到任何选项|选项文本|option\s+.+\s+not\s+found|no\s+options?\s+found)/i.test(message);
+  }
+
+  async _probeStepVisibility(tabId, step) {
+    if (tabId == null || !step) return { observed: null, evidence: 'probe_unavailable' };
+    return new Promise((resolve) => {
+      try {
+        chrome.tabs.sendMessage(tabId, {
+          type: 'AT_PROBE_STEP_VISIBILITY',
+          step,
+        }, (result) => {
+          if (chrome.runtime.lastError) {
+            resolve({ observed: null, evidence: 'probe_unavailable' });
+            return;
+          }
+          resolve(result && typeof result === 'object'
+            ? result
+            : { observed: null, evidence: 'probe_no_response' });
+        });
+      } catch (e) {
+        resolve({ observed: null, evidence: 'probe_unavailable' });
+      }
+    });
+  }
+
+  async _probeOverlaySelectionEffect(tabId, step) {
+    if (tabId == null || !PlayerManager._stepLooksLikeOverlay(step)) return null;
+    return new Promise((resolve) => {
+      try {
+        chrome.tabs.sendMessage(tabId, { type: 'AT_PROBE_OVERLAY_SELECTION', step }, (result) => {
+          if (chrome.runtime.lastError || !result || typeof result !== 'object') {
+            resolve(null);
+            return;
+          }
+          resolve({
+            mode: 'observe',
+            type: 'overlay_selection',
+            observed: result.observed === true ? true : null,
+            expected: String(step.value_text || step.value || '').slice(0, 180),
+            actual: String(result.actual || '').slice(0, 180),
+            evidence: String(result.evidence || ''),
+          });
+        });
+      } catch {
+        resolve(null);
+      }
+    });
+  }
+
+  async _recoverOverlayPostState(tabId, step, nextStep, before, error) {
+    if (!PlayerManager._shouldProbeOverlayPostState(step, nextStep)) return null;
+    if (!PlayerManager._isRecoverableOverlayFailure(error)) return null;
+    // 只有“执行前不可见、报错后可见”才能证明本次动作导致了状态转换。
+    // 下一步本来就可见或前置证据缺失时不恢复，避免掩盖真实失败。
+    if (before?.observed !== false) return null;
+    const after = await this._probeStepVisibility(tabId, nextStep);
+    if (after?.observed !== true) return null;
+    return {
+      mode: 'observe',
+      type: 'next_target_visible',
+      observed: true,
+      expected: String(nextStep.description || nextStep.value || nextStep.action_type || '后续目标').slice(0, 180),
+      actual: String(after.actual || '').slice(0, 180),
+      evidence: 'target_became_visible_after_overlay_action',
+      recovered_from: PlayerManager._previewRuntimeValue(error?.message || error || '', 240),
+    };
+  }
+
+  async _observeOverlayPostState(tabId, step, nextStep, before, timeoutMs = 1500, intervalMs = 120) {
+    if (!PlayerManager._shouldProbeOverlayPostState(step, nextStep)) return null;
+    // 下一目标可见性只作为诊断线索：它可能被权限、数据、异步渲染或隐藏
+    // 原生控件影响，不能单独据此判定当前动作失败。
+    if (before?.observed !== false) return null;
+    const attempts = Math.max(1, Math.ceil(Math.max(0, Number(timeoutMs) || 0) / Math.max(1, Number(intervalMs) || 120)) + 1);
+    let after = null;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      after = await this._probeStepVisibility(tabId, nextStep);
+      if (after?.observed === true) break;
+      if (after?.observed == null) return null;
+      if (attempt + 1 < attempts) await this._sleep(intervalMs);
+    }
+    return {
+      mode: 'observe',
+      type: 'next_target_visible',
+      observed: after?.observed === true,
+      expected: String(nextStep.description || nextStep.value || nextStep.action_type || '后续目标').slice(0, 180),
+      actual: String(after?.actual || '').slice(0, 180),
+      wait_ms: Math.max(0, Number(timeoutMs) || 0),
+      evidence: after?.observed === true
+        ? 'target_became_visible_after_overlay_action'
+        : 'target_remained_hidden_after_overlay_action',
+    };
+  }
+
+  async _observeOverlayPostStateWithLoadRetry(tabId, step, nextStep, before, tabLoadTimeoutMs) {
+    const initial = await this._observeOverlayPostState(tabId, step, nextStep, before);
+    if (!initial || initial.observed !== false) {
+      return { effect: initial, tab_load_waited: false };
+    }
+
+    // 浮层选项可能立即触发导航或较慢的异步渲染。先保留快速探针，避免短生命周期
+    // 菜单拖慢回放；快速探针未命中时，再等待页面稳定并使用剩余定位窗口复核。
+    await this._waitForTabLoad(tabId, tabLoadTimeoutMs);
+    const retried = await this._observeOverlayPostState(tabId, step, nextStep, before, 4500);
+    return {
+      // 页面切换期间 content script 可能暂时不可用；缺少证据时保持“无法验证”，
+      // 不把一次明确 false 延续成假失败。
+      effect: retried?.observed == null ? null : retried,
+      tab_load_waited: true,
+    };
+  }
+
+  static _textExactTagPickExpr(rawValue, modalScoped = false) {
     const s = String(rawValue || '');
     const idx = s.indexOf('::');
     if (idx <= 0) return 'null';
@@ -5660,6 +7343,7 @@ export class PlayerManager {
         var matched = [];
         for (var i = 0; i < nodes.length; i++) {
           var el = nodes[i];
+          ${modalScoped ? 'if (!activeModal.contains(el)) continue;' : ''}
           var raw = (el.textContent || '').trim().replace(/\\s+/g, ' ');
           if (raw === normalized) matched.push(el);
         }
@@ -5766,11 +7450,70 @@ export class PlayerManager {
     })()`;
   }
 
+  static _treeNodeTextMayBeFinalTarget(locatorMeta) {
+    const context = PlayerManager._parseLocatorMetaObject(locatorMeta)?.context || {};
+    const recordedTag = String(context.tag || '').trim().toLowerCase();
+    const controlKind = String(context.control_kind || '').trim().toLowerCase();
+    const childControlTags = new Set(['a', 'button', 'input', 'label', 'select', 'textarea', 'i', 'svg', 'path', 'use']);
+    const childControlKinds = new Set(['button', 'checkbox', 'radio', 'select', 'svg', 'switch', 'menu_trigger', 'node_action']);
+    return !childControlTags.has(recordedTag) && !childControlKinds.has(controlKind);
+  }
+
+  static _treeNodeChildActionPickExpr(rawValue, locatorMeta) {
+    const context = PlayerManager._parseLocatorMetaObject(locatorMeta)?.context || {};
+    const recordedTag = String(context.tag || '').trim().toLowerCase();
+    if (!['a', 'button', 'i', 'svg', 'path', 'use'].includes(recordedTag)) return 'null';
+    const treeNodeExpr = PlayerManager._treeNodeTextPickExpr(rawValue);
+    if (treeNodeExpr === 'null') return 'null';
+    const rect = context.rect && typeof context.rect === 'object' ? context.rect : null;
+    return `(function(){
+      try {
+        var treeNode = ${treeNodeExpr};
+        if (!treeNode || !treeNode.querySelectorAll) return null;
+        var recordedTag = ${JSON.stringify(recordedTag)};
+        var recordedRect = ${JSON.stringify(rect)};
+        function visible(host) {
+          if (!host || !host.getBoundingClientRect) return false;
+          var r = host.getBoundingClientRect();
+          if (!r || (r.width <= 0 && r.height <= 0)) return false;
+          var style = window.getComputedStyle ? window.getComputedStyle(host) : null;
+          return !style || (style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) !== 0);
+        }
+        function excluded(host) {
+          return !!(host.closest && host.closest(
+            '.ant-tree-switcher, .ec-ant-tree-switcher, [class*="-ant-tree-switcher"], ' +
+            '.ant-tree-checkbox, .ec-ant-tree-checkbox, [class*="-ant-tree-checkbox"]'
+          ));
+        }
+        var hosts = Array.prototype.slice.call(treeNode.querySelectorAll(
+          'button, a[href], [role="button"], [aria-haspopup="menu"], [onclick], i'
+        )).filter(function(host){ return !excluded(host) && visible(host); });
+        if (recordedTag === 'svg' || recordedTag === 'path' || recordedTag === 'use') {
+          var svgHosts = hosts.filter(function(host){ return !!(host.querySelector && host.querySelector('svg')); });
+          if (svgHosts.length) hosts = svgHosts;
+        }
+        if (hosts.length === 1) return hosts[0];
+        if (!hosts.length || !recordedRect || !Number.isFinite(Number(recordedRect.left)) || !Number.isFinite(Number(recordedRect.top))) return null;
+        var expectedX = Number(recordedRect.left) + Number(recordedRect.width || 0) / 2;
+        var expectedY = Number(recordedRect.top) + Number(recordedRect.height || 0) / 2;
+        hosts.sort(function(a, b){
+          var ar = a.getBoundingClientRect();
+          var br = b.getBoundingClientRect();
+          var ad = Math.hypot(ar.left + ar.width / 2 - expectedX, ar.top + ar.height / 2 - expectedY);
+          var bd = Math.hypot(br.left + br.width / 2 - expectedX, br.top + br.height / 2 - expectedY);
+          return ad - bd;
+        });
+        return hosts[0] || null;
+      } catch (e) { return null; }
+    })()`;
+  }
+
   static _treeInteractionPickExpr(rawValue) {
     let cfg = null;
     try { cfg = JSON.parse(String(rawValue || '')); } catch { cfg = null; }
     if (!cfg || typeof cfg !== 'object') return 'null';
     const framework = String(cfg.framework || '').trim().toLowerCase();
+    const variant = String(cfg.variant || '').trim().toLowerCase();
     const kind = String(cfg.kind || '').trim().toLowerCase();
     const title = String(cfg.title || '').trim().replace(/\s+/g, ' ');
     if (!framework || !kind || !title) return 'null';
@@ -5783,6 +7526,7 @@ export class PlayerManager {
     return `(function(){
       try {
         var framework = ${JSON.stringify(framework)};
+        var variant = ${JSON.stringify(variant)};
         var kind = ${JSON.stringify(kind)};
         var title = ${JSON.stringify(title)};
         var sameTitleIndex = ${Number.isFinite(sameTitleIndex) ? sameTitleIndex : 0};
@@ -5881,23 +7625,85 @@ export class PlayerManager {
           return scored[0] && scored[0].item && scored[0].item.node || null;
         }
         if (framework === 'ant-tree') {
-          var antNodes = Array.prototype.slice.call(document.querySelectorAll('.ant-tree-treenode'));
-          if (!antNodes.length) antNodes = Array.prototype.slice.call(document.querySelectorAll('.ant-tree-node-content-wrapper, [role="treeitem"]'));
+          var isSelectTree = variant === 'select';
+          var antNodeSelector = isSelectTree
+            ? '.ant-select-tree-treenode, .ec-ant-select-tree-treenode, [class*="-ant-select-tree-treenode"]'
+            : '.ant-tree-treenode, .ec-ant-tree-treenode, [class*="-ant-tree-treenode"]';
+          var antContentSelector = isSelectTree
+            ? '.ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"]'
+            : '.ant-tree-node-content-wrapper, .ec-ant-tree-node-content-wrapper, [class*="-ant-tree-node-content-wrapper"]';
+          var antTitleSelector = isSelectTree
+            ? '.ant-select-tree-title, .ec-ant-select-tree-title, [class*="-ant-select-tree-title"]'
+            : '.ant-tree-title, .ec-ant-tree-title, [class*="-ant-tree-title"]';
+          if (kind === 'node_action' && !isSelectTree) {
+            antNodeSelector += ', .ant-select-tree-treenode, .ec-ant-select-tree-treenode, [class*="-ant-select-tree-treenode"]';
+            antContentSelector += ', .ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"]';
+            antTitleSelector += ', .ant-select-tree-title, .ec-ant-select-tree-title, [class*="-ant-select-tree-title"]';
+          }
+          var antNodes = Array.prototype.slice.call(document.querySelectorAll(antNodeSelector));
+          if (!antNodes.length && variant !== 'tree') {
+            var selectNodes = Array.prototype.slice.call(document.querySelectorAll('.ant-select-tree-treenode, .ec-ant-select-tree-treenode, [class*="-ant-select-tree-treenode"]'));
+            if (selectNodes.length) {
+              isSelectTree = true;
+              antNodeSelector = '.ant-select-tree-treenode, .ec-ant-select-tree-treenode, [class*="-ant-select-tree-treenode"]';
+              antContentSelector = '.ant-select-tree-node-content-wrapper, .ec-ant-select-tree-node-content-wrapper, [class*="-ant-select-tree-node-content-wrapper"]';
+              antTitleSelector = '.ant-select-tree-title, .ec-ant-select-tree-title, [class*="-ant-select-tree-title"]';
+              antNodes = selectNodes;
+            }
+          }
+          if (!antNodes.length) antNodes = Array.prototype.slice.call(document.querySelectorAll(antContentSelector + ', [role="treeitem"]'));
           var antItems = collect(
             antNodes,
-            function(node){ return visibleTitle(node.querySelector && node.querySelector('.ant-tree-title') || node); },
-            function(node){ return node.querySelector && node.querySelector('.ant-tree-node-content-wrapper') || node; }
+            function(node){ return visibleTitle(node.querySelector && node.querySelector(antTitleSelector) || node); },
+            function(node){ return node.querySelector && node.querySelector(antContentSelector) || node; }
           );
           var antNode = pickBest(antItems);
           if (!antNode) return null;
-          if (kind === 'expand_toggle') return antNode.querySelector && antNode.querySelector('.ant-tree-switcher');
-          if (kind === 'node_content') return antNode.querySelector && antNode.querySelector('.ant-tree-node-content-wrapper, .ant-tree-title') || antNode;
+          if (kind === 'expand_toggle') return antNode.querySelector && antNode.querySelector(isSelectTree
+            ? '.ant-select-tree-switcher, .ec-ant-select-tree-switcher, [class*="-ant-select-tree-switcher"]'
+            : '.ant-tree-switcher, .ec-ant-tree-switcher, [class*="-ant-tree-switcher"]');
+          if (kind === 'node_content') return antNode.querySelector && antNode.querySelector(antContentSelector + ', ' + antTitleSelector) || antNode;
+          if (kind === 'checkbox') return antNode.querySelector && antNode.querySelector(isSelectTree
+            ? '.ant-select-tree-checkbox, .ec-ant-select-tree-checkbox, [class*="-ant-select-tree-checkbox"]'
+            : '.ant-tree-checkbox, .ec-ant-tree-checkbox, [class*="-ant-tree-checkbox"]');
           if (kind !== 'node_action') return null;
-          var hosts = antNode.querySelectorAll('.tree-node-actions .data-source-icon, .tree-node-actions [class*="data-source-icon"]');
-          if (!hosts || !hosts.length) {
-            hosts = antNode.querySelectorAll('.tree-node-actions .action-icon-wrapper, .tree-node-actions [class*="action-icon"]');
+          var hosts = Array.prototype.slice.call(antNode.querySelectorAll(
+            '.tree-node-actions .data-source-icon, .tree-node-actions [class*="data-source-icon"], ' +
+            '.tree-node-actions .action-icon-wrapper, .tree-node-actions [class*="action-icon"], ' +
+            '[aria-haspopup="menu"], button, [role="button"], .teamNode > i'
+          ));
+          hosts = hosts.filter(function(host) {
+            return !(host.closest && host.closest(
+              '.ant-tree-switcher, .ec-ant-tree-switcher, [class*="-ant-tree-switcher"], ' +
+              '.ant-tree-checkbox, .ec-ant-tree-checkbox, [class*="-ant-tree-checkbox"]'
+            ));
+          });
+          if (hosts.length) return hosts[actionIndex] || hosts[0];
+          return null;
+        }
+        if (framework === 'element-tree' || framework === 'iview-tree') {
+          var isElementTree = framework === 'element-tree';
+          var nodeSelector = isElementTree ? '.el-tree-node' : '.ivu-tree-title';
+          var titleSelector = isElementTree ? '.el-tree-node__label' : '';
+          var anchorSelector = isElementTree ? '.el-tree-node__content' : '';
+          var componentNodes = Array.prototype.slice.call(document.querySelectorAll(nodeSelector));
+          var componentItems = collect(
+            componentNodes,
+            function(node){ return visibleTitle(titleSelector && node.querySelector && node.querySelector(titleSelector) || node); },
+            function(node){ return anchorSelector && node.querySelector && node.querySelector(anchorSelector) || node; }
+          );
+          var componentNode = pickBest(componentItems);
+          if (!componentNode) return null;
+          if (isElementTree) {
+            if (kind === 'expand_toggle') return componentNode.querySelector && componentNode.querySelector('.el-tree-node__expand-icon');
+            if (kind === 'checkbox') return componentNode.querySelector && componentNode.querySelector('.el-checkbox');
+            if (kind === 'node_content') return componentNode.querySelector && componentNode.querySelector('.el-tree-node__content, .el-tree-node__label') || componentNode;
+          } else {
+            var item = componentNode.closest && componentNode.closest('li') || componentNode.parentElement || componentNode;
+            if (kind === 'expand_toggle') return item.querySelector && item.querySelector('.ivu-tree-arrow');
+            if (kind === 'checkbox') return item.querySelector && item.querySelector('.ivu-checkbox');
+            if (kind === 'node_content') return componentNode;
           }
-          if (hosts && hosts.length) return hosts[actionIndex] || hosts[0];
           return null;
         }
         if (framework === 'vtree') {
@@ -5919,20 +7725,195 @@ export class PlayerManager {
 
   // 滚动元素到视口中央并返回视口内坐标。
   // structured=true 时返回 actionability 状态，便于区分 not_found/disabled/hidden/covered。
-  _buildFindCode(sel, xp, text, skipDisabledCheck = false, locatorMeta = null, structured = false) {
+  _buildFindCode(sel, xp, text, skipDisabledCheck = false, locatorMeta = null, structured = false, actionType = '', captureHitDiagnostic = false) {
+    const modalScoped = PlayerManager._recordedModalScope(sel, locatorMeta);
+    const scopedNodes = (nodesExpr) => modalScoped
+      ? `Array.from(${nodesExpr}).filter(function(node){ return activeModal.contains(node); })`
+      : nodesExpr;
+    const withModalScope = (expression) => modalScoped ? `(function(){
+      try {
+        var roots = Array.from(document.querySelectorAll(
+          '[role="dialog"],[role="alertdialog"],dialog,.ant-modal-wrap,.ant-modal,.ant-modal-confirm,.el-dialog__wrapper,.el-dialog,.ivu-modal-wrap,.ivu-modal,.arco-modal-wrapper,.arco-modal,.t-dialog__ctx,.t-dialog,.n-dialog,.MuiDialog-root,.MuiModal-root,[class*="modal-wrap"],[class*="Modal__"]'
+        )).filter(function(root) {
+          var node = root;
+          while (node) {
+            var style = window.getComputedStyle(node);
+            if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) < 0.02) return false;
+            if (node.getAttribute && node.getAttribute('aria-hidden') === 'true') return false;
+            node = node.parentElement;
+          }
+          var rect = root.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        });
+        roots = roots.filter(function(root) {
+          return !roots.some(function(other) { return other !== root && root.contains(other); });
+        });
+        function zIndex(root) {
+          var highest = 0;
+          for (var node = root; node; node = node.parentElement) {
+            var z = parseInt(window.getComputedStyle(node).zIndex, 10);
+            if (!isNaN(z)) highest = Math.max(highest, z);
+          }
+          return highest;
+        }
+        roots.sort(function(a, b) { return zIndex(a) - zIndex(b); });
+        var activeModal = roots[roots.length - 1];
+        if (!activeModal) return null;
+        return ${expression};
+      } catch (e) { return null; }
+    })()` : expression;
     const disabledGuard = (via) => skipDisabledCheck
       ? ''
       : `const disabledInfo = ${PlayerManager._disabledInfoCode('el')};
         if (disabledInfo && disabledInfo.disabled) {
           return ${structured ? `{ ok: false, reason: 'disabled', disabled: disabledInfo, via: '${via}' }` : 'null'};
         }`;
+    const hitDiagnosticCode = captureHitDiagnostic ? `
+        var hitDiagnostic = null;
+        if (!hitOk && hit && hit.nodeType === 1) {
+          try {
+            function diagnosticNumber(value) {
+              return Number.isFinite(value) ? Math.round(value * 10) / 10 : null;
+            }
+            function diagnosticOpacity(value) {
+              return Number.isFinite(value) ? Math.round(Math.max(0, Math.min(1, value)) * 1000) / 1000 : null;
+            }
+            function diagnosticRect(node) {
+              if (!node || !node.getBoundingClientRect) return null;
+              var box = node.getBoundingClientRect();
+              return { left: diagnosticNumber(box.left), top: diagnosticNumber(box.top),
+                width: diagnosticNumber(box.width), height: diagnosticNumber(box.height) };
+            }
+            function diagnosticStyle(node) {
+              if (!node) return null;
+              var style = window.getComputedStyle(node);
+              var opacity = Number(style.opacity);
+              var zIndex = Number(style.zIndex);
+              var effectiveOpacity = 1;
+              for (var ancestor = node; ancestor; ancestor = ancestor.parentElement) {
+                var ancestorOpacity = Number(window.getComputedStyle(ancestor).opacity);
+                if (Number.isFinite(ancestorOpacity)) effectiveOpacity *= ancestorOpacity;
+              }
+              return {
+                display: style.display === 'none' ? 'none' : 'rendered',
+                visibility: style.visibility === 'visible' ? 'visible' : style.visibility === 'hidden' ? 'hidden' : 'other',
+                opacity: diagnosticOpacity(opacity),
+                effective_opacity: diagnosticOpacity(effectiveOpacity),
+                pointer_events: style.pointerEvents === 'none' ? 'none' : style.pointerEvents === 'auto' ? 'auto' : 'other',
+                z_index: Number.isFinite(zIndex) ? diagnosticNumber(zIndex) : null,
+              };
+            }
+            var selectSelector = '.ivu-select,.el-select,.ant-select';
+            var blockerOwner = hit.closest && hit.closest(selectSelector);
+            var targetOwner = target.closest && target.closest(selectSelector);
+            var dropdown = hit.closest && hit.closest('.ivu-select-dropdown,.el-select-dropdown,.ant-select-dropdown');
+            function selectOpen(node) {
+              if (!node) return null;
+              var expanded = node.getAttribute && node.getAttribute('aria-expanded');
+              var classes = node.classList;
+              return expanded === 'true' ? true : expanded === 'false' ? false
+                : classes && classes.contains('ivu-select') ? classes.contains('ivu-select-visible')
+                : classes && classes.contains('ant-select') ? classes.contains('ant-select-open')
+                : null;
+            }
+            hitDiagnostic = {
+              viewport_width: diagnosticNumber(Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0)),
+              viewport_height: diagnosticNumber(Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0)),
+              target_rect: diagnosticRect(target),
+              blocker_rect: diagnosticRect(hit),
+              blocker_style: diagnosticStyle(hit),
+              dropdown_rect: diagnosticRect(dropdown),
+              dropdown_style: diagnosticStyle(dropdown),
+              blocker_owner_found: !!blockerOwner,
+              blocker_owner_open: selectOpen(blockerOwner),
+              target_owner_found: !!targetOwner,
+              target_owner_open: selectOpen(targetOwner),
+              same_control: blockerOwner && targetOwner ? blockerOwner === targetOwner : null,
+              open_select_count: document.querySelectorAll('.ivu-select-visible,.ant-select-open').length,
+            };
+          } catch (diagnosticError) {}
+        }
+    ` : '';
 
     const wrap = (findExpr, via) => `(function(){
       try {
         const el = ${findExpr};
         if (!el) return null;
+        ${modalScoped ? 'if (!activeModal.contains(el)) return null;' : ''}
         ${disabledGuard(via)}
         let target = el;
+        const locatorContext = ${JSON.stringify(PlayerManager._parseLocatorMetaObject(locatorMeta)?.context || null)};
+        const requestedAction = ${JSON.stringify(String(actionType || '').trim().toLowerCase())};
+        function nearestTreeClickableHost(node) {
+          const recordedTag = String(locatorContext && locatorContext.tag || '').trim().toLowerCase();
+          const tag = String(node && node.tagName || '').trim().toLowerCase();
+          if (!['svg', 'path', 'use'].includes(recordedTag) || !['svg', 'path', 'use'].includes(tag)) return null;
+          const treeNode = node.closest && node.closest(
+            '.ant-tree-treenode, .ec-ant-tree-treenode, [class*="-ant-tree-treenode"], [role="treeitem"]'
+          );
+          if (!treeNode) return null;
+          const host = node.closest && node.closest(
+            'button, a[href], [role="button"], [aria-haspopup="menu"], [onclick], i'
+          );
+          if (!host || host === treeNode || !(treeNode.contains && treeNode.contains(host))) return null;
+          if (host.closest && host.closest(
+            '.ant-tree-switcher, .ec-ant-tree-switcher, [class*="-ant-tree-switcher"], ' +
+            '.ant-tree-checkbox, .ec-ant-tree-checkbox, [class*="-ant-tree-checkbox"]'
+          )) return null;
+          const hr = host.getBoundingClientRect && host.getBoundingClientRect();
+          if (!hr || (hr.width <= 0 && hr.height <= 0)) return null;
+          return host;
+        }
+        const promotedTreeHost = nearestTreeClickableHost(el);
+        if (promotedTreeHost) target = promotedTreeHost;
+        function findVisibleNativeToggleHost(input) {
+          if (!input || String(input.tagName || '').toLowerCase() !== 'input') return null;
+          const type = String(input.type || '').toLowerCase();
+          if (type !== 'radio' && type !== 'checkbox') return null;
+          function usableHost(host) {
+            if (!host || host === input || !host.getBoundingClientRect) return false;
+            const rect = host.getBoundingClientRect();
+            if (rect.width <= 2 || rect.height <= 2) return false;
+            const style = window.getComputedStyle(host);
+            if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) === 0) return false;
+            const nested = Array.from(host.querySelectorAll ? host.querySelectorAll('a[href],button,select,textarea,[role="button"]') : []);
+            return !nested.some(function(node) {
+              const nr = node.getBoundingClientRect();
+              return node !== input && nr.width > 2 && nr.height > 2;
+            });
+          }
+          function activatesControl(host) {
+            if (!host) return false;
+            if (String(host.tagName || '').toLowerCase() === 'label') {
+              return host.control === input || (host.contains && host.contains(input))
+                || !!(input.id && host.getAttribute && host.getAttribute('for') === input.id);
+            }
+            return !!(host.contains && host.contains(input));
+          }
+          const activation = locatorContext && locatorContext.activation_target;
+          if (activation && typeof activation === 'object') {
+            let recordedHost = null;
+            try {
+              if (activation.selector) recordedHost = document.querySelector(String(activation.selector));
+            } catch (e) {}
+            try {
+              if (!recordedHost && activation.xpath) {
+                recordedHost = document.evaluate(String(activation.xpath), document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+              }
+            } catch (e) {}
+            if (activatesControl(recordedHost) && usableHost(recordedHost)) return recordedHost;
+          }
+          const inputRect = input.getBoundingClientRect();
+          if (inputRect.width > 2 || inputRect.height > 2) return null;
+          const labels = input.labels ? Array.from(input.labels) : [];
+          for (const label of labels) {
+            if (!label || label.control !== input) continue;
+            if (usableHost(label)) return label;
+          }
+          const component = input.closest && input.closest('.ivu-radio-wrapper, .ant-radio-wrapper, .el-radio, .ivu-checkbox-wrapper, .ant-checkbox-wrapper, .el-checkbox');
+          if (usableHost(component)) return component;
+          return null;
+        }
         if (target.matches && target.matches('.ivu-select,.ant-select,.el-select,.v-select,.vs__dropdown-toggle,[role="combobox"]')) {
           const inner = target.querySelector('.ivu-select-selection,.ant-select-selector,.el-input,.el-select__wrapper,.vs__dropdown-toggle,[role="textbox"],input');
           if (inner) {
@@ -5941,6 +7922,11 @@ export class PlayerManager {
           }
         }
         let r = target.getBoundingClientRect();
+        const visibleToggleHost = findVisibleNativeToggleHost(el);
+        if (visibleToggleHost) {
+          target = visibleToggleHost;
+          r = target.getBoundingClientRect();
+        }
         const vtreeExpandToggle = target.closest && target.closest('.vtree-tree-node__square.vtree-tree-node__expand');
         if (vtreeExpandToggle) {
           const vr = vtreeExpandToggle.getBoundingClientRect();
@@ -5966,13 +7952,165 @@ export class PlayerManager {
             }
           }
         }
-        target.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        ${modalScoped ? 'if (!activeModal.contains(target)) return null;' : ''}
+        const pointer = locatorContext && locatorContext.pointer && typeof locatorContext.pointer === 'object'
+          ? locatorContext.pointer
+          : null;
+        let hoverAnchor = null;
+        // 展开后的菜单父节点会把整棵子菜单计入自身边界框。hover 若仍取父节点
+        // 中心，落点会偏到某个子菜单项；优先使用框架的直接标题区域。
+        if (requestedAction === 'hover' && !(pointer && pointer.use_recorded_point === true) && target.querySelector) {
+          try {
+            hoverAnchor = target.querySelector(
+              ':scope > .el-submenu__title, :scope > .ivu-menu-submenu-title, :scope > .ant-menu-submenu-title',
+            );
+            if (hoverAnchor) {
+              const ar = hoverAnchor.getBoundingClientRect();
+              if (ar.width <= 0 || ar.height <= 0) hoverAnchor = null;
+            }
+          } catch (e) {}
+        }
+        (hoverAnchor || target).scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
         r = target.getBoundingClientRect();
         if (r.width === 0 && r.height === 0) return ${structured ? `{ ok: false, reason: 'hidden', via: '${via}' }` : 'null'};
-        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        let cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        function isBackdropLikeName(node) {
+          const cls = String((node && node.className) || '').toLowerCase();
+          const id = String((node && node.id) || '').toLowerCase();
+          const name = cls + ' ' + id;
+          return /\\b(el-overlay|el-modal|drawer|mask|backdrop|modal|overlay)\\b/.test(name);
+        }
+        function isLargeBackdropLikeTarget(node, rect) {
+          const vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+          const vh = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+          const areaRatio = vw > 0 && vh > 0 ? (rect.width * rect.height) / (vw * vh) : 0;
+          return isBackdropLikeName(node) && areaRatio >= 0.25;
+        }
+        function validRecordedPointer(point) {
+          if (!point || point.use_recorded_point !== true) return false;
+          const xRatio = Number(point.x_ratio);
+          const yRatio = Number(point.y_ratio);
+          if (!Number.isFinite(xRatio) || !Number.isFinite(yRatio)) return false;
+          return xRatio >= 0 && xRatio <= 1 && yRatio >= 0 && yRatio <= 1;
+        }
+        function pointHitsTarget(node, px, py) {
+          const hitNode = document.elementFromPoint(px, py);
+          if (!hitNode || hitNode.nodeType !== 1) return false;
+          if (hitNode === node) return true;
+          let curNode = hitNode;
+          while (curNode) {
+            if (curNode === node) return true;
+            curNode = curNode.parentElement;
+          }
+          try {
+            const label = hitNode.closest && hitNode.closest('label');
+            if (label && label.control === node) return true;
+          } catch (e) {}
+          if (sameCompositeControlSurface(node, hitNode)) return true;
+          return false;
+        }
+        function compositeControlRoot(node) {
+          if (!node || !node.closest) return null;
+          try {
+            return node.closest([
+              '.el-select', '.ivu-select', '.ant-select', '.v-select', '.vs__dropdown-toggle',
+              '.el-cascader', '.ivu-cascader', '.ant-cascader', '.ant-cascader-picker',
+              '.el-autocomplete', '.t-select', '.arco-select', '.n-select', '.MuiSelect-root',
+              '[role="combobox"]',
+            ].join(','));
+          } catch (e) { return null; }
+        }
+        function hasIndependentCompositeAction(hitNode, root) {
+          if (!hitNode || !hitNode.closest || !root) return false;
+          try {
+            const independent = hitNode.closest([
+              'button', 'a[href]', 'select', 'textarea',
+              '[role="button"]', '[role="link"]', '[role="option"]', '[role="menuitem"]',
+              '.el-select-dropdown__item', '.el-option', '.ivu-select-item', '.ant-select-item-option',
+              '.el-tag__close', '.el-input__clear', '.el-select__caret.el-icon-circle-close',
+              '.ant-select-clear', '.ivu-select-clear',
+            ].join(','));
+            return !!independent && independent !== root && root.contains(independent);
+          } catch (e) { return false; }
+        }
+        function sameCompositeControlSurface(node, hitNode) {
+          const targetRoot = compositeControlRoot(node);
+          const hitRoot = compositeControlRoot(hitNode);
+          if (!targetRoot || targetRoot !== hitRoot) return false;
+          // Composite controls render their visible click surface as sibling nodes
+          // (for example Element UI's .el-input and .el-select__tags). Those
+          // siblings are one activation surface, not an overlay. Keep independent
+          // actions/options blocked so a moved pointer cannot silently clear or
+          // select a different value.
+          return !hasIndependentCompositeAction(hitNode, targetRoot);
+        }
+        let usedRecordedPointer = false;
+        let usedBackdropPoint = false;
+        let usedSmartPoint = false;
+        let usedHoverAnchor = false;
+        // 所有鼠标步骤都可带“元素内比例坐标”。先验证录制点在当前布局中仍
+        // 命中目标，再采用它；canvas/SVG 等无内部 DOM 语义目标由此准确复现。
+        if (validRecordedPointer(pointer)) {
+          const recordedX = r.left + r.width * Math.min(1, Math.max(0, Number(pointer.x_ratio)));
+          const recordedY = r.top + r.height * Math.min(1, Math.max(0, Number(pointer.y_ratio)));
+          const vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+          const vh = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+          const boundedX = Math.min(Math.max(recordedX, 1), Math.max(1, vw - 1));
+          const boundedY = Math.min(Math.max(recordedY, 1), Math.max(1, vh - 1));
+          if (pointHitsTarget(target, boundedX, boundedY)) {
+            cx = boundedX;
+            cy = boundedY;
+            usedRecordedPointer = true;
+          }
+        } else if (hoverAnchor) {
+          const ar = hoverAnchor.getBoundingClientRect();
+          const hoverX = ar.left + ar.width / 2;
+          const hoverY = ar.top + ar.height / 2;
+          if (pointHitsTarget(target, hoverX, hoverY)) {
+            cx = hoverX;
+            cy = hoverY;
+            usedHoverAnchor = true;
+          }
+        } else if (isLargeBackdropLikeTarget(target, r)) {
+          const vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+          const vh = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+          const points = [
+            [0.18, 0.5], [0.82, 0.5], [0.5, 0.18], [0.5, 0.82],
+            [0.12, 0.18], [0.88, 0.18], [0.12, 0.82], [0.88, 0.82],
+          ];
+          for (const pair of points) {
+            const px = Math.min(Math.max(r.left + r.width * pair[0], 1), Math.max(1, vw - 1));
+            const py = Math.min(Math.max(r.top + r.height * pair[1], 1), Math.max(1, vh - 1));
+            if (pointHitsTarget(target, px, py)) {
+              cx = px;
+              cy = py;
+              usedBackdropPoint = true;
+              break;
+            }
+          }
+        }
+        // 录制点因响应式布局或临时遮挡失效时，在目标内部寻找可见可命中的点。
+        // 优先中心与近中心点，避免普通控件的边缘图标/分裂按钮被误点。
+        if (!pointHitsTarget(target, cx, cy)) {
+          const ratios = [[.5, .5], [.35, .5], [.65, .5], [.5, .35], [.5, .65], [.2, .2], [.8, .2], [.2, .8], [.8, .8]];
+          const vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+          const vh = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+          for (const pair of ratios) {
+            const px = Math.min(Math.max(r.left + r.width * pair[0], 1), Math.max(1, vw - 1));
+            const py = Math.min(Math.max(r.top + r.height * pair[1], 1), Math.max(1, vh - 1));
+            if (pointHitsTarget(target, px, py)) {
+              cx = px;
+              cy = py;
+              usedSmartPoint = true;
+              break;
+            }
+          }
+        }
         const hit = document.elementFromPoint(cx, cy);
         let hitOk = false;
         let hitBrief = '';
+        let hitSubstituted = false;
+        let hitSameComponent = false;
         if (hit && hit.nodeType === 1) {
           hitBrief = String(hit.tagName || '').toLowerCase() + (hit.id ? '#' + hit.id : '') + (hit.className ? '.' + String(hit.className).trim().replace(/\\s+/g, '.') : '');
           let cur = hit;
@@ -5988,6 +8126,49 @@ export class PlayerManager {
               const lab = typeof hit.closest === 'function' ? hit.closest('label') : null;
               if (lab && lab.control === target) hitOk = true;
             } catch (e2) {}
+          }
+          if (!hitOk && sameCompositeControlSurface(target, hit)) {
+            hitOk = true;
+            hitSameComponent = true;
+          }
+        }
+        function nodeText(node) {
+          return String((node && (node.innerText || node.textContent)) || '').replace(/\\s+/g, ' ').trim();
+        }
+        function interactiveOwner(node) {
+          if (!node || !node.closest) return null;
+          return node.closest('a[href],button,label,[role="button"],[role="link"],[role="menuitem"],.xcomponent-btn,.next-btn,.ant-btn,.ivu-btn,.el-button');
+        }
+        function sameSemanticElement(a, b) {
+          if (!a || !b) return false;
+          var at = String(a.tagName || '').toLowerCase();
+          var bt = String(b.tagName || '').toLowerCase();
+          if (at !== bt) return false;
+          if (at === 'a') {
+            var ah = a.getAttribute && a.getAttribute('href');
+            var bh = b.getAttribute && b.getAttribute('href');
+            if (ah && bh && ah === bh) return true;
+          }
+          var av = nodeText(a);
+          var bv = nodeText(b);
+          if (av && bv && av === bv) return true;
+          var aa = a.getAttribute && (a.getAttribute('aria-label') || a.getAttribute('title'));
+          var ba = b.getAttribute && (b.getAttribute('aria-label') || b.getAttribute('title'));
+          if (aa && ba && aa === ba) return true;
+          return false;
+        }
+        if (!hitOk && hit && hit.nodeType === 1) {
+          var hitOwner = interactiveOwner(hit);
+          var targetOwner = interactiveOwner(target) || target;
+          if (sameSemanticElement(hitOwner, targetOwner)) {
+            var hr = hitOwner.getBoundingClientRect();
+            if (hr.width > 0 && hr.height > 0) {
+              cx = hr.left + hr.width / 2;
+              cy = hr.top + hr.height / 2;
+              hitOk = true;
+              hitSubstituted = true;
+              hitBrief = hitBrief + ' -> ' + String(hitOwner.tagName || '').toLowerCase() + (hitOwner.id ? '#' + hitOwner.id : '') + (hitOwner.className ? '.' + String(hitOwner.className).trim().replace(/\\s+/g, '.') : '');
+            }
           }
         }
         function normText(v, max) {
@@ -6074,14 +8255,43 @@ export class PlayerManager {
             role: role,
             type: type,
             stable_attr: stable,
+            value: (String(originalNode && originalNode.tagName || '').toLowerCase() === 'input'
+              || String(originalNode && originalNode.tagName || '').toLowerCase() === 'textarea'
+              || String(originalNode && originalNode.tagName || '').toLowerCase() === 'select')
+              ? String(originalNode.value || '')
+              : '',
             via: '${via}',
           };
         }
-        return { ok: true, x: cx, y: cy, via: '${via}', hitOk: hitOk, hit: hitBrief, target_summary: describe(target, el) };
+        var nativeToggle = null;
+        if (String(el.tagName || '').toLowerCase() === 'input') {
+          var nativeType = String(el.type || '').toLowerCase();
+          if (nativeType === 'radio' || nativeType === 'checkbox') {
+            // View UI 使用组件 class 表示受控 checkbox 状态，内部 input.checked
+            // 在部分版本中不会同步。保留原生控件读取作为其它框架的默认路径。
+            var iviewCheckbox = el.closest && el.closest('.ivu-checkbox');
+            nativeToggle = {
+              type: nativeType,
+              checked: iviewCheckbox ? !!(iviewCheckbox.classList && iviewCheckbox.classList.contains('ivu-checkbox-checked')) : !!el.checked,
+              state_source: iviewCheckbox ? 'iview_component' : 'native_input',
+            };
+          }
+        }
+        ${hitDiagnosticCode}
+        return { ok: true, x: cx, y: cy, via: '${via}', hitOk: hitOk, hit: hitBrief, hit_substituted: hitSubstituted, hit_same_component: hitSameComponent, used_recorded_pointer: usedRecordedPointer, used_backdrop_point: usedBackdropPoint, used_smart_point: usedSmartPoint, used_hover_anchor: usedHoverAnchor, native_toggle: nativeToggle, ${captureHitDiagnostic ? 'hit_diagnostic: hitDiagnostic,' : ''} target_summary: describe(target, el) };
       } catch(e) {
         return ${structured ? `{ ok: false, reason: 'lookup_error', message: String(e && e.message || e), via: '${via}' }` : 'null'};
       }
     })()`;
+
+    const collectionCandidate = PlayerManager._collectionItemCandidate(locatorMeta);
+    // 集合项语义定位不能降级到固定序号，否则会把“未找到原数据”变成静默误操作。
+    if (collectionCandidate) {
+      return withModalScope(wrap(
+        PlayerManager._collectionItemPickExpr(collectionCandidate.value),
+        'meta-collection-item',
+      ));
+    }
 
     const hadVolatileRc = PlayerManager._isVolatileRcCss(sel) || PlayerManager._isVolatileRcXPath(xp || '');
 
@@ -6100,19 +8310,19 @@ export class PlayerManager {
       ? (cssIsStableId
         ? `document.querySelector(${JSON.stringify(safeSel)})`
         : PlayerManager._contextAwarePickExpr(
-          `document.querySelectorAll(${JSON.stringify(safeSel)})`,
+          scopedNodes(`document.querySelectorAll(${JSON.stringify(safeSel)})`),
           JSON.stringify(PlayerManager._parseLocatorMetaObject(locatorMeta)?.context || null),
         ))
       : null;
     const cssExpr = cssFindOne ? wrap(cssFindOne, 'css') : null;
     const locatorContextJson = JSON.stringify(PlayerManager._parseLocatorMetaObject(locatorMeta)?.context || null);
     const xpathExpr = safeXp ? wrap(
-      PlayerManager._contextAwarePickExpr(PlayerManager._xpathSnapshotNodesExpr(safeXp), locatorContextJson),
+      PlayerManager._contextAwarePickExpr(scopedNodes(PlayerManager._xpathSnapshotNodesExpr(safeXp)), locatorContextJson),
       'xpath',
     ) : null;
     const parts = [];
     const metaParts = [];
-    const metaCandidates = PlayerManager._normalizeLocatorMetaCandidates(locatorMeta);
+    const metaCandidates = PlayerManager._orderedLocatorMetaCandidates(locatorMeta);
     const seenMeta = new Set();
     for (const c of metaCandidates) {
       const type = String(c.type || '');
@@ -6129,7 +8339,7 @@ export class PlayerManager {
         const findExpr = isStableId
           ? `document.querySelector(${JSON.stringify(value)})`
           : PlayerManager._contextAwarePickExpr(
-            `document.querySelectorAll(${JSON.stringify(value)})`,
+            scopedNodes(`document.querySelectorAll(${JSON.stringify(value)})`),
             locatorContextJson,
           );
         metaParts.push(wrap(findExpr, `meta-${type}`));
@@ -6140,7 +8350,7 @@ export class PlayerManager {
         const safeMetaXp = PlayerManager._normalizeXPath(value);
         if (!safeMetaXp) continue;
         metaParts.push(wrap(
-          PlayerManager._contextAwarePickExpr(PlayerManager._xpathSnapshotNodesExpr(safeMetaXp), locatorContextJson),
+          PlayerManager._contextAwarePickExpr(scopedNodes(PlayerManager._xpathSnapshotNodesExpr(safeMetaXp)), locatorContextJson),
           `meta-${type}`,
         ));
         continue;
@@ -6150,9 +8360,22 @@ export class PlayerManager {
         metaParts.push(wrap(PlayerManager._textExactPickExpr(value), 'meta-text'));
         continue;
       }
+      if (type === 'text_exact') {
+        metaParts.push(wrap(
+          `(function(){const t=${JSON.stringify(value.trim().replace(/\s+/g, ' '))};` +
+          `const n=e=>String((e&&e.textContent)||'').trim().replace(/\\s+/g,' ');` +
+          `const owner=e=>e&&e.closest&&e.closest('button,a,label,[role="button"],[role="menuitem"],li,option,[role="option"],.ivu-btn,.ant-btn,.el-button,.arco-btn,.n-button');` +
+          `for(const e of document.querySelectorAll('button,a,label,[role="button"],[role="menuitem"],li,option,[role="option"],.ivu-btn,.ant-btn,.el-button,.arco-btn,.n-button'))` +
+          `{if(n(e)===t${modalScoped ? '&&activeModal.contains(e)' : ''})return e;}` +
+          `for(const e of document.querySelectorAll('span,[class*="btn"],[class*="button"]'))` +
+          `{if(n(e)===t${modalScoped ? '&&activeModal.contains(e)' : ''})return owner(e)||e;}return null;})()`,
+          'meta-text'
+        ));
+        continue;
+      }
 
-      if (type === 'text_exact_tag' && !skipDisabledCheck) {
-        const expr = PlayerManager._textExactTagPickExpr(value);
+      if (type === 'text_exact_tag') {
+        const expr = PlayerManager._textExactTagPickExpr(value, modalScoped);
         if (expr !== 'null') metaParts.push(wrap(expr, 'meta-text-tag'));
         continue;
       }
@@ -6163,7 +8386,13 @@ export class PlayerManager {
         continue;
       }
 
-      if (type === 'tree_node_text' || type === 'tree_item_text') {
+      if (type === 'tree_node_text') {
+        if (!PlayerManager._treeNodeTextMayBeFinalTarget(locatorMeta)) {
+          const childExpr = PlayerManager._treeNodeChildActionPickExpr(value, locatorMeta);
+          if (childExpr !== 'null') metaParts.push(wrap(childExpr, 'meta-tree-node-child-action'));
+          continue;
+      }
+      if (type !== 'tree_node_text' && type !== 'tree_item_text') continue;
         const expr = PlayerManager._treeNodeTextPickExpr(value);
         if (expr !== 'null') metaParts.push(wrap(expr, 'meta-tree-node-text'));
       }
@@ -6176,7 +8405,7 @@ export class PlayerManager {
       parts.push(wrap(
         `(function(){const t=${JSON.stringify(text)};` +
         `for(const e of document.querySelectorAll('li,option,[role="option"],[role="menuitem"]'))` +
-        `{if(e.textContent.trim().replace(/\\s+/g,' ')===t)return e;}return null;})()`,
+        `{if(e.textContent.trim().replace(/\\s+/g,' ')===t${modalScoped ? '&&activeModal.contains(e)' : ''})return e;}return null;})()`,
         'text'
       ));
     }
@@ -6195,7 +8424,7 @@ export class PlayerManager {
       parts.push(wrap(PlayerManager._ivuTableCellFallbackExpr(safeXp, locatorContextJson), 'ivu-table-cell'));
     }
 
-    return parts.length ? parts.join(' || ') : 'null';
+    return parts.length ? withModalScope(parts.join(' || ')) : 'null';
   }
 
   /**
@@ -6283,6 +8512,16 @@ export class PlayerManager {
         var resolved = ${resultChain};
         var el = resolved && resolved.el;
         if (!el) return { ok: false, err: 'not_found' };
+        function isLayoutVisible(node) {
+          var cur = node;
+          while (cur) {
+            var style = window.getComputedStyle(cur);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || parseFloat(style.opacity) <= 0.01) return false;
+            cur = cur.parentElement;
+          }
+          var rect = node.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        }
         var tag = el.tagName && String(el.tagName).toLowerCase() || '';
         var t = '';
         if (tag === 'textarea' || tag === 'input') {
@@ -6291,7 +8530,7 @@ export class PlayerManager {
           t = el.textContent;
           if (t === null || t === undefined) t = '';
         }
-        return { ok: true, text: t };
+        return { ok: true, text: t, visible: isLayoutVisible(el) };
       } catch (e) {
         return { ok: false, err: e && e.message ? String(e.message) : 'error' };
       }
@@ -6526,7 +8765,7 @@ export class PlayerManager {
     };
   }
 
-  async _executeAssertJsonStep(tabId, step, testCaseId) {
+  async _executeAssertJsonStep(tabId, step, testCaseId, locale) {
     if (step.wait_before) await this._sleep(step.wait_before);
     await this._throwIfPageError(tabId);
     const sel = (step.target_selector || '').trim();
@@ -6572,7 +8811,7 @@ export class PlayerManager {
       await this.api.assertJson(testCaseId, { stepId: Number(sid), actual });
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
-      throw new Error(`JSON 断言失败：${msg}`);
+      throw new Error(`${trByLocale(locale, 'JSON 断言失败：', 'JSON assertion failed: ')}${msg}`);
     }
   }
 
@@ -6586,7 +8825,7 @@ export class PlayerManager {
     console.log('[AT assert_text] ========== CDP 执行 · 普通断言 ==========');
     console.log(
       '[AT assert_text] 说明:',
-      mode === 'element'
+      mode.startsWith('element')
         ? '已按 CSS/XPath 定位；textarea/input 取 value，其它取 textContent；与「输入值」全字符相等'
         : '未填选择器：整页 innerText 是否包含「输入值」子串',
     );
@@ -6609,6 +8848,7 @@ export class PlayerManager {
       );
     }
     console.log('[AT assert_text] 比对结果:', mode === 'element' || String(mode || '').startsWith('element_attribute:') ? '元素值匹配' : '整页 includes', '=', hit);
+    console.log('[AT assert_text] 比对结果:', String(mode || '').startsWith('element') ? '元素匹配' : '整页匹配', '=', hit);
     console.log('[AT assert_text] ==========================================');
   }
 
@@ -6627,7 +8867,10 @@ export class PlayerManager {
     const source = String(step?.read_mode || contextAssertion.source || 'auto').trim().toLowerCase();
     const readMode = source === 'contenteditable' ? 'text' : (['auto', 'text', 'attribute', 'value'].includes(source) ? source : 'auto');
     const attribute = String(step?.attribute || contextAssertion.attribute || '').trim();
-    return attribute ? { target, match, readMode, attribute } : { target, match, readMode };
+    const waitMode = String(raw.wait_mode || '').trim().toLowerCase() === 'immediate'
+      ? 'immediate'
+      : 'eventually';
+    return attribute ? { target, match, readMode, attribute, waitMode } : { target, match, readMode, waitMode };
   }
 
   static _matchAssertionText(actual, expected, mode = 'contains') {
@@ -6671,35 +8914,35 @@ export class PlayerManager {
       .trim();
   }
 
-  static _assertionMatchLabel(mode = 'contains') {
-    if (mode === 'equals') return '等于';
-    if (mode === 'not_contains') return '不包含';
-    if (mode === 'regex') return '匹配正则';
-    if (mode === 'visible') return '可见';
-    return '包含';
+  static _assertionMatchLabel(mode = 'contains', locale) {
+    if (mode === 'equals') return trByLocale(locale, '等于', 'Equals');
+    if (mode === 'not_contains') return trByLocale(locale, '不包含', 'Does not contain');
+    if (mode === 'regex') return trByLocale(locale, '匹配正则', 'Matches regex');
+    if (mode === 'visible') return trByLocale(locale, '可见', 'Visible');
+    return trByLocale(locale, '包含', 'Contains');
   }
 
-  static _assertionTargetLabel(target = 'page') {
-    if (target === 'element') return '指定元素';
-    if (target === 'error') return '错误提示';
+  static _assertionTargetLabel(target = 'page', locale) {
+    if (target === 'element') return trByLocale(locale, '指定元素', 'Specified element');
+    if (target === 'error') return trByLocale(locale, '失败提示（错误/警告）', 'Failure prompt (error/warning)');
     if (target === 'url') return 'URL';
-    return '整页文本';
+    return trByLocale(locale, '整页文本', 'Page text');
   }
 
-  static _previewAssertionValue(value, max = 500) {
+  static _previewAssertionValue(value, max = 500, locale) {
     const text = String(value ?? '').replace(/\s+/g, ' ').trim();
-    if (!text) return '（空）';
+    if (!text) return trByLocale(locale, '（空）', '(empty)');
     return text.length > max ? `${text.slice(0, max)}…` : text;
   }
 
-  static _formatAssertionFailure({ target, attribute, match, expected, actual, css, xpath }) {
+  static _formatAssertionFailure({ target, attribute, match, expected, actual, css, xpath, locale }) {
     return [
-      '断言失败：实际值不满足预期',
-      `断言目标: ${PlayerManager._assertionTargetLabel(target)}`,
-      ...(attribute ? [`属性名: ${attribute}`] : []),
-      `匹配方式: ${PlayerManager._assertionMatchLabel(match)}`,
-      `期望值: ${PlayerManager._previewAssertionValue(expected)}`,
-      `实际值: ${PlayerManager._previewAssertionValue(actual)}`,
+      trByLocale(locale, '断言失败：实际值不满足预期', 'Assertion failed: actual value does not match expectation'),
+      `${trByLocale(locale, '断言目标', 'Target')}: ${PlayerManager._assertionTargetLabel(target, locale)}`,
+      ...(attribute ? [`${trByLocale(locale, '属性名', 'Attribute')}: ${attribute}`] : []),
+      `${trByLocale(locale, '匹配方式', 'Match')}: ${PlayerManager._assertionMatchLabel(match, locale)}`,
+      `${trByLocale(locale, '期望值', 'Expected')}: ${PlayerManager._previewAssertionValue(expected, 500, locale)}`,
+      `${trByLocale(locale, '实际值', 'Actual')}: ${PlayerManager._previewAssertionValue(actual, 500, locale)}`,
       `原始长度: 期望 ${String(expected ?? '').length}，实际 ${String(actual ?? '').length}`,
       `CSS: ${css || '—'}`,
       `XPath: ${xpath || '—'}`,
@@ -6747,7 +8990,22 @@ export class PlayerManager {
     return last;
   }
 
-  async _executeAssertTextStepCDP(tabId, step) {
+  async _waitForTextAssertionCDP(assertion, expected, readActual) {
+    const eventually = assertion.waitMode !== 'immediate';
+    const observeAbsence = eventually && assertion.match === 'not_contains';
+    const deadline = Date.now() + 10000;
+    let actual = '';
+    while (true) {
+      actual = await readActual();
+      const hit = PlayerManager._matchAssertionText(actual, expected, assertion.match);
+      if (!observeAbsence && hit) return { hit: true, actual };
+      if (observeAbsence && !hit) return { hit: false, actual };
+      if (!eventually || Date.now() >= deadline) return { hit: observeAbsence, actual };
+      await this._sleep(250);
+    }
+  }
+
+  async _executeAssertTextStepCDP(tabId, step, locale) {
     if (step.wait_before) await this._sleep(step.wait_before);
     const expected = PlayerManager._resolveAssertionExpectedValue(step);
     const hasLocator = String(step.target_selector || '').trim() !== ''
@@ -6759,7 +9017,10 @@ export class PlayerManager {
     }
     if (step?.attribute_error) throw new Error(`断言失败：${step.attribute_error}`);
     if (assertion.match !== 'visible' && expected.trim() === '') {
-      throw new Error('断言失败：未配置断言文本（「输入值」不能为空或仅空白）');
+      throw new Error(trByLocale(locale,
+        '断言失败：未配置断言文本（「输入值」不能为空或仅空白）',
+        'Assertion failed: expected text is not configured (input value cannot be empty or whitespace only)',
+      ));
     }
     if (assertion.match === 'regex') {
       try {
@@ -6770,24 +9031,30 @@ export class PlayerManager {
     }
 
     if (assertion.target === 'error') {
-      const actual = await this._waitForPageErrorTextCDP(tabId, 10000);
-      const hit = PlayerManager._matchAssertionText(actual, expected, assertion.match);
+      const evaluation = await this._waitForTextAssertionCDP(assertion, expected, async () => {
+        const res = await this._cdpSend(tabId, 'Runtime.evaluate', {
+          expression: PlayerManager.getFailurePromptTextExpr(),
+          returnByValue: true,
+        });
+        return String(res?.result?.value || '');
+      });
       this._logAssertTextCdpDebug({
-        mode: `error_${assertion.match}`,
+        mode: `failure_prompt_${assertion.match}_${assertion.waitMode}`,
         expected,
-        actual,
-        hit,
+        actual: evaluation.actual,
+        hit: evaluation.hit,
         css: '',
         xpath: '',
       });
-      if (!hit) {
+      if (!evaluation.hit) {
         throw PlayerManager._createAssertionFailureError({
           target: assertion.target,
           match: assertion.match,
           expected,
-          actual,
+          actual: evaluation.actual,
           css: '',
           xpath: '',
+          locale,
         });
       }
       return PlayerManager._createAssertionResult(null, {
@@ -6799,28 +9066,30 @@ export class PlayerManager {
     }
 
     if (assertion.target === 'url') {
-      const res = await this._cdpSend(tabId, 'Runtime.evaluate', {
-        expression: 'String(location.href || "")',
-        returnByValue: true,
+      const evaluation = await this._waitForTextAssertionCDP(assertion, expected, async () => {
+        const res = await this._cdpSend(tabId, 'Runtime.evaluate', {
+          expression: 'String(location.href || "")',
+          returnByValue: true,
+        });
+        return String(res?.result?.value || '');
       });
-      const actual = String(res?.result?.value || '');
-      const hit = PlayerManager._matchAssertionText(actual, expected, assertion.match);
       this._logAssertTextCdpDebug({
-        mode: `url_${assertion.match}`,
+        mode: `url_${assertion.match}_${assertion.waitMode}`,
         expected,
-        actual,
-        hit,
+        actual: evaluation.actual,
+        hit: evaluation.hit,
         css: '',
         xpath: '',
       });
-      if (!hit) {
+      if (!evaluation.hit) {
         throw PlayerManager._createAssertionFailureError({
           target: assertion.target,
           match: assertion.match,
           expected,
-          actual,
+          actual: evaluation.actual,
           css: '',
           xpath: '',
+          locale,
         });
       }
       return PlayerManager._createAssertionResult(null, {
@@ -6841,7 +9110,7 @@ export class PlayerManager {
       if (result == null) {
         const treeDiag = await this._getTreeWaitDiagnosticSuffix(tabId, step.locator_meta);
         throw new Error(
-          `断言失败：找不到目标元素${treeDiag}\n  CSS: ${step.target_selector || '—'}\n  XPath: ${step.target_xpath || '—'}`,
+          `${trByLocale(locale, '断言失败：找不到目标元素', 'Assertion failed: target element not found')}${treeDiag}\n  CSS: ${step.target_selector || '—'}\n  XPath: ${step.target_xpath || '—'}`,
         );
       }
       if (assertion.match === 'visible') {
@@ -6928,42 +9197,52 @@ export class PlayerManager {
         return { ok: false, err: String(e && e.message ? e.message : e) };
       }
     })()`;
-    const res = await this._cdpSend(tabId, 'Runtime.evaluate', { expression: expr, returnByValue: true });
-    const o = res?.result?.value;
-    const pageText = o && o.ok && typeof o.text === 'string' ? o.text : '';
-    const hit = PlayerManager._matchAssertionText(pageText, expected, assertion.match);
+    const evaluation = await this._waitForTextAssertionCDP(assertion, expected, async () => {
+      const res = await this._cdpSend(tabId, 'Runtime.evaluate', { expression: expr, returnByValue: true });
+      const value = res?.result?.value;
+      return value && value.ok && typeof value.text === 'string' ? value.text : '';
+    });
     this._logAssertTextCdpDebug({
-      mode: `whole_page_${assertion.match}`,
+      mode: `whole_page_${assertion.match}_${assertion.waitMode}`,
       expected,
-      actual: pageText,
-      hit,
+      actual: evaluation.actual,
+      hit: evaluation.hit,
       css: '',
       xpath: '',
     });
-    if (!hit) {
+    if (!evaluation.hit) {
       throw PlayerManager._createAssertionFailureError({
         target: assertion.target,
         match: assertion.match,
         expected,
-        actual: pageText,
+        actual: evaluation.actual,
         css: '',
         xpath: '',
+        locale,
       });
     }
     return PlayerManager._createAssertionResult(null, {
       target: assertion.target,
       match: assertion.match,
       expected,
-      actual: pageText,
+      actual: evaluation.actual,
     });
   }
 
-  async _isPageLoadingUi(tabId) {
+  async _isPageLoadingUi(tabId, event = 'loading_poll') {
     try {
+      const active = this._perfStepByTab.get(tabId);
       const res = await this._cdpSend(tabId, 'Runtime.evaluate', {
-        expression: PlayerManager.PAGE_LOADING_UI_CHECK,
+        expression: active
+          ? PlayerManager._pageLoadingUiStateCheck(active.targetSelector, active.targetXPath)
+          : PlayerManager.PAGE_LOADING_UI_CHECK,
         returnByValue: true,
       });
+      if (active) {
+        const state = res?.result?.value;
+        active.perf.notePageState(active.step, event, state);
+        return state?.loading === true;
+      }
       return res?.result?.value === true;
     } catch {
       return false;
@@ -6994,7 +9273,7 @@ export class PlayerManager {
     }
   }
 
-  // 等待浮层（下拉框）出现在 DOM 并可见，最多等 timeout ms（页面 loading 时不扣减剩余时间）
+  // 等待浮层（下拉框）出现在 DOM 并可见；页面 loading 期间暂停定位预算。
   async _waitForOverlay(tabId, timeout = 3500) {
     const helpers = PlayerManager._customOverlayCollectFnSource();
     const code = `(function(){
@@ -7010,79 +9289,255 @@ export class PlayerManager {
       });
     })()`;
     let remaining = this._getEffectiveWaitTimeout(tabId, timeout);
-    const wallEnd = Date.now() + PlayerManager.LOADING_WAIT_WALL_MS;
+    let wallEnd = this._locatorWallDeadline(tabId);
     while (Date.now() < wallEnd && remaining > 0) {
       await this._throwIfPageError(tabId);
-      const loading = await this._isPageLoadingUi(tabId);
       const res = await this._cdpSend(tabId, 'Runtime.evaluate', { expression: code, returnByValue: true });
       if (res?.result?.value === true) return true;
+      const loading = await this._isPageLoadingUi(tabId);
+      if (loading) {
+        const resumed = await this._waitForLoadingUiToClear(tabId, async () => {
+          const retry = await this._cdpSend(tabId, 'Runtime.evaluate', { expression: code, returnByValue: true });
+          return retry?.result?.value === true;
+        });
+        wallEnd += resumed.waitedMs;
+        if (resumed.target) return true;
+        continue;
+      }
       await this._sleep(200);
-      if (!loading) remaining -= 200;
+      remaining -= 200;
     }
     return false;
   }
 
-  // 通过 CSS/XPath/文本内容 查找元素坐标，带超时重试（页面处于 loading 时不扣减剩余时间）
+  // 通过 CSS/XPath/文本内容查找元素坐标；页面 loading 结束后继续定位。
   // skipDisabledCheck=true 用于浮层选项（选项本身不会 disabled）
-  async _getElementBoxResult(
-    tabId,
-    selector,
-    xpath,
-    textFallback = '',
-    timeout = 5000,
-    skipDisabledCheck = false,
-    locatorMeta = null,
-    requireHitTest = false,
-  ) {
-    let remaining = this._getEffectiveWaitTimeout(tabId, timeout);
-    const wallEnd = Date.now() + PlayerManager.LOADING_WAIT_WALL_MS;
-    let lastStatus = null;
-    while (Date.now() < wallEnd && remaining > 0) {
-      await this._throwIfPageError(tabId);
-      const loading = await this._isPageLoadingUi(tabId);
-      const res = await this._cdpSend(tabId, 'Runtime.evaluate', {
-        expression: this._buildFindCode(selector, xpath, textFallback, skipDisabledCheck, locatorMeta),
-        returnByValue: true,
-      });
-      const box = res?.result?.value;
-      if (box && requireHitTest && box.hitOk === false) {
-        // 元素已渲染但仍被 loading mask/浮层挡住时，继续等待真正可点击。
-        lastStatus = { ok: false, reason: 'covered', covered: box.hit };
-        await this._sleep(120);
-        if (!loading) remaining -= 120;
-        continue;
-      }
-      if (box) return { ok: true, box };
-
-      const statusRes = await this._cdpSend(tabId, 'Runtime.evaluate', {
-        expression: this._buildFindCode(selector, xpath, textFallback, skipDisabledCheck, locatorMeta, true),
-        returnByValue: true,
-      });
-      const status = statusRes?.result?.value;
-      if (status && status.ok === false) lastStatus = status;
-      await this._sleep(400);
-      if (!loading) remaining -= 400;
-    }
-    const failed = lastStatus || { ok: false, reason: 'not_found' };
-    const treeDiagExpr = PlayerManager._treeInteractionDiagnosticExpr(locatorMeta);
-    if (treeDiagExpr !== 'null') {
-      try {
-        const diagRes = await this._cdpSend(tabId, 'Runtime.evaluate', {
-          expression: treeDiagExpr,
+  async _getElementBoxResult(tabId, selector, xpath, textFallback = '', timeout = 5000, skipDisabledCheck = false, locatorMeta = null, actionType = '') {
+    const active = this._perfStepByTab.get(tabId);
+    const requireHitTest = actionType === true;
+    const resolvedActionType = requireHitTest ? '' : actionType;
+    const find = async () => {
+      let remaining = timeout;
+      let wallEnd = this._locatorWallDeadline(tabId);
+      let lastStatus = null;
+      while (Date.now() < wallEnd && remaining > 0) {
+        await this._throwIfPageError(tabId);
+        const res = await this._cdpSend(tabId, 'Runtime.evaluate', {
+          expression: this._buildFindCode(selector, xpath, textFallback, skipDisabledCheck, locatorMeta, false, resolvedActionType, !!active),
           returnByValue: true,
         });
-        const tree = diagRes?.result?.value;
-        if (tree && typeof tree === 'object') failed.tree = tree;
-      } catch (e) { /* ignore */ }
-    }
-    return failed;
+        const box = res?.result?.value;
+        // A spinner elsewhere on the page must not block an actionable target.
+        if (box && (!requireHitTest || box.hitOk !== false)) return { ok: true, box };
+        if (box && requireHitTest) lastStatus = { ok: false, reason: 'covered', covered: box.hit, hit_diagnostic: box.hit_diagnostic };
+        const loading = await this._isPageLoadingUi(tabId);
+        if (loading) {
+          const resumed = await this._waitForLoadingUiToClear(tabId, async () => {
+            const retry = await this._cdpSend(tabId, 'Runtime.evaluate', {
+              expression: this._buildFindCode(selector, xpath, textFallback, skipDisabledCheck, locatorMeta, false, resolvedActionType, !!active),
+              returnByValue: true,
+            });
+            const target = retry?.result?.value;
+            return target && (!requireHitTest || target.hitOk !== false) ? target : null;
+          });
+          wallEnd += resumed.waitedMs;
+          if (resumed.target) return { ok: true, box: resumed.target };
+          continue;
+        }
+        if (box && (!requireHitTest || box.hitOk !== false)) return { ok: true, box };
+
+        const statusRes = await this._cdpSend(tabId, 'Runtime.evaluate', {
+          expression: this._buildFindCode(selector, xpath, textFallback, skipDisabledCheck, locatorMeta, true, resolvedActionType, !!active),
+          returnByValue: true,
+        });
+        const status = statusRes?.result?.value;
+        if (status && status.ok === false) lastStatus = status;
+        await this._sleep(400);
+        remaining -= 400;
+      }
+      const failed = lastStatus || { ok: false, reason: 'not_found' };
+      const treeDiagExpr = PlayerManager._treeInteractionDiagnosticExpr(locatorMeta);
+      if (treeDiagExpr !== 'null') {
+        try {
+          const diagRes = await this._cdpSend(tabId, 'Runtime.evaluate', {
+            expression: treeDiagExpr,
+            returnByValue: true,
+          });
+          const tree = diagRes?.result?.value;
+          if (tree && typeof tree === 'object') failed.tree = tree;
+        } catch (e) { /* ignore */ }
+      }
+      return failed;
+    };
+    return active ? active.perf.measure('locator', find, active.step, true) : find();
   }
 
-  async _getElementBox(tabId, selector, xpath, textFallback = '', timeout = 5000, skipDisabledCheck = false, locatorMeta = null) {
+  async _getElementBox(tabId, selector, xpath, textFallback = '', timeout = 5000, skipDisabledCheck = false, locatorMeta = null, actionType = '') {
     const result = await this._getElementBoxResult(
-      tabId, selector, xpath, textFallback, timeout, skipDisabledCheck, locatorMeta
+      tabId, selector, xpath, textFallback, timeout, skipDisabledCheck, locatorMeta, actionType
     );
     return result && result.ok ? result.box : null;
+  }
+
+  // 树组件（尤其 TreeSelect）常把视口外节点从 DOM 中卸载。不能只等待当前
+  // DOM 出现目标：每次未命中后滚动“该树”的容器，再用完整语义信息重试。
+  // 这会同时覆盖根节点、任意父节点和叶子节点；展开仍由录制到的展开步骤负责。
+  async _findTreeInteractionBoxWithScrollCDP(tabId, step, timeout = 6000) {
+    const config = PlayerManager._getTreeInteractionConfig(step?.locator_meta);
+    if (!config) return null;
+
+    const treeMeta = PlayerManager._treeInteractionLocatorMeta(config);
+    if (!treeMeta) return null;
+    const deadline = Math.min(Date.now() + timeout, this._locatorWallDeadline(tabId));
+    let lastResult = null;
+    let attempts = 0;
+
+    while (Date.now() < deadline) {
+      const remaining = Math.max(1, deadline - Date.now());
+      const result = await this._getElementBoxResult(
+        tabId, '', '', '', Math.min(700, remaining), false, treeMeta,
+      );
+      lastResult = result;
+      if (result?.ok && result.box) return result;
+
+      const scrollExpr = PlayerManager._treeScrollStepExpr(config);
+      if (scrollExpr === 'null') break;
+      const scrollRes = await this._cdpSend(tabId, 'Runtime.evaluate', {
+        expression: scrollExpr,
+        returnByValue: true,
+      });
+      const scroll = scrollRes?.result?.value;
+      attempts += 1;
+      if (!scroll?.moved || attempts >= 14) break;
+      // 给 Vue/React 的虚拟列表一次渲染机会，再用树语义重新匹配。
+      await this._sleep(140);
+    }
+    return lastResult || { ok: false, reason: 'not_found' };
+  }
+
+  async _waitForClickUncoveredCDP(tabId, step, initialBox, options = {}) {
+    const looksLikeOverlay = !!options.looksLikeOverlay;
+    const virtualAligned = !!options.virtualAligned;
+    const locatorMeta = options.locatorMeta ?? step.locator_meta;
+    const startedAt = Date.now();
+    const deadline = Date.now() + PlayerManager.CLICK_COVERED_RETRY_MS;
+    let latest = initialBox || null;
+    let attempt = 0;
+    let lastHitCheckAt = startedAt;
+    let cachedBox = false;
+    const active = this._perfStepByTab.get(tabId);
+    const note = (phase, details = {}) => active?.perf?.noteUncoveredCheck?.(active.step, {
+      phase,
+      attempt,
+      elapsedMs: Date.now() - startedAt,
+      hitSampleAgeMs: Date.now() - lastHitCheckAt,
+      ...details,
+    });
+    note('initial', {
+      targetFound: !!latest,
+      hitOk: latest?.hitOk,
+      hit: latest?.hit,
+      via: latest?.via,
+      hitDiagnostic: latest?.hit_diagnostic,
+    });
+
+    while (latest && latest.hitOk === false && Date.now() < deadline) {
+      await this._sleep(300);
+      attempt += 1;
+      if (await this._isPageLoadingUi(tabId)) {
+        cachedBox = true;
+        note('loading', {
+          loadingUi: true, targetFound: null, hitOk: latest?.hitOk,
+          hit: latest?.hit, via: latest?.via, hitDiagnostic: latest?.hit_diagnostic, reason: 'loading', cachedBox,
+        });
+        continue;
+      }
+
+      if (virtualAligned) {
+        const virtualBox = await this._findVirtualScrollTargetBoxCDP(tabId, step, { overlayOnly: false });
+        if (virtualBox) {
+          latest = virtualBox;
+          lastHitCheckAt = Date.now();
+        }
+        cachedBox = !virtualBox;
+        note('recheck', {
+          loadingUi: false, targetFound: !!virtualBox, hitOk: latest?.hitOk,
+          hit: latest?.hit, via: latest?.via, hitDiagnostic: latest?.hit_diagnostic, cachedBox,
+          ...(!virtualBox ? { reason: 'not_found' } : {}),
+        });
+        continue;
+      }
+
+      if (looksLikeOverlay) {
+        const overlayBox = await this._cdpSend(tabId, 'Runtime.evaluate', {
+          expression: PlayerManager._findInOverlayCode(step.value || ''),
+          returnByValue: true,
+        }).then(r => r?.result?.value || null);
+        if (overlayBox) {
+          latest = overlayBox;
+          lastHitCheckAt = Date.now();
+        }
+        cachedBox = !overlayBox;
+        note('recheck', {
+          loadingUi: false, targetFound: !!overlayBox, hitOk: latest?.hitOk,
+          hit: latest?.hit, via: latest?.via, hitDiagnostic: latest?.hit_diagnostic, cachedBox,
+          ...(!overlayBox ? { reason: 'not_found' } : {}),
+        });
+        continue;
+      }
+
+      const freshResult = await this._getElementBoxResult(
+        tabId,
+        step.target_selector,
+        step.target_xpath,
+        step.value || '',
+        800,
+        false,
+        locatorMeta,
+      );
+      if (freshResult && freshResult.ok && freshResult.box) {
+        latest = freshResult.box;
+        lastHitCheckAt = Date.now();
+      }
+      cachedBox = !(freshResult && freshResult.ok && freshResult.box);
+      note('recheck', {
+        loadingUi: false, targetFound: !cachedBox, hitOk: latest?.hitOk,
+        hit: latest?.hit, via: latest?.via, hitDiagnostic: latest?.hit_diagnostic, cachedBox,
+        ...(cachedBox ? { reason: freshResult?.reason || 'not_found' } : {}),
+      });
+    }
+
+    note('final', {
+      targetFound: cachedBox ? null : !!latest, hitOk: latest?.hitOk, hit: latest?.hit,
+      via: latest?.via, hitDiagnostic: latest?.hit_diagnostic, cachedBox,
+      reason: latest?.hitOk === true ? 'uncovered' : 'timeout',
+    });
+    return latest;
+  }
+
+  async _waitForNativeToggleState(tabId, step, expectedChecked, timeout = 900) {
+    const deadline = Date.now() + timeout;
+    let actualChecked = null;
+    while (Date.now() < deadline) {
+      const result = await this._getElementBoxResult(
+        tabId,
+        step.target_selector,
+        step.target_xpath,
+        '',
+        250,
+        false,
+        step.locator_meta,
+      );
+      const toggle = result?.ok ? result.box?.native_toggle : null;
+      if (toggle) {
+        actualChecked = toggle.checked;
+        if (toggle.checked === expectedChecked) {
+          return { supported: true, matched: true, type: toggle.type, actual_checked: toggle.checked };
+        }
+      }
+      await this._sleep(100);
+    }
+    return { supported: true, matched: false, actual_checked: actualChecked };
   }
 
   async _collectRuntimeStepTarget(tabId, step, cdpAvailable) {
@@ -7095,16 +9550,16 @@ export class PlayerManager {
       ? String(step.value || step.value_text || '')
       : '';
     try {
-      const result = await this._getElementBoxResult(
-        tabId,
-        step.target_selector || '',
-        step.target_xpath || '',
-        textFallback,
-        1200,
-        true,
-        step.locator_meta,
-      );
-      const summary = result?.ok && result.box?.target_summary ? result.box.target_summary : null;
+      // Optional report metadata: probe once. The actual action owns waiting
+      // and retrying, so a missing target cannot consume two timeout windows.
+      const response = await this._cdpSend(tabId, 'Runtime.evaluate', {
+        expression: this._buildFindCode(
+          step.target_selector || '', step.target_xpath || '', textFallback,
+          true, step.locator_meta, false,
+        ),
+        returnByValue: true,
+      });
+      const summary = response?.result?.value?.target_summary;
       if (!summary || typeof summary !== 'object') return null;
       const label = String(summary.label || summary.text || summary.stable_attr || '').trim();
       if (!label) return null;
@@ -7116,7 +9571,32 @@ export class PlayerManager {
         type: String(summary.type || ''),
         via,
         locator: PlayerManager._previewRuntimeValue(PlayerManager._runtimeLocatorValueForVia(step, via), 500),
+        value: summary.value == null ? undefined : PlayerManager._previewRuntimeValue(summary.value, 240),
       };
+    } catch {
+      return null;
+    }
+  }
+
+  async _collectCollectionResolution(tabId, step, cdpAvailable) {
+    if (!cdpAvailable || tabId == null || !step) return null;
+    const config = PlayerManager._collectionItemConfig(step.locator_meta);
+    if (!config || (config.collection?.kind && !['table', 'list', 'card', 'menu'].includes(config.collection.kind))) return null;
+    if (config._collection_locator_mode === 'ordinal') {
+      try {
+        const expression = PlayerManager._collectionOrdinalDiagnosticExpr(config);
+        const result = await this._cdpSend(tabId, 'Runtime.evaluate', { expression, returnByValue: true });
+        return result?.result?.value && typeof result.result.value === 'object' ? result.result.value : null;
+      } catch {
+        return null;
+      }
+    }
+    try {
+      const expression = PlayerManager._collectionItemDiagnosticExpr(config);
+      const result = await this._cdpSend(tabId, 'Runtime.evaluate', { expression, returnByValue: true });
+      const value = result?.result?.value;
+      if (!value || typeof value !== 'object') return null;
+      return value;
     } catch {
       return null;
     }
@@ -7214,7 +9694,7 @@ export class PlayerManager {
     if (reason === 'lookup_error') {
       return `查找目标元素时发生错误：${result?.message || 'unknown'}${treeDiag}\n  CSS: ${css}\n  XPath: ${xp}`;
     }
-    return `找不到元素（等待超时；全页 loading 时计时会暂停）${treeDiag}\n  CSS: ${css}\n  XPath: ${xp}`;
+    return `找不到元素（等待超时；单步定位预算为 15 秒）${treeDiag}\n  CSS: ${css}\n  XPath: ${xp}`;
   }
 
   async _activateRevealTriggerCDP(tabId, trigger) {
@@ -7239,56 +9719,235 @@ export class PlayerManager {
     return true;
   }
 
+  static _revealTriggerExpandedExpr(trigger) {
+    const selector = String(trigger?.target_selector || '').trim();
+    const xpath = String(trigger?.target_xpath || '').trim();
+    return `(function(){
+      try {
+        var el = null;
+        var selector = ${JSON.stringify(selector)};
+        var xpath = ${JSON.stringify(xpath)};
+        if (selector) {
+          try { el = document.querySelector(selector); } catch (e) {}
+        }
+        if (!el && xpath) {
+          try { el = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue; } catch (e) {}
+        }
+        if (!el) return false;
+        function visible(node) {
+          if (!node || !node.getBoundingClientRect) return false;
+          var rect = node.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) return false;
+          var style = window.getComputedStyle(node);
+          return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0.02;
+        }
+        var hosts = [el];
+        var clickable = el.closest && el.closest('button,[role="button"],[aria-haspopup],[aria-expanded],summary,a[href]');
+        if (clickable && hosts.indexOf(clickable) < 0) hosts.push(clickable);
+        for (var cur = el.parentElement, depth = 0; cur && depth < 3; cur = cur.parentElement, depth += 1) {
+          if (hosts.indexOf(cur) < 0) hosts.push(cur);
+        }
+        for (var i = 0; i < hosts.length; i += 1) {
+          var host = hosts[i];
+          if (String(host.getAttribute && host.getAttribute('aria-expanded') || '').toLowerCase() === 'true') return true;
+          if (String(host.getAttribute && host.getAttribute('data-state') || '').toLowerCase() === 'open') return true;
+          if (String(host.getAttribute && host.getAttribute('data-open') || '').toLowerCase() === 'true') return true;
+          if (host.hasAttribute && host.hasAttribute('open')) return true;
+          var className = typeof host.className === 'string' ? host.className : String(host.getAttribute && host.getAttribute('class') || '');
+          if (/(^|[\\s_-])(open|opened|expanded)(?=$|[\\s_-])/i.test(className)) return true;
+          var controlled = String(host.getAttribute && (host.getAttribute('aria-controls') || host.getAttribute('aria-owns')) || '').trim();
+          if (controlled) {
+            var ids = controlled.split(/\\s+/);
+            for (var j = 0; j < ids.length; j += 1) {
+              var target = document.getElementById(ids[j]);
+              if (visible(target)) return true;
+            }
+          }
+        }
+        return false;
+      } catch (e) { return false; }
+    })()`;
+  }
+
+  async _isRevealAlreadySatisfiedCDP(tabId, step, trigger) {
+    if (PlayerManager._stepLooksLikeOverlay(step) && String(step?.value || '').trim()) {
+      try {
+        const found = await this._cdpSend(tabId, 'Runtime.evaluate', {
+          expression: PlayerManager._findInOverlayCode(step.value || ''),
+          returnByValue: true,
+        }).then((res) => res?.result?.value || null);
+        if (found) return true;
+      } catch (e) { /* fall through to trigger state */ }
+    }
+    if (String(trigger?.action || 'hover').toLowerCase() !== 'click') return false;
+    try {
+      return await this._cdpSend(tabId, 'Runtime.evaluate', {
+        expression: PlayerManager._revealTriggerExpandedExpr(trigger),
+        returnByValue: true,
+      }).then((res) => res?.result?.value === true);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static _overlayScrollStepExpr() {
+    return `(function(){
+      try {
+        var selector = ${JSON.stringify(PlayerManager.OVERLAY_CONTAINER_SEL)};
+        function visible(el) {
+          if (!el || !el.getBoundingClientRect) return false;
+          var r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          var st = window.getComputedStyle(el);
+          return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity || 1) > 0.02;
+        }
+        function zIndex(el) {
+          var z = 0, cur = el;
+          while (cur && cur !== document.body) {
+            var n = parseInt(window.getComputedStyle(cur).zIndex, 10);
+            if (!isNaN(n) && n > z) z = n;
+            cur = cur.parentElement;
+          }
+          return z;
+        }
+        var overlays = Array.prototype.slice.call(document.querySelectorAll(selector)).filter(visible)
+          .map(function(el){ return { el: el, z: zIndex(el) }; })
+          .sort(function(a, b){ return b.z - a.z; });
+        if (!overlays.length) return { moved: false, containers: 0 };
+        // 仅处理最上层浮层，避免多 Select 同时打开时滚错列表。
+        var active = overlays.filter(function(item){ return item.z === overlays[0].z; }).slice(0, 2);
+        var containers = [];
+        function add(el) {
+          if (!el || containers.indexOf(el) >= 0 || !visible(el)) return;
+          if (el.scrollHeight - el.clientHeight > 2) containers.push(el);
+        }
+        active.forEach(function(item){
+          add(item.el);
+          Array.prototype.slice.call(item.el.querySelectorAll('*')).forEach(add);
+        });
+        var moved = false;
+        containers.slice(0, 5).forEach(function(container){
+          var maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+          var before = container.scrollTop;
+          var step = Math.max(40, Math.floor(container.clientHeight * 0.8));
+          var next = before + step;
+          if (next >= maxTop - 1 && before > 0) next = 0;
+          else next = Math.min(maxTop, next);
+          container.scrollTop = next;
+          try { container.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (e) {}
+          if (container.scrollTop !== before) moved = true;
+        });
+        return { moved: moved, containers: containers.length };
+      } catch (e) { return { moved: false, containers: 0, error: String(e && e.message || e) }; }
+    })()`;
+  }
+
+  // 下拉 / 自动完成 / 级联的兜底路径。不以录制时是否识别出 virtual class
+  // 为前提：只有已在当前浮层中按文本找不到选项时才执行，且只滚动最上层浮层。
+  async _findOverlayItemByScrollingCDP(tabId, text, timeout = 3800) {
+    const needle = String(text || '').trim();
+    if (!needle) return null;
+    const deadline = Math.min(Date.now() + timeout, this._locatorWallDeadline(tabId));
+    let attempts = 0;
+    while (Date.now() < deadline && attempts < 18) {
+      await this._throwIfPageError(tabId);
+      const found = await this._cdpSend(tabId, 'Runtime.evaluate', {
+        expression: PlayerManager._findInOverlayCode(needle),
+        returnByValue: true,
+      }).then((res) => res?.result?.value || null);
+      if (found) return found;
+      const scroll = await this._cdpSend(tabId, 'Runtime.evaluate', {
+        expression: PlayerManager._overlayScrollStepExpr(),
+        returnByValue: true,
+      }).then((res) => res?.result?.value || null);
+      if (!scroll?.moved) break;
+      attempts += 1;
+      await this._sleep(140);
+    }
+    return null;
+  }
+
   // 浮层选项专用查找：等下拉框打开 → 在容器内按文本搜索 → 超时时输出诊断
   async _clickOverlayItem(tabId, step, locale = 'zh', options = {}) {
+    this._locatorWallDeadline(tabId);
     const textToFind = step.value || '';
     const hadReveal = options.hadReveal === true;
     const virtualMeta = PlayerManager._parseLocatorMetaObject(step?.locator_meta)?.context?.virtual_scroll;
     const hasVirtualContext = virtualMeta && ['maybe', 'true'].includes(String(virtualMeta.hint || ''));
+    const findOption = async () => {
+      const res = await this._cdpSend(tabId, 'Runtime.evaluate', {
+        expression: PlayerManager._findInOverlayCode(textToFind), returnByValue: true,
+      });
+      return res?.result?.value || null;
+    };
+    const findActionableOption = async () => {
+      const target = await findOption();
+      return target && target.hitOk !== false ? target : null;
+    };
 
-    if (hadReveal) {
-      const helpers = PlayerManager._customOverlayCollectFnSource();
-      let waitSub = 2800;
-      while (waitSub > 0) {
-        const res = await this._cdpSend(tabId, 'Runtime.evaluate', {
-          expression: `(function(){ ${helpers} return collectCustomOverlayContainers().length; })()`,
-          returnByValue: true,
-        });
-        const n = Number(res?.result?.value ?? 0);
-        if (n >= 2) break;
-        await this._sleep(200);
-        waitSub -= 200;
-      }
-      await this._sleep(320);
-    }
-
-    // 等下拉框真正出现（最多约 3.5s）
-    const overlayAppeared = await this._waitForOverlay(tabId, 3500);
-    if (!overlayAppeared) {
-      // 即使没检测到标准浮层容器，也继续尝试文本搜索（有些组件用非标准类名）
-      console.warn('[AT Player] 未检测到标准浮层容器，仍将尝试文本搜索');
-    }
-
-    // 在浮层容器内按文本搜索；全页 loading 时不扣减 6s 预算
-    let remaining = this._getEffectiveWaitTimeout(tabId, 6000);
-    const wallEnd = Date.now() + PlayerManager.LOADING_WAIT_WALL_MS;
     let box = null;
+    if (!hadReveal) {
+      box = await findOption();
+    }
+    if (hadReveal) {
+      // 触发器展开后直接等待录制的目标选项。“至少两个浮层”不是稳定的
+      // 就绪条件：普通 Select/下拉菜单通常只有一个浮层，额外等待反而会引入竞态。
+      let waitSub = 1200;
+      while (!box && waitSub > 0) {
+        box = await findOption();
+        if (box) break;
+        await this._sleep(160);
+        waitSub -= 160;
+      }
+    }
+
+    if (box?.hitOk === false && await this._isPageLoadingUi(tabId)) {
+      const resumed = await this._waitForLoadingUiToClear(tabId, findActionableOption);
+      box = resumed.target || null;
+    }
+
+    if (!box && await this._isPageLoadingUi(tabId)) {
+      const resumed = await this._waitForLoadingUiToClear(tabId, findActionableOption);
+      box = resumed.target || null;
+    }
+
+    // 已经找到可点击的选项时，无须再等待可能不具备标准 class 的浮层容器。
+    if (!box) {
+      const overlayAppeared = await this._measurePlaybackNested(tabId, 'overlay_container_wait',
+        () => this._waitForOverlay(tabId, 3500));
+      if (!overlayAppeared) {
+        // 非标准浮层仍可通过选项文本继续查找。
+        console.warn('[AT Player] 未检测到标准浮层容器，仍将尝试文本搜索');
+      }
+    }
+
+    // 先等待异步选项出现；若仍未命中，再进入浮层内滚动扫描。
+    let remaining = 2200;
+    let wallEnd = this._locatorWallDeadline(tabId);
     while (!box && Date.now() < wallEnd && remaining > 0) {
       await this._throwIfPageError(tabId);
+      box = await findOption();
+      if (box && box.hitOk !== false) break;
       const loading = await this._isPageLoadingUi(tabId);
-      const res = await this._cdpSend(tabId, 'Runtime.evaluate', {
-        expression: PlayerManager._findInOverlayCode(textToFind),
-        returnByValue: true,
-      });
-      box = res?.result?.value || null;
+      if (loading) {
+        box = null;
+        const resumed = await this._waitForLoadingUiToClear(tabId, findActionableOption);
+        wallEnd += resumed.waitedMs;
+        box = resumed.target || null;
+        continue;
+      }
       if (!box) {
         await this._sleep(400);
-        if (!loading) remaining -= 400;
+        remaining -= 400;
       }
     }
 
     if (!box) {
       box = await this._findVirtualScrollTargetBoxCDP(tabId, step, { overlayOnly: true });
+    }
+
+    if (!box) {
+      box = await this._findOverlayItemByScrollingCDP(tabId, textToFind, 3800);
     }
 
     if (!box && !hasVirtualContext && (step.target_xpath || step.target_selector)) {
@@ -7320,8 +9979,8 @@ export class PlayerManager {
       throw new Error(
         trByLocale(
           locale,
-          `在下拉框中找不到选项 "${textToFind}"（等待超时；全页 loading 时计时会暂停）${hint}`,
-          `Option "${textToFind}" not found in dropdown (wait timed out; timer pauses while full-page loading is active)${hint}`,
+          `在下拉框中找不到选项 "${textToFind}"（等待超时；单步定位预算为 15 秒）${hint}`,
+          `Option "${textToFind}" not found in dropdown (wait timed out; step locator budget is 15 seconds)${hint}`,
         ),
       );
     }
@@ -7340,7 +9999,7 @@ export class PlayerManager {
       virtual_scroll: vs,
       overlayOnly: options.overlayOnly === true,
     });
-    return this._cdpSend(tabId, 'Runtime.evaluate', {
+    return this._measurePlaybackNested(tabId, 'virtual_scan', () => this._cdpSend(tabId, 'Runtime.evaluate', {
       expression: `(() => {
         const payload = ${payload};
         const needle = String(payload.text || '').replace(/\\s+/g, ' ').trim();
@@ -7392,6 +10051,9 @@ export class PlayerManager {
           '.el-select-dropdown__item',
           '.el-option',
           '.ivu-select-item',
+          '.ivu-cascader-menu-item',
+          '.el-cascader-node',
+          '.ant-cascader-menu-item',
           '[class*="virtual"]',
           '[class*="row"]',
           '[class*="item"]'
@@ -7406,7 +10068,7 @@ export class PlayerManager {
         };
         const clickableFor = (item) => {
           if (!item) return null;
-          if (item.matches && item.matches('button,a,[role="button"],input[type="button"],input[type="submit"],li,[role="option"],[role="menuitem"],.ant-select-item,.el-select-dropdown__item,.el-option,.ivu-select-item')) return item;
+          if (item.matches && item.matches('button,a,[role="button"],input[type="button"],input[type="submit"],li,[role="option"],[role="menuitem"],.ant-select-item,.el-select-dropdown__item,.el-option,.ivu-select-item,.ivu-cascader-menu-item,.el-cascader-node,.ant-cascader-menu-item')) return item;
           return item.querySelector && (item.querySelector('button,a,[role="button"],input[type="button"],input[type="submit"]') || item);
         };
         const boxFor = (el) => {
@@ -7454,6 +10116,39 @@ export class PlayerManager {
           try { add(document.querySelector(ctx.container_selector)); } catch (e) {}
         }
         add(byXpath(ctx.container_xpath));
+        const searchCandidates = (items) => {
+          const filtered = items.filter(looksVirtual);
+          const searchTargets = filtered.length ? filtered : items.filter((el) => String(ctx.hint || '') === 'maybe' && isScrollable(el));
+          for (const container of searchTargets.slice(0, 8)) {
+            const originalTop = container.scrollTop;
+            const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+            const recordedTop = Number(ctx.scroll_top);
+            const stepSize = Math.max(40, Math.floor((container.clientHeight || 160) * 0.82));
+            const positions = [];
+            const pushPos = (v) => {
+              if (!Number.isFinite(v)) return;
+              const n = Math.max(0, Math.min(maxTop, Math.round(v)));
+              if (!positions.includes(n)) positions.push(n);
+            };
+            pushPos(recordedTop);
+            pushPos(originalTop);
+            pushPos(0);
+            for (let p = 0; p <= maxTop && positions.length < 16; p += stepSize) pushPos(p);
+            pushPos(maxTop);
+            for (const pos of positions) {
+              container.scrollTop = pos;
+              try { container.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (e) {}
+              const found = findIn(container);
+              if (found) return found;
+            }
+          }
+          return null;
+        };
+        // Recorded container is the strongest clue. Search it before walking the
+        // whole document, which can be expensive on large application pages.
+        const recordedCandidates = candidates.slice();
+        const recordedFound = searchCandidates(recordedCandidates);
+        if (recordedFound) return recordedFound;
         if (overlayOnly) {
           const overlays = Array.from(document.querySelectorAll(overlaySel)).filter(visible).sort((a, b) => zIndex(b) - zIndex(a));
           for (const overlay of overlays) {
@@ -7463,35 +10158,10 @@ export class PlayerManager {
         } else {
           Array.from(document.querySelectorAll('*')).forEach(add);
         }
-        const filtered = candidates.filter(looksVirtual);
-        const searchTargets = filtered.length ? filtered : candidates.filter((el) => String(ctx.hint || '') === 'maybe' && isScrollable(el));
-        for (const container of searchTargets.slice(0, 8)) {
-          const originalTop = container.scrollTop;
-          const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
-          const recordedTop = Number(ctx.scroll_top);
-          const stepSize = Math.max(40, Math.floor((container.clientHeight || 160) * 0.82));
-          const positions = [];
-          const pushPos = (v) => {
-            if (!Number.isFinite(v)) return;
-            const n = Math.max(0, Math.min(maxTop, Math.round(v)));
-            if (!positions.includes(n)) positions.push(n);
-          };
-          pushPos(recordedTop);
-          pushPos(originalTop);
-          pushPos(0);
-          for (let p = 0; p <= maxTop && positions.length < 16; p += stepSize) pushPos(p);
-          pushPos(maxTop);
-          for (const pos of positions) {
-            container.scrollTop = pos;
-            try { container.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (e) {}
-            const found = findIn(container);
-            if (found) return found;
-          }
-        }
-        return null;
+        return searchCandidates(candidates.filter((el) => !recordedCandidates.includes(el)));
       })()`,
       returnByValue: true,
-    }).then(r => r?.result?.value || null).catch(() => null);
+    }).then(r => r?.result?.value || null).catch(() => null));
   }
 
   // 执行一次 CDP 鼠标点击（完整序列：move→press→release）
@@ -7499,18 +10169,56 @@ export class PlayerManager {
     const button = options.button || 'left';
     const clickCount = Number(options.clickCount || 1);
     const buttons = button === 'right' ? 2 : 1;
-    await this._cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
+    const move = this._measurePlaybackNested(tabId, 'cdp_mouse_move', () =>
+      this._cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' }));
     this._rememberPointerPosition(tabId, x, y);
+    if (options.pipelineMove === true && button === 'left' && clickCount === 1) {
+      // Hidden pages can defer the rAF-aligned mouseMoved ACK for seconds. Sending
+      // mousePressed immediately afterward flushes the queued move in Chromium.
+      // Observe the move rejection now so it cannot become unhandled while press runs.
+      const moved = move.then(() => null, error => error);
+      let pressError = null;
+      try {
+        await this._measurePlaybackNested(tabId, 'cdp_mouse_press', () =>
+          this._cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, clickCount, buttons }));
+      } catch (error) {
+        pressError = error;
+      }
+      let releaseError = null;
+      try {
+        if (!pressError) await this._sleep(60);
+        // A rejected press may still have reached the page; always release it.
+        await this._measurePlaybackNested(tabId, 'cdp_mouse_release', () =>
+          this._cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button, clickCount, buttons: 0 }));
+      } catch (error) {
+        releaseError = error;
+      }
+      const moveError = await moved;
+      const failure = pressError || releaseError || moveError;
+      if (failure) {
+        // Press/release may have reached the page even when a CDP ACK fails.
+        // Do not replay this click through the DOM fallback.
+        const error = failure instanceof Error ? failure : new Error(String(failure));
+        error.cdpClickDeliveryUncertain = true;
+        throw error;
+      }
+      return;
+    }
+    await move;
     if (clickCount <= 1 || button === 'right') {
-      await this._cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, clickCount, buttons });
+      await this._measurePlaybackNested(tabId, 'cdp_mouse_press', () =>
+        this._cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, clickCount, buttons }));
       await this._sleep(60);
-      await this._cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button, clickCount, buttons: 0 });
+      await this._measurePlaybackNested(tabId, 'cdp_mouse_release', () =>
+        this._cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button, clickCount, buttons: 0 }));
       return;
     }
     for (let i = 1; i <= clickCount; i++) {
-      await this._cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, clickCount: i, buttons });
+      await this._measurePlaybackNested(tabId, 'cdp_mouse_press', () =>
+        this._cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, clickCount: i, buttons }));
       await this._sleep(40);
-      await this._cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button, clickCount: i, buttons: 0 });
+      await this._measurePlaybackNested(tabId, 'cdp_mouse_release', () =>
+        this._cdpSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button, clickCount: i, buttons: 0 }));
       if (i < clickCount) await this._sleep(60);
     }
   }
@@ -9023,7 +11731,7 @@ export class PlayerManager {
     const preferId = Boolean(
       safeSel && /^#[\w-]+$/.test(safeSel) && !PlayerManager._isVolatileRcCss(selector)
     );
-    const metaCandidates = PlayerManager._normalizeLocatorMetaCandidates(locatorMeta);
+    const metaCandidates = PlayerManager._orderedLocatorMetaCandidates(locatorMeta);
     const locatorContext = PlayerManager._parseLocatorMetaObject(locatorMeta)?.context || null;
     const unifiedTargetExpr = PlayerManager._buildDomTargetChain(safeSel, safeXp, locatorMeta);
 
@@ -9411,7 +12119,7 @@ export class PlayerManager {
     const preferId = Boolean(
       safeSel && /^#[\w-]+$/.test(safeSel) && !PlayerManager._isVolatileRcCss(selector)
     );
-    const metaCandidates = PlayerManager._normalizeLocatorMetaCandidates(locatorMeta);
+    const metaCandidates = PlayerManager._orderedLocatorMetaCandidates(locatorMeta);
     const locatorContext = PlayerManager._parseLocatorMetaObject(locatorMeta)?.context || null;
     const unifiedTargetExpr = PlayerManager._buildDomTargetChain(safeSel, safeXp, locatorMeta);
     const expr = `(function(){
@@ -9791,6 +12499,12 @@ export class PlayerManager {
     return false;
   }
 
+  static _recordedExpectedToggleState(step, fallback = null) {
+    const recorded = PlayerManager._parseLocatorMetaObject(step?.locator_meta)
+      ?.context?.toggle?.expected_checked;
+    return typeof recorded === 'boolean' ? recorded : fallback;
+  }
+
   static _stepLooksLikeAntSelectSearch(step) {
     const meta = typeof step?.locator_meta === 'string'
       ? step.locator_meta
@@ -9821,6 +12535,11 @@ export class PlayerManager {
   }
 
   static _stepLooksLikeOverlay(step) {
+    const action = String(step?.action_type || '').trim().toLowerCase();
+    // Page-level assertions intentionally have no selector and carry their
+    // expected text in `value`. They must be evaluated by the assertion
+    // executor, not treated as legacy text-only overlay options.
+    if (action.startsWith('assert_')) return false;
     const locatorContext = PlayerManager._parseLocatorMetaObject(step?.locator_meta)?.context || {};
     return (step?.is_overlay && String(step?.value || '').trim() !== '')
       || (locatorContext.overlay === true && String(step?.value || '').trim() !== '')
@@ -9926,26 +12645,41 @@ export class PlayerManager {
       case 'click':
       case 'double_click':
       case 'right_click': {
+        const looksLikeOverlay = PlayerManager._stepLooksLikeOverlay(step);
         const revealTrigger = PlayerManager._extractRevealTriggerFromLocatorMeta(step.locator_meta);
+        let revealActivated = false;
         if (revealTrigger) {
-          try { await this._activateRevealTriggerCDP(tabId, revealTrigger); } catch (e) { /* ignore */ }
-          await this._sleep(420);
+          const alreadySatisfied = await this._isRevealAlreadySatisfiedCDP(tabId, step, revealTrigger);
+          if (!alreadySatisfied) {
+            try { revealActivated = await this._activateRevealTriggerCDP(tabId, revealTrigger); } catch (e) { /* ignore */ }
+            // 激活逻辑自身已等待悬浮生效；只留一个短帧间隔，避免短生命周期菜单
+            // 在真正点击前就自动关闭。
+            await this._sleep(80);
+          }
         }
         // 自动识别浮层选项步骤（兼容旧录制数据中没有 is_overlay 标记的情况）
         // 判断依据：
         //   1. 明确标记了 is_overlay
         //   2. CSS 选择器为空且有文本值（录制器对浮层返回空 CSS）
-        const looksLikeOverlay = PlayerManager._stepLooksLikeOverlay(step);
-
         let box;
         let virtualAligned = false;
         if (looksLikeOverlay) {
-          box = await this._clickOverlayItem(tabId, step, locale, { hadReveal: !!revealTrigger });
+          box = await this._measurePlaybackNested(tabId, 'overlay_selection',
+            () => this._clickOverlayItem(tabId, step, locale, { hadReveal: revealActivated }));
           actualLocator = PlayerManager._actualLocatorFromVia(step, 'overlay-text');
         } else {
           // 普通点击：检查 disabled 状态，等待组件就绪（级联 Select 场景）
-          const boxResult = await this._getElementBoxResult(
-            tabId, step.target_selector, step.target_xpath, step.value || '', 6000, false, step.locator_meta, true
+          // 树语义步骤先在对应树容器中分段滚动查找。普通定位只会对已经
+          // 渲染的节点生效，虚拟化树中的根/父/叶节点都会因此漏掉。
+          const treeResult = await this._measurePlaybackNested(tabId, 'tree_search',
+            () => this._findTreeInteractionBoxWithScrollCDP(tabId, step, 5200));
+          // 语义适配器未覆盖的旧步骤仍保留 CSS/XPath 兜底，避免这次增强
+          // 改变既有用例的兼容性。
+          // 非 Tree 普通点击沿用 6 秒等待；只有 Tree 已经消耗专用查找窗口时，
+          // 才使用 800ms 的 CSS/XPath 短兜底，避免两个完整窗口串行叠加。
+          const fallbackWaitMs = treeResult ? 800 : 6000;
+          const boxResult = treeResult?.ok ? treeResult : await this._getElementBoxResult(
+            tabId, step.target_selector, step.target_xpath, step.value || '', fallbackWaitMs, false, step.locator_meta
           );
           box = boxResult && boxResult.ok ? boxResult.box : null;
           const virtualBox = await this._findVirtualScrollTargetBoxCDP(tabId, step, { overlayOnly: false });
@@ -9968,6 +12702,28 @@ export class PlayerManager {
               expression: PlayerManager._findInOverlayCode(step.value || ''),
               returnByValue: true,
             }).then(r => r?.result?.value || null);
+            if (!freshBox && revealTrigger) {
+              // 菜单可能在定位与点击之间因超时关闭。重新触发一次并重新取坐标，
+              // 绝不沿用已消失选项的旧坐标点击底层页面。
+              const stillExpanded = await this._isRevealAlreadySatisfiedCDP(tabId, step, revealTrigger);
+              if (!stillExpanded) {
+                try { await this._activateRevealTriggerCDP(tabId, revealTrigger); } catch (e) { /* ignore */ }
+                await this._sleep(60);
+              }
+                box = await this._measurePlaybackNested(tabId, 'overlay_selection',
+                  () => this._clickOverlayItem(tabId, step, locale, { hadReveal: true }));
+              freshBox = await this._cdpSend(tabId, 'Runtime.evaluate', {
+                expression: PlayerManager._findInOverlayCode(step.value || ''),
+                returnByValue: true,
+              }).then(r => r?.result?.value || null);
+            }
+            if (!freshBox) {
+              throw new Error(trByLocale(
+                locale,
+                `浮层选项「${step.value || ''}」在点击前已退出可见状态，请检查菜单触发条件或自动关闭时间。`,
+                `Overlay option "${step.value || ''}" disappeared before it could be clicked. Check the menu trigger or auto-close timing.`,
+              ));
+            }
           } else {
             const freshResult = await this._getElementBoxResult(
               tabId,
@@ -9985,16 +12741,24 @@ export class PlayerManager {
             freshBox = freshResult.box;
           }
         }
-        const merged = freshBox || box;
+        let merged = freshBox || box;
+        if (merged && merged.hitOk === false) {
+          merged = await this._measurePlaybackNested(tabId, 'uncovered_wait', () => this._waitForClickUncoveredCDP(tabId, step, merged, {
+            looksLikeOverlay,
+            virtualAligned,
+          })) || merged;
+        }
         const { x, y } = merged;
+        const nativeToggle = step.action_type === 'click' ? merged?.native_toggle : null;
         if (merged && merged.hitOk === false) {
           const base =
             '目标不可点击：视口中心点被其它元素遮挡（常见于非预期弹窗、遮罩或浮层；与 Playwright 的 hit-test 类似）。请先关闭遮挡物或调整用例。';
+          const hitLine = merged.hit ? `\n  遮挡元素: ${merged.hit}` : '';
           if (looksLikeOverlay) {
-            throw new Error(`${base}\n  选项文本: ${step.value || ''}`);
+            throw new Error(`${base}${hitLine}\n  选项文本: ${step.value || ''}`);
           }
           const treeDiag = await this._getTreeWaitDiagnosticSuffix(tabId, step.locator_meta);
-          throw new Error(`${base}${treeDiag}\n  CSS: ${step.target_selector}\n  XPath: ${step.target_xpath}`);
+          throw new Error(`${base}${hitLine}${treeDiag}\n  CSS: ${step.target_selector}\n  XPath: ${step.target_xpath}`);
         }
 
         const clickWhen = PlayerManager._normalizeClickWhen(step.click_when ?? step.details?.click_when);
@@ -10046,10 +12810,39 @@ export class PlayerManager {
         await this._cdpClick(tabId, x, y, {
           button: actionType === 'right_click' ? 'right' : 'left',
           clickCount: actionType === 'double_click' ? 2 : 1,
+          pipelineMove: actionType === 'click' && !revealTrigger,
         });
 
+        if (nativeToggle) {
+          const expectedChecked = PlayerManager._recordedExpectedToggleState(
+            step,
+            nativeToggle.type === 'radio' ? true : !nativeToggle.checked,
+          );
+          // 复选框/单选框状态只作为回放证据，不阻断后续业务步骤。录制起点
+          // 不稳定或组件异步重渲染时，强制要求录制时的绝对状态会制造假失败。
+          const toggleResult = await this._waitForNativeToggleState(tabId, step, expectedChecked, 250);
+          nativeToggle.observation = {
+            expectedChecked,
+            actualChecked: toggleResult.actual_checked,
+            observed: toggleResult.matched,
+          };
+        }
+
         if (looksLikeOverlay) await this._sleep(400);
-        break;
+        return {
+          locator: actualLocator,
+          effect: nativeToggle
+            ? {
+              mode: 'observe',
+              type: 'toggle_checked',
+              observed: nativeToggle.observation?.observed ?? null,
+              expected: nativeToggle.observation?.expectedChecked ? 'checked' : 'unchecked',
+              actual: nativeToggle.observation?.actualChecked == null
+                ? 'unavailable'
+                : nativeToggle.observation.actualChecked ? 'checked' : 'unchecked',
+            }
+            : { mode: 'none', observed: null },
+        };
       }
 
       case 'input': {
@@ -10094,10 +12887,19 @@ export class PlayerManager {
         }
         if (lastErr) throw new Error(`输入失败（等待超时）\n  CSS: ${step.target_selector}\n  XPath: ${step.target_xpath}\n  ${lastErr.message}`);
         await this._sleep(120);
-        break;
+        return {
+          locator: actualLocator,
+          effect: { mode: 'observe', type: 'input_value', observed: null, expected: PlayerManager._previewRuntimeValue(step.value || '', 240) },
+        };
       }
 
       case 'select': {
+        if (step.target_selector || step.target_xpath || step.locator_meta) {
+          const probe = await this._getElementBoxResult(
+            tabId, step.target_selector, step.target_xpath, '', 1600, false, step.locator_meta
+          );
+          if (probe?.ok) actualLocator = PlayerManager._actualLocatorFromVia(step, probe.box?.via);
+        }
         const deadline = Date.now() + 8000;
         let lastErr = null;
         while (Date.now() < deadline) {
@@ -10120,7 +12922,10 @@ export class PlayerManager {
         }
         if (lastErr) throw new Error(`选择失败（等待超时）\n  CSS: ${step.target_selector}\n  XPath: ${step.target_xpath}\n  ${lastErr.message}`);
         await this._sleep(120);
-        break;
+        return {
+          locator: actualLocator,
+          effect: { mode: 'observe', type: 'select_value', observed: null, expected: PlayerManager._previewRuntimeValue(step.value_text || step.value || '', 240) },
+        };
       }
 
       case 'key': {
@@ -10147,7 +12952,7 @@ export class PlayerManager {
         }
         if (lastErr) throw new Error(`按键失败\n  CSS: ${step.target_selector}\n  XPath: ${step.target_xpath}`);
         await this._sleep(80);
-        break;
+        return { locator: actualLocator, effect: { mode: 'none', observed: null } };
       }
 
       case 'scroll': {
@@ -10165,19 +12970,16 @@ export class PlayerManager {
           deltaX: Number(step.delta_x) || 0,
           deltaY: scrollY,
         });
-        break;
+        return { effect: { mode: 'none', observed: null } };
       }
 
       case 'hover': {
-        const boxResult = await this._getElementBoxResult(
-          tabId, step.target_selector, step.target_xpath, '', 5000, false, step.locator_meta
-        );
-        const box = boxResult?.ok ? boxResult.box : null;
+        const box = await this._getElementBox(tabId, step.target_selector, step.target_xpath, '', 5000, false, step.locator_meta, 'hover');
         if (box) {
           actualLocator = PlayerManager._actualLocatorFromVia(step, box.via);
           await this._sleep(120);
           const freshBox = await this._getElementBox(
-            tabId, step.target_selector, step.target_xpath, '', 2000, false, step.locator_meta
+            tabId, step.target_selector, step.target_xpath, '', 2000, false, step.locator_meta, 'hover'
           );
           const merged = freshBox || box;
           if (merged.hitOk === false) {
@@ -10198,11 +13000,11 @@ export class PlayerManager {
           this._rememberPointerPosition(tabId, merged.x, merged.y);
         }
         await this._sleep(300);
-        break;
+        return { locator: actualLocator, effect: { mode: 'none', observed: null } };
       }
 
       default:
-        await this._executeStepDOM(tabId, step, locale);
+        return this._executeStepDOM(tabId, step, locale);
     }
     return actualLocator;
   }
@@ -10229,8 +13031,10 @@ export class PlayerManager {
       if (result?.error_code) err.code = result.error_code;
       if (result?.locator_error) err.locatorError = result.locator_error;
       if (result?.variable_extraction_error) err.variableExtraction = result.variable_extraction_error;
+      if (result?.step_outcome) err.stepOutcome = result.step_outcome;
       throw err;
     }
+    return result.step_outcome || null;
   }
 
   // =========================================================
@@ -10248,7 +13052,52 @@ export class PlayerManager {
 
   _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  _waitForTabLoad(tabId, timeoutMs = DEFAULT_TAB_LOAD_TIMEOUT_MS) {
+  _locatorWallDeadline(tabId) {
+    const now = Date.now();
+    const budget = this._locatorDeadlineByTab.get(tabId);
+    if (budget && !Number.isFinite(budget.deadline)) {
+      budget.deadline = now + PlayerManager.STEP_LOCATOR_WALL_MS;
+    }
+    if (budget && !Number.isFinite(budget.loadingWallEnd)) {
+      budget.loadingWallEnd = now + PlayerManager.LOADING_WAIT_WALL_MS;
+    }
+    return Math.min(
+      now + PlayerManager.STEP_LOCATOR_WALL_MS,
+      budget?.deadline ?? Infinity,
+    );
+  }
+
+  // Loading 是页面状态，不消耗目标出现的重试时间；总等待仍受单步上限约束。
+  async _waitForLoadingUiToClear(tabId, targetProbe = null) {
+    return this._measurePlaybackNested(tabId, 'loading_wait', async () => {
+      const startedAt = Date.now();
+      this._locatorWallDeadline(tabId);
+      const budget = this._locatorDeadlineByTab.get(tabId);
+      const wallEnd = budget?.loadingWallEnd ?? startedAt + PlayerManager.LOADING_WAIT_WALL_MS;
+      const finish = (target = null) => {
+        const waitedMs = Date.now() - startedAt;
+        if (budget) budget.deadline += waitedMs;
+        return { waitedMs, target };
+      };
+      while (Date.now() < wallEnd) {
+        await this._throwIfPageError(tabId);
+        if (targetProbe) {
+          const target = await targetProbe();
+          if (target) return finish(target);
+        }
+        if (!(await this._isPageLoadingUi(tabId))) return finish();
+        await this._sleep(400);
+      }
+      throw new Error(`页面加载未结束（单步加载等待上限为 ${Math.round(PlayerManager.LOADING_WAIT_WALL_MS / 1000)} 秒）`);
+    });
+  }
+
+  _measurePlaybackNested(tabId, phase, task) {
+    const active = this._perfStepByTab.get(tabId);
+    return active ? active.perf.measure(phase, task, active.step, true) : task();
+  }
+
+  _waitForTabLoad(tabId, timeoutMs = DEFAULT_TAB_LOAD_TIMEOUT_MS, firstPollDelayMs = 500) {
     const timeoutAt = Date.now() + Math.max(1000, Number(timeoutMs) || DEFAULT_TAB_LOAD_TIMEOUT_MS);
     return new Promise((resolve, reject) => {
       const check = async () => {
@@ -10260,7 +13109,7 @@ export class PlayerManager {
         }
         setTimeout(check, 300);
       };
-      setTimeout(check, 500);
+      setTimeout(check, firstPollDelayMs);
     });
   }
 

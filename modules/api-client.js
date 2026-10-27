@@ -32,23 +32,31 @@ export class ApiClient {
         ...(body != null ? { body: JSON.stringify(body) } : {}),
         signal: controller.signal,
       });
-      const text = await res.text();
+      let text = '';
       let data;
-      try {
-        data = text ? JSON.parse(text) : {};
-      } catch (_) {
-        data = { message: text };
+      if (typeof res.text === 'function') {
+        text = await res.text();
+        try {
+          data = text ? JSON.parse(text) : {};
+        } catch (_) {
+          data = { message: text };
+        }
+      } else if (typeof res.json === 'function') {
+        data = await res.json();
+      } else {
+        data = {};
       }
       const hasCode = data && data.code !== undefined && data.code !== null;
       const hasSuccessFlag = data && data.success !== undefined && data.success !== null;
       const normalizedCode = hasCode ? Number(data.code) : null;
       const okByCode = !hasCode || normalizedCode === 0 || normalizedCode === 200;
       const explicitFailure = data?.success === false || !okByCode;
+      const httpOk = res.ok == null ? true : res.ok;
       const hasErrorMessage = data && typeof data === 'object'
         && ['message', 'msg', 'error'].some((key) => Boolean(data[key]));
       const acceptedByHttp = res.ok && !hasCode && !hasSuccessFlag && !hasErrorMessage;
       const acceptedByEnvelope = (hasCode && okByCode) || (hasSuccessFlag && data.success === true);
-      if (!res.ok || (!acceptedByEnvelope && !acceptedByHttp) || explicitFailure) {
+      if (!httpOk || (!acceptedByEnvelope && !acceptedByHttp) || explicitFailure) {
         const message = data.message || data.msg || data.error || text || '请求失败';
         const err = new Error(`HTTP ${res.status} ${method} ${url}: ${message}`);
         err.response = { status: res.status, data };
@@ -69,7 +77,16 @@ export class ApiClient {
     }
   }
 
-  getTestCase(id) { return this.request('GET', `/testcases/${id}?raw_values=1`); }
+  // 读取用例时兼容瞬时网络失败，避免录制/回放启动阶段因一次超时直接中断。
+  async getTestCase(id) {
+    try {
+      return await this.request('GET', `/testcases/${id}?raw_values=1`, null, { timeoutMs: 30000 });
+    } catch (error) {
+      const message = String(error?.message || '');
+      if (!/请求超时|timeout|network|failed to fetch|fetch failed/i.test(message)) throw error;
+      return this.request('GET', `/testcases/${id}?raw_values=1`, null, { timeoutMs: 30000 });
+    }
+  }
   // 扩展 CDP 回放直接读取 admin 的统一 caseKey，避免在扩展侧重组 CaseDO/StepDO。
   getAdminPlaywrightCase(caseKey, projectEnvironmentId, batchId = '', executionCapability = '') {
     const query = new URLSearchParams();
@@ -158,7 +175,25 @@ export class ApiClient {
   importRecording(payload) {
     return this.request('POST', '/automation/automationUiScene/recordings/import', payload, { timeoutMs: 60000 });
   }
-  createRecordingSession(id, body) { return this.request('POST', `/testcases/${id}/recording-sessions`, body || {}); }
+  getPlan(id) { return this.request('GET', `/plans/${id}`); }
+  savePlanResult(id, result) { return this.request('POST', `/plans/${id}/results`, result, { timeoutMs: 30000 }); }
+  async downloadStepFileAsset(caseId, stepId) {
+    const headers = {};
+    const token = this._getToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`${this.base}/testcases/${caseId}/steps/${stepId}/file-asset/download`, { headers });
+    if (!res.ok) {
+      let message = '下载测试文件失败';
+      try { message = (await res.json())?.message || message; } catch { /* 非 JSON 响应 */ }
+      throw new Error(message);
+    }
+    return {
+      name: decodeURIComponent((res.headers.get('content-disposition') || '').split("filename*=UTF-8''")[1] || 'test-file'),
+      mimeType: res.headers.get('content-type') || 'application/octet-stream',
+      buffer: await res.arrayBuffer(),
+    };
+  }
+  createRecordingSession(id, body) { return this.request('POST', `/testcases/${id}/recording-sessions`, body || {}, { timeoutMs: 30000 }); }
   saveRecordingSessionStep(id, sessionId, body) {
     return this.request('POST', `/testcases/${id}/recording-sessions/${encodeURIComponent(sessionId)}/steps`, body || {});
   }

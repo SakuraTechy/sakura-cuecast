@@ -1,9 +1,10 @@
 {
   "manifest_version": 3,
   "minimum_chrome_version": "125",
-  "name": "CueCast",
-  "version": "1.2.0",
-  "description": "Record and replay web UI test cases with CueCast.",
+  "name": "__MSG_extensionName__",
+  "version": "2.0.3",
+  "description": "__MSG_extensionDescription__",
+  "default_locale": "en",
   "permissions": [
     "activeTab",
     "tabs",
@@ -29,12 +30,19 @@
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     },
-    "default_title": "回演CueCast"
+    "default_title": "__MSG_extensionTitle__"
   },
   "options_page": "options/options.html",
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": [
+        "https://app.icuecast.com/*",
+        "http://app.icuecast.com/*",
+        "https://app.icuecast.ai/*",
+        "http://app.icuecast.ai/*",
+        "http://localhost/*",
+        "http://127.0.0.1/*"
+      ],
       "js": ["content/bridge.js"],
       "run_at": "document_start",
       "all_frames": false

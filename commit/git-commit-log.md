@@ -1,3 +1,1072 @@
+# 2026-10-27 修复 CDP 执行摘要缺少实际命中定位器
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `test/playback-start.test.js`
+- `../sakura-admin-ui/src/views/automation/automationUiScene/execution.ts`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+合并后的 CDP 执行器在点击、输入、选择、按键和悬停等成功分支中虽然计算了 `actualLocator`，但没有将它回传给主回放循环；断言专用分支也丢失了成功断言的实际定位器。主循环因此无法写入 `locator_source/locator_type/locator_value`，执行摘要只能显示配置候选。Admin 分层详情合并逻辑同时未将 `locator_diagnostics.selected` 的来源和类型映射到展示行，导致即使诊断已返回，页面也无法正确标记实际命中。
+
+## 变更内容
+
+- 主回放循环统一接收 CDP 直接返回的定位对象和 `{ locator }` 结果，并保留条件跳过结果。
+- CDP 点击、输入、选择、按键、悬停结果携带实际定位器；选择步骤补充执行前定位探测；`assert_text` 成功结果保留实际定位器。
+- Admin 分层详情将实际命中定位器的来源、类型和值从 `locator_diagnostics.selected` 映射到步骤模型。
+- 增加 CDP 输入步骤回归测试，确认实际定位器能够从动作结果回传到摘要契约。
+
+## 验证
+
+- `node --check modules/player-manager.js`
+- `node --check test/playback-start.test.js`
+- `node --test test/playback-start.test.js`
+- `git diff --check`
+- `sakura-admin-ui` 前端类型检查/构建
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+-                executionOutcome = await this._executeStepCDP(playTabId, executableStep, targetUrl, ctx.locale, runtimeNextStep, {
++                const cdpResult = await this._executeStepCDP(playTabId, executableStep, targetUrl, ctx.locale, runtimeNextStep, {
+                   beforeActionScreenshot: captureCurrentStep,
+                 });
++                executionOutcome = cdpResult;
++                const returnedLocator = cdpResult?.locator
++                  || (cdpResult?.source ? cdpResult : null);
++                if (returnedLocator && typeof returnedLocator === 'object') {
++                  actualLocator = returnedLocator;
++                }
++                if (cdpResult?.__cdpStepResult) stepExecutionResult = cdpResult;
+```
+
+```diff
+             } else if (String(executableStep.action_type || '').trim().toLowerCase() === 'assert_text' && cdpAvailable) {
+               const assertionResult = await this._executeAssertTextStepCDP(playTabId, executableStep, ctx.locale);
++              actualLocator = assertionResult?.source ? assertionResult : null;
+               executionOperationAssertion = assertionResult?.operationAssertion || null;
+```
+
+```diff
+         return {
++          locator: actualLocator,
+           effect: nativeToggle
+@@
+-        return { effect: { mode: 'observe', type: 'input_value', observed: null, expected: PlayerManager._previewRuntimeValue(step.value || '', 240) } };
++        return {
++          locator: actualLocator,
++          effect: { mode: 'observe', type: 'input_value', observed: null, expected: PlayerManager._previewRuntimeValue(step.value || '', 240) },
++        };
+```
+
+### `test/playback-start.test.js`
+
+```diff
++test('CDP action results retain the actual locator for the playback summary', async () => {
++  const player = new PlayerManager({}, {});
++  player._validateStepXpathsCDP = async () => {};
++  player._getElementBoxResult = async () => ({
++    ok: true,
++    box: { via: 'meta-css_fallback' },
++  });
++  player._throwIfPageError = async () => {};
++  player._setInputValueCDP = async () => {};
++  player._getEffectiveWaitTimeout = () => 1;
++  player._sleep = async () => {};
++
++  const result = await player._executeStepCDP(1, {
++    action_type: 'input',
++    target_selector: '#name',
++    locator_meta: {
++      candidates: [{ type: 'css_fallback', value: '#name', score: 0.72 }],
++    },
++    value: 'Sakura',
++  });
++
++  assert.equal(result.locator.source, 'locator_meta.candidates[0]');
++  assert.equal(result.locator.type, 'css_fallback');
++  assert.equal(result.locator.value, '#name');
++  assert.equal(result.locator.matchedCount, 1);
++});
+```
+
+### `../sakura-admin-ui/src/views/automation/automationUiScene/execution.ts`
+
+```diff
+   })).filter(item => item.type && item.value)
+-  step.locatorValue = detail.locatorValue || stringValue(selected.effective_target || selected.value) || step.locatorValue || '-'
++  const selectedSource = stringValue(
++    selected.source || selected.locator_source || selected.locatorSource
++      || diagnostics.actual_locator_source || diagnostics.actualLocatorSource
++      || diagnostics.locator_source || diagnostics.locatorSource,
++  )
++  const selectedType = stringValue(
++    selected.type || selected.locator_type || selected.locatorType
++      || diagnostics.actual_locator_type || diagnostics.actualLocatorType
++      || diagnostics.locator_type || diagnostics.locatorType,
++  )
++  const selectedValue = detail.locatorValue || stringValue(selected.effective_target || selected.value)
++  step.locatorSource = selectedSource || step.locatorSource || '-'
++  step.locatorType = selectedType || step.locatorType || '-'
++  step.locatorValue = selectedValue || step.locatorValue || '-'
+@@
+-  step.hasActualLocator = step.hasActualLocator || Boolean(step.locatorValue && step.locatorValue !== '-')
++  step.hasActualLocator = step.hasActualLocator || Boolean(
++    selectedSource
++      || (step.locatorValue !== '-' && (step.locatorSource !== '-' || step.locatorType !== '-')),
++  )
+```
+
+---
+
+# 2026-10-27 修复 CDP 执行摘要候选策略缺少 collection_item
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `test/playback-start.test.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+合并后的 CDP 诊断只返回候选数量，没有返回完整的 `configured_locators`；admin-ui 因此退回执行记录中的旧候选投影，导致“元素定位 · 候选策略”缺少 `collection_item`，候选顺序和实际命中定位器也与录制结果不一致。部分历史步骤还只在 `context.collection_item_identity.semantic_config` 中保存了集合语义配置，执行器会错误退回 CSS/XPath。
+
+## 变更内容
+
+- CDP `locator_diagnostics` 返回完整 `configured_locators`，保留 `locator_meta.candidates` 的原始顺序、类型、值和评分。
+- 对缺少显式 `collection_item` 候选但仍保留集合语义上下文的历史步骤，恢复集合候选并让 CDP 定位优先使用它。
+- 保留原始 `locator_meta` 不变；普通 CSS、XPath 以及既有候选仍按原逻辑执行。
+- 增加候选顺序、完整集合语义值和历史上下文恢复回归测试。
+
+## 验证
+
+- `node --check modules/player-manager.js`
+- `node --check test/playback-start.test.js`
+- `node --test test/playback-start.test.js`：5/5 通过
+- `npm test`：136/136 通过
+- `npm run build`：构建成功；保留合并代码既有重复成员和重复键警告
+- `git diff --check`：通过
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+     const locatorMeta = PlayerManager._parseLocatorMetaObject(step?.locator_meta);
+-    const configuredLocators = PlayerManager._normalizeLocatorMetaCandidates(step?.locator_meta);
++    const configuredLocators = (Array.isArray(locatorMeta?.candidates) ? locatorMeta.candidates : [])
++      .map((candidate) => ({
++        type: String(candidate?.type || ''),
++        value: String(candidate?.value || ''),
++        score: Number(candidate?.score),
++      }))
++      .filter((candidate) => candidate.type && candidate.value)
++      .slice(0, 16);
++    const collectionCandidate = PlayerManager._collectionItemCandidate(locatorMeta);
++    if (collectionCandidate && !configuredLocators.some((candidate) => (
++      ['collection_item', 'table_row_semantic'].includes(candidate.type)
++    ))) {
++      configuredLocators.unshift(collectionCandidate);
++    }
+@@
+       configured_candidate_count: configuredLocators.length,
++      configured_locators: configuredLocators.map((candidate) => ({
++        type: candidate.type,
++        value: candidate.value,
++        ...(Number.isFinite(candidate.score) ? { score: candidate.score } : {}),
++      })),
+@@
++  static _collectionItemCandidate(locatorMeta) {
++    const meta = PlayerManager._parseLocatorMetaObject(locatorMeta);
++    const recorded = Array.isArray(meta?.candidates) ? meta.candidates : [];
++    const candidate = recorded.find((item) => ['collection_item', 'table_row_semantic'].includes(String(item?.type || '')));
++    if (candidate?.value) {
++      return {
++        type: String(candidate.type),
++        value: String(candidate.value),
++        score: Number(candidate.score),
++      };
++    }
++    const config = PlayerManager._collectionItemConfig(meta);
++    if (!config) return null;
++    return { type: 'collection_item', value: JSON.stringify(config), score: 0.99 };
++  }
+```
+
+### `test/playback-start.test.js`
+
+```diff
++test('CDP locator diagnostics preserve collection candidates and recorded order', () => {
++  const collectionValue = JSON.stringify({
++    collection: { kind: 'table', root: { framework: 'html', wrapper_index: -1 } },
++    fields: [{ kind: 'item_text', header: '业务对象', value: '编辑' }],
++    recorded_row_index: 0,
++    action: { css: 'td:last-child button', scope: 'descendant' },
++  });
++  const locatorMeta = {
++    candidates: [
++      { type: 'collection_item', value: collectionValue, score: 0.99 },
++      { type: 'css_fallback', value: 'tbody > tr:first-child button', score: 0.72 },
++      { type: 'text_exact_tag', value: 'button::编辑', score: 0.70 },
++      { type: 'text_exact', value: '编辑', score: 0.66 },
++      { type: 'xpath_fallback', value: "//button[normalize-space()='编辑']", score: 0.42 },
++      { type: 'table_cell_xpath', value: '/html/body/table/tbody/tr[1]/td[3]', score: 0.34 },
++      { type: 'table_cell_css', value: 'tbody > tr:nth-of-type(1) > td:nth-of-type(3)', score: 0.33 },
++    ],
++    context: {},
++  };
++  const diagnostics = PlayerManager._buildCdpLocatorDiagnostics(
++    { locator_meta: locatorMeta, target_selector: '', target_xpath: '' },
++    { source: 'locator_meta.candidates[0]', type: 'collection_item', value: collectionValue },
++    'passed',
++    120,
++  );
++  assert.deepEqual(diagnostics.configured_locators.map((candidate) => candidate.type), [
++    'collection_item', 'css_fallback', 'text_exact_tag', 'text_exact',
++    'xpath_fallback', 'table_cell_xpath', 'table_cell_css',
++  ]);
++  assert.equal(diagnostics.configured_candidate_count, 7);
++});
+```
+
+# 2026-10-27 修复合并后 CDP 成功断言摘要缺少判定和实际值
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `test/playback-start.test.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+CDP 元素断言成功时，执行器已经返回 `operationAssertion`，但主回放循环只保留了定位结果，没有把断言诊断写入步骤结果。Admin 因此只能显示执行摘要和断言配置，无法生成“断言判定”区域，也不会显示“实际值”列。
+
+## 变更内容
+
+- 保存 `assert_text` 直接 CDP 执行返回的断言诊断。
+- 从通用 CDP 执行结果中提取 `operationAssertion`，兼容 `result.operationAssertion` 和 `result.locator.operationAssertion`。
+- 成功步骤将断言诊断作为 `operation_assertion` 传入 `appendStepResult`，由统一诊断层生成 `details.operation.outcome.assertion`。
+- 增加成功断言诊断传递契约回归检查。
+
+## 验证
+
+- `node --check modules/player-manager.js`
+- `node --check test/playback-start.test.js`
+- `node --test test/playback-start.test.js`：3/3 通过
+- `npm test`：134/134 通过
+- `npm run build`：构建成功（保留合并代码既有重复成员和重复键警告）
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+           const actionType = String(executableStep.action_type || '').trim().toLowerCase();
+           let stepExecutionResult = null;
++          let executionOperationAssertion = null;
+@@
+-              await this._executeAssertTextStepCDP(playTabId, executableStep, ctx.locale);
++              const assertionResult = await this._executeAssertTextStepCDP(playTabId, executableStep, ctx.locale);
++              executionOperationAssertion = assertionResult?.operationAssertion || null;
+@@
++          if (!executionOperationAssertion) {
++            const returnedAssertion = executionOutcome?.operationAssertion || executionOutcome?.locator?.operationAssertion;
++            if (returnedAssertion && typeof returnedAssertion === 'object') {
++              executionOperationAssertion = returnedAssertion;
++            }
++          }
+@@
+           appendStepResult(runtimeStep, i, executionStatus, stepStartedAt, '', actualLocator, null, {
+             ...(stepExecutionResult?.details && typeof stepExecutionResult.details === 'object' ? stepExecutionResult.details : {}),
++            ...(executionOperationAssertion ? { operation_assertion: executionOperationAssertion } : {}),
+```
+
+### `test/playback-start.test.js`
+
+```diff
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
+@@
+ const { PlayerManager } = await import('../modules/player-manager.js');
++const playerManagerSource = readFileSync(new URL('../modules/player-manager.js', import.meta.url), 'utf8');
+@@
++test('CDP assertion results are forwarded into the typed operation diagnostic', () => {
++  assert.match(playerManagerSource, /let executionOperationAssertion = null;/);
++  assert.match(playerManagerSource, /const assertionResult = await this\._executeAssertTextStepCDP\(/);
++  assert.match(playerManagerSource, /const returnedAssertion = executionOutcome\?\.operationAssertion \|\| executionOutcome\?\.locator\?\.operationAssertion/);
++  assert.match(playerManagerSource, /\.\.\.\(executionOperationAssertion \? \{ operation_assertion: executionOperationAssertion \} : \{\}\)/);
++});
+```
+
+---
+
+# 2026-10-27 修复元素断言报 evaluation 初始化前访问
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `content/player.js`
+- `test/playback-start.test.js`
+- `test/content-player-script.test.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+合并后的元素断言分支已经计算了 `actual` 和 `hit`，但失败处理仍引用未在该分支初始化的 `evaluation`。CDP 执行 `assert_element_match` 时，元素值不匹配会先触发 `Cannot access 'evaluation' before initialization`，掩盖真实断言结果。
+
+## 变更内容
+
+- CDP 元素断言失败处理改用当前分支已计算的 `actual`。
+- content-script 元素断言的日志、调试回传和失败处理统一改用 `actual`/`hit`。
+- content-script 等待过程保留命中的元素引用，读取断言值时不再访问未定义的 `el`。
+- 增加 CDP 元素断言不匹配回归测试，确认返回真实断言信息而不是 TDZ 错误。
+- 增加 content-script 元素断言静态回归检查，锁定元素引用和比较结果来源。
+
+## 验证
+
+- `node --check modules/player-manager.js`
+- `node --check content/player.js`
+- `node --check test/playback-start.test.js`
+- `node --check test/content-player-script.test.js`
+- `node --test test/playback-start.test.js`：2/2 通过
+- `npm test`：133/133 通过
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+           match: assertion.match,
+           expected,
+-          actual: evaluation.actual,
++          actual,
+           css: step.target_selector || '',
+           xpath: step.target_xpath || '',
+           actualLocator,
+```
+
+### `content/player.js`
+
+```diff
+             let lastActual = '';
++            let lastElement = null;
+@@
+-          const readResult = getElementAssertionValue(el, assertion.readMode, assertion.attribute);
++          const readResult = getElementAssertionValue(evaluation.element, assertion.readMode, assertion.attribute);
+@@
+             expected.length,
+             '字 / 实际',
+-            evaluation.actual.length,
++            actual.length,
+             '字 / 匹配',
+-            evaluation.hit,
++            hit,
+@@
+-          if (!evaluation.hit) {
++          if (!hit) {
+             throw new Error(formatAssertionFailure({
+@@
+-              actual: evaluation.actual,
++              actual,
+```
+
+### `test/playback-start.test.js`
+
+```diff
++test('CDP element assertion reports the actual value instead of a temporal-dead-zone error', async () => {
++  const player = new PlayerManager({}, {});
++  player._waitForElementAssertionCDP = async () => ({
++    via: 'css',
++    matched_count: 1,
++    visible_count: 1,
++    value: 'actual text',
++    attribute_present: true,
++  });
++  player._logAssertTextCdpDebug = () => {};
++
++  await assert.rejects(
++    () => player._executeAssertTextStepCDP(1, {
++      action_type: 'assert_element_match',
++      target_selector: '#target',
++      match_mode: 'contains',
++      expect: 'missing text',
++    }, 'en_US'),
++    (error) => {
++      assert.equal(error?.operationAssertion?.actual?.preview, 'actual text');
++      assert.equal(String(error?.message || '').includes("Cannot access 'evaluation' before initialization"), false);
++      return true;
++    },
++  );
++});
+```
+
+### `test/content-player-script.test.js`
+
+```diff
++test('element assertions use the retained element and local comparison result', () => {
++  const start = source.indexOf("if (assertion.target === 'element')");
++  const end = source.indexOf('// 未填选择器', start);
++  const elementAssertion = source.slice(start, end);
++
++  assert.match(elementAssertion, /getElementAssertionValue\\(evaluation\\.element,/);
++  assert.doesNotMatch(elementAssertion, /getElementAssertionValue\\(el,/);
++  assert.doesNotMatch(elementAssertion, /evaluation\\.(actual|hit)/);
++});
+```
+
+---
+
+# 2026-10-26 修复合并后 CDP 回放启动时报 i is not defined
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `test/playback-start.test.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+合并官方 v2.0.3 后，回放初始化代码在步骤循环外误插入了 `ctx.stepIndex = i`。CDP 回放尚未进入首个步骤时就访问了未定义的循环变量 `i`，因此立即失败并显示 `i is not defined`。
+
+## 变更内容
+
+- 删除步骤循环外的错误 `ctx.stepIndex = i`。
+- 保留步骤循环内部已有的步骤索引赋值，运行中的进度和诊断数据不变。
+- 增加最小 Admin CDP 回放启动回归测试，覆盖无浏览器启动模式和零等待步骤。
+
+## 验证
+
+- `node --check modules/player-manager.js`
+- `node --check test/playback-start.test.js`
+- `node --test test/playback-start.test.js`：1/1 通过
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+       const tabLoadTimeoutMs = ctx.playbackPurpose === 'record_context_prepare'
+         ? RECORD_CONTEXT_PREPARE_TIMEOUT_MS
+         : DEFAULT_TAB_LOAD_TIMEOUT_MS;
+-
+-          ctx.stepIndex = i;
+       let cdpAvailable = false;
+```
+
+### `test/playback-start.test.js`
+
+```diff
++test('CDP playback starts without referencing the step loop index during initialization', async () => {
++  const result = await player.start('case-1', '', {
++    adminCaseKey: 'case-1',
++    batchId: 'batch-1',
++    dataSource: 'admin',
++    executionId: 'run-1',
++    keepTabOpenAfterPlayback: true,
++    suppressResultSave: true,
++  });
++
++  assert.equal(result.ok, true, result.error);
++});
+```
+
+---
+
+# 2026-10-26 修复录制 API 自定义前缀导致的 invalid_api_base
+
+## 涉及文件
+
+- `background.js`
+- `test/platform-config.test.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+Admin 开发/测试环境可能通过 `/dev-api`、`/test-api` 等 API 前缀代理请求。扩展此前只接受 `/` 或 `/api`，导致合法录制请求仍被返回 `invalid_api_base`。
+
+## 变更内容
+
+- 保留同协议、同主机及 API base 路径前缀，支持 `/api`、`/dev-api`、`/test-api` 和部署自定义前缀。
+- 继续拒绝不同主机、不同协议、凭据、查询参数和哈希。
+- 增加 `/dev-api`、跨主机、跨协议及查询参数回归测试。
+
+## 验证
+
+- `node --check background.js`
+- `node --check test/platform-config.test.js`
+- `node --test test/platform-config.test.js`：3/3 通过
+- `npm test`：130/130 通过
+
+## 具体代码改动
+
+### `background.js`
+
+```diff
+-    // Admin 前端与 API 可能使用不同端口，但必须保持同协议和主机并归一化。
++    // Admin 可能使用 /api、/dev-api 或部署自定义前缀，保留完整 API base 路径。
+     const normalizedPath = apiUrl.pathname.replace(/\/+$/, '') || '/';
+     if (
+-      || !['/', '/api'].includes(normalizedPath)
+       || apiUrl.username
+@@
+-    return normalizedPath === '/' ? apiUrl.origin : `${apiUrl.origin}/api`;
++    return normalizedPath === '/' ? apiUrl.origin : `${apiUrl.origin}${normalizedPath}`;
+```
+
+### `test/platform-config.test.js`
+
+```diff
++    resolvePlatformApiBase('http://172.19.5.51:22/automation', 'http://172.19.5.51:22/automation'),
++    '',
++    resolvePlatformApiBase('/dev-api', 'http://172.19.5.51:22/automation'),
++    'http://172.19.5.51:22/dev-api',
++  assert.equal(
++    resolvePlatformApiBase('http://172.19.5.51:8000/dev-api?x=1', 'http://172.19.5.51:22/automation'),
++    '',
+```
+
+---
+
+# 2026-10-26 再次修复录制时 invalid_api_base
+
+## 涉及文件
+
+- `background.js`
+- `test/platform-config.test.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+前一版已兼容页面同源根地址和 `/api` 地址，但实际部署中 Admin 前端与 API 使用同一主机的不同端口（例如 `:22` 与 `:8000`），严格的 origin 比较仍会返回 `invalid_api_base`。
+
+## 变更内容
+
+- 允许同协议、同主机、不同端口的 API 地址。
+- 继续拒绝不同主机、不同协议、非法路径、查询参数和哈希，保留来源信任校验。
+- 增加跨端口允许、跨主机拒绝、跨协议拒绝的回归测试。
+
+## 验证
+
+- `node --check background.js`
+- `node --check test/platform-config.test.js`
+- `node --test test/platform-config.test.js`：3/3 通过
+- `npm test`：130/130 通过
+
+## 具体代码改动
+
+### `background.js`
+
+```diff
+-    // Admin 录制契约同时存在根地址和 /api 地址，必须保持同源并归一化。
++    const sender = new URL(senderUrl);
++    // Admin 前端与 API 可能使用不同端口，但必须保持同协议和主机并归一化。
+     const normalizedPath = apiUrl.pathname.replace(/\/+$/, '') || '/';
+     if (
+-      apiUrl.origin !== senderOrigin
++      !(
++        apiUrl.origin === senderOrigin
++        || (apiUrl.protocol === sender.protocol && apiUrl.hostname === sender.hostname)
++      )
+       || !['/', '/api'].includes(normalizedPath)
+       || apiUrl.username
+```
+
+### `test/platform-config.test.js`
+
+```diff
++  assert.equal(
++    resolvePlatformApiBase('http://172.19.5.51:8000/api', 'http://172.19.5.51:22/automation'),
++    'http://172.19.5.51:8000/api',
++  );
++  assert.equal(
++    resolvePlatformApiBase('http://172.19.5.52:8000/api', 'http://172.19.5.51:22/automation'),
++    '',
++  );
++  assert.equal(
++    resolvePlatformApiBase('https://172.19.5.51:8000/api', 'http://172.19.5.51:22/automation'),
++    '',
++  );
+```
+
+---
+
+# 2026-10-26 修复录制时 invalid_api_base
+
+## 涉及文件
+
+- `background.js`
+- `test/platform-config.test.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+合并 v2.0.3 后，扩展将中台传入的 `apiBase` 限制为同源 `/api` 路径。现有 Admin 录制契约也允许传入同源根地址，例如 `http://172.19.5.51:22`，开始录制时因此被扩展直接拒绝并返回 `invalid_api_base`。
+
+## 变更内容
+
+- 允许同源根地址、`/api` 地址及其尾斜杠形式，并统一返回无尾斜杠地址。
+- 继续拒绝跨域地址、用户名密码、查询参数、哈希和其他路径，保留平台来源校验。
+- 增加根地址、`/api/` 和非法路径的回归测试。
+
+## 验证
+
+- `node --check background.js`
+- `node --check test/platform-config.test.js`
+- `node --test test/platform-config.test.js`：3/3 通过
+- `npm test`：130/130 通过
+
+## 具体代码改动
+
+### `background.js`
+
+```diff
+     const senderOrigin = new URL(senderUrl).origin;
+     const apiUrl = new URL(String(input || '/api'), `${senderOrigin}/`);
++    // Admin 录制契约同时存在根地址和 /api 地址，必须保持同源并归一化。
++    const normalizedPath = apiUrl.pathname.replace(/\/+$/, '') || '/';
+     if (
+       apiUrl.origin !== senderOrigin
+-      || apiUrl.pathname !== '/api'
++      || !['/', '/api'].includes(normalizedPath)
+       || apiUrl.username
+@@
+-    return apiUrl.href.replace(/\/$/, '');
++    return normalizedPath === '/' ? apiUrl.origin : `${apiUrl.origin}/api`;
+```
+
+### `test/platform-config.test.js`
+
+```diff
++test('background accepts same-origin root and /api platform bases', () => {
++  const source = fs.readFileSync(path.join(root, 'background.js'), 'utf8').replace(/\r\n/g, '\n');
++  const start = source.indexOf('function resolvePlatformApiBase(');
++  const end = source.indexOf('\n}\n\nconst state =', start) + 2;
++  assert.equal(resolvePlatformApiBase('http://172.19.5.51:22', 'http://172.19.5.51:22/automation'), 'http://172.19.5.51:22');
++  assert.equal(resolvePlatformApiBase('http://172.19.5.51:22/api/', 'http://172.19.5.51:22/automation'), 'http://172.19.5.51:22/api');
++});
+```
+
+---
+
+# 2026-10-26 合并官方 v2.0.3 并解决冲突
+
+## 涉及文件
+
+- 官方 v2.0.3 合并涉及的全部文本文件，包括 `background.js`、内容脚本、播放器/录制器、Popup、API 客户端、Runner/性能模块、构建配置、本地化资源和测试文件。
+- `modules/player-manager.js`、`modules/api-client.js`、`commit/git-commit-log.md`。
+
+## 变更原因
+
+本地 `dev` 分支已包含录制会话、Admin 中台回放、CDP 条件点击、日期变量、基础设施步骤和兼容性诊断；官方 v2.0.3 同时引入国际化、Runner、性能诊断、窗口管理和增强定位能力。两者均从 v1.2.0 分叉，不能整文件取单侧版本。本次按三方差异合并，保留两侧能力并修复自动合并产生的重复方法、括号边界和旧测试桩兼容问题。
+
+## 变更内容
+
+- 保留本地证书错误处理、Admin 执行诊断、原始录制兼容、条件点击、日期变量和标签页清理逻辑。
+- 合并官方可见页面模拟、网络诊断、文件选择器拦截、定位性能分段、树/浮层定位、点击管线、国际化和 Runner 能力。
+- 保持 `playwright_step`、`locator_meta` 和 Admin 主数据链路不变。
+- `ApiClient` 同时兼容标准 Fetch `text()` 响应和测试/旧实现的 `json()` 响应；无 `ok` 字段的成功 envelope 按成功处理。
+- XPath 预检在没有 CDP 调试 API 时跳过，以便继续走既有 DOM 降级路径。
+- 浮层定位先尝试已出现的选项，再等待容器，避免已可操作目标被无关 Loading 阻塞。
+- 合并同名标签页清理实现，复用标签页只保留根页并清理新打开的后代页。
+
+## 验证
+
+```powershell
+node --check background.js; node --check content/bridge.js; node --check content/player.js; node --check content/recorder.js
+node --check modules/api-client.js; node --check modules/player-manager.js; node --check modules/recorder-manager.js; node --check popup/popup.js
+npm test
+```
+
+结果：129 个测试全部通过；JavaScript 语法检查、JSON/Manifest 解析和 `git diff --check` 全部通过。
+
+## 具体代码改动
+
+### `README.md`
+
+```diff
+-# 回演 - Chrome 插件
++# 回演 CueCast - Chrome 扩展
+```
+
+### `_locales/en/messages.json`
+
+```diff
++{
++  "extensionName": {
+```
+
+### `_locales/zh_CN/messages.json`
+
+```diff
++{
++  "extensionName": {
+```
+
+### `background.js`
+
+```diff
++import { RunnerWindowRegistry } from './modules/runner-windows.js';
++import { runExecutionPlan } from './modules/plan-runner.js';
+```
+
+### `build.mjs`
+
+```diff
++import { build } from 'esbuild';
++import { cp, mkdir, rm, access } from 'node:fs/promises';
+```
+
+### `content/bridge.js`
+
+```diff
++  function isTrustedPlatformLocation() {
++    return window.location.protocol === 'http:' || window.location.protocol === 'https:';
+```
+
+### `content/player.js`
+
+```diff
++  function pushUnique(list, value) {
++    if (value && !list.includes(value)) list.push(value);
+```
+
+### `content/recorder.js`
+
+```diff
++  let currentLocale = String(chrome.i18n?.getUILanguage?.() || '').toLowerCase().startsWith('zh') ? 'zh' : 'en';
++  function normalizeLocale(locale) {
+```
+
+### `manifest.json`
+
+```diff
+-  "name": "CueCast",
+-  "version": "1.2.0",
++  "name": "__MSG_extensionName__",
++  "version": "2.0.3",
+```
+
+### `modules/agent-recording-browser.js`
+
+```diff
++const AGENT_REF_ATTRIBUTE = 'data-cuecast-agent-ref';
++async function executeInTab(tabId, func, args = []) {
+```
+
+### `modules/api-client.js`
+
+```diff
+-      const text = await res.text();
++      let text = '';
++      if (typeof res.text === 'function') {
+```
+
+### `modules/incognito.js`
+
+```diff
++export async function inspectIncognitoAvailability() {
++  const allowed = await new Promise((resolve) => {
+```
+
+### `modules/plan-runner.js`
+
+```diff
++function flag(value, fallback = false) {
++  if (value == null) return fallback;
+```
+
+### `modules/playback-perf.js`
+
+```diff
++// Opt-in developer trace. Keep only timings and bounded, sanitized state:
++// no URLs, selectors, values, screenshots, or response payloads belong here.
+```
+
+### `modules/playback-window.js`
+
+```diff
++// Maximize background playback windows when Chrome permits it. A window-size
++// preference must not prevent a case from starting or steal another app's focus.
+```
+
+### `modules/player-manager.js`
+
+```diff
+-  return raw.startsWith('en') ? 'en' : 'zh';
++  return raw.startsWith('zh') ? 'zh' : 'en';
+```
+
+### `modules/recorder-manager.js`
+
+```diff
++import { inspectIncognitoAvailability } from './incognito.js';
++const RECORD_TAB_LOAD_TIMEOUT_MS = 90000;
+```
+
+### `modules/runner-run-context.js`
+
+```diff
++export class RunnerRunContext {
++  constructor(config, onInvalidate) {
+```
+
+### `modules/runner-windows.js`
+
+```diff
++const STORAGE_KEY = 'cc-runner-active-windows-v1';
++export class RunnerWindowRegistry {
+```
+
+### `package-lock.json`
+
+```diff
++{
++  "name": "cuecast-extension-build",
+```
+
+### `package.json`
+
+```diff
++{
++  "name": "cuecast-extension-build",
+```
+
+### `package.sh`
+
+```diff
++#!/usr/bin/env bash
++set -euo pipefail
+```
+
+### `popup/popup.css`
+
+```diff
+-  --font: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
++  --font: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+```
+
+### `popup/popup.html`
+
+```diff
+-  <link rel="preconnect" href="https://fonts.googleapis.com">
+-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+```
+
+### `popup/popup.js`
+
+```diff
+-const SETTINGS_KEY = 'cuecastSettings';
+-const DEFAULT_SETTINGS = {
+```
+
+### `test/agent-recording-browser.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/api-client.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/collection-fixed-panes.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/content-player-script.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/plan-runner.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/platform-config.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/playback-focus.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/playback-perf.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/playback-wait.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/playback-window.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/recorder-collection-default.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/recorder-hover.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/recorder-sensitive-input.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/recorder-toggle-state.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/runner-run-context.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/runner-windows.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/toggle-observation.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+### `test/upload-file-playback.test.js`
+
+```diff
++import test from 'node:test';
++import assert from 'node:assert/strict';
+```
+
+---
+
+# 2026-09-22 增加日期全局变量的 script 计算偏移兼容
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `tests/operation-contract.test.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+Admin 日期全局操作新增了旧版 `web-setdate` 使用的 `script` 日期偏移表达式。CueCast 回放此前只读取数字 `offset_seconds`，无法执行 `60*60*24*7` 等合法计算配置。
+
+## 变更内容
+
+- 日期全局变量优先读取 `script`，使用受限算术表达式计算秒数，禁止执行任意 JavaScript。
+- 更新目录字段数量契约测试，覆盖新增日期计算字段。
+
+## 验证
+
+- `node --check modules/player-manager.js`
+- `node --test tests/operation-contract.test.js`：24 个测试通过。
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+@@
+-      const offsetSeconds = Number(step?.offset_seconds ?? 0);
+-      if (!Number.isFinite(offsetSeconds)) throw new Error('offset_seconds 必须是有效数字');
++      const offsetExpression = step?.script ?? step?.offset_seconds ?? 0;
++      const offsetSeconds = evaluateArithmeticExpression(offsetExpression, variableContext);
+```
+
+### `tests/operation-contract.test.js`
+
+```diff
+@@
+-  assert.equal(fieldCount, 137);
++  assert.equal(fieldCount, 148);
+```
+
+---
+
+# 2026-09-22 支持日期 script 引用全局变量
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+日期偏移脚本需要支持 `60*60*24*{{date}}` 这类由前序步骤生成天数的配置。
+
+## 变更内容
+
+CueCast 日期变量执行改为通过当前 `variableContext` 解析 `${name}` / `{{name}}` 后再执行受限算术表达式。
+
+## 验证
+
+`node --test tests/operation-contract.test.js`：24 个测试通过。
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+@@
+-      const offsetSeconds = evaluateArithmeticExpression(offsetExpression);
++      const offsetSeconds = evaluateArithmeticExpression(offsetExpression, variableContext);
+```
+
+---
+
 # 2026-09-13 修复 AI 变量提取和视觉识别接口超时问题
 
 ## 涉及文件
@@ -49,7 +1118,6 @@ AI 推理时间（尤其是复杂模型如 gpt-5.6-luna）通常需要 60-100 �
 ```
 
 ---
-
 # 2026-09-13 DOM 属性降级策略扩展（支持 src/href/checked/disabled/readonly/selected/aria-*）
 
 ## 涉及文件
@@ -175,6 +1243,52 @@ node --check modules/player-manager.js
 +    action_type: 'assert_text', expect: dataUrl, value: '',
 +    locator_meta: { context: { assertion: { source: 'attribute', attribute: 'src', preview: dataUrl } } },
 +  };
++  assert.equal(PlayerManager._adaptRecordedStep(step).expect, dataUrl);
++  assert.equal(PlayerManager._resolveAssertionExpectedValue({ ...step, expect: '' }), dataUrl);
++});
+```
+
+# 2026-09-11 CDP 与 Playwright Runner 图片属性断言期望值恢复修复
+
+## 涉及文件
+
+- `modules/player-manager.js`
+- `tests/operation-contract.test.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+录制的图片 `src` 断言将完整 data URL 保存在 `expect`。当兼容字段 `value` 为空时，CDP 未继续读取录制元数据的断言预览，导致统一元素属性断言的期望值丢失；空字符串“包含”断言还可能产生误通过。
+
+## 验证
+
+```powershell
+node --experimental-default-type=module --test tests/operation-contract.test.js tests/cuecast-recording-compatibility.test.js
+node --check modules/player-manager.js
+```
+
+结果：待本次修改后执行。
+
+## 具体代码改动
+
+### `modules/player-manager.js`
+
+```diff
+@@
+-        expect: matchMode === 'visible' ? '' : String(step.expect ?? step.value ?? ''),
++        expect: matchMode === 'visible' ? '' : PlayerManager._resolveAssertionExpectedValue(step),
+@@
+-    const expectedValue = step.expect ?? step.value;
+-    const expected = expectedValue != null ? String(expectedValue) : '';
++    const expected = PlayerManager._resolveAssertionExpectedValue(step);
+```
+
+### `tests/operation-contract.test.js`
+
+```diff
+@@
++test('CueCast 属性断言优先使用 expect 并兼容录制元数据预览', () => {
++  const dataUrl = `data:image/jpg;base64,${'a'.repeat(2048)}`;
 +  assert.equal(PlayerManager._adaptRecordedStep(step).expect, dataUrl);
 +  assert.equal(PlayerManager._resolveAssertionExpectedValue({ ...step, expect: '' }), dataUrl);
 +});
@@ -6747,6 +7861,67 @@ v1.2.0 录制数据仍保留 `set_variable`、`assert_text` 等原始 action，�
 +});
 ```
 
+# 2026-08-06 CueCast 补齐目录参数的统一执行详情
+
+## 涉及文件
+
+- modules/operation-diagnostics.js
+- tests/operation-contract.test.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. 将目录中变量操作的读取模式、正则替换、日期时间、时间戳单位、计算尾零策略等参数加入统一执行详情。
+2. 让 CueCast 详情字段与 Admin `automation-operation-catalog.json` 的参数定义保持一致，便于手动添加和录制步骤使用相同展示模型。
+3. 增加目录参数完整性契约测试，确认日期变量的全部参数进入步骤详情。
+
+## 验证
+
+- `node --check modules/operation-diagnostics.js`：通过。
+- `node --experimental-default-type=module --test tests/operation-contract.test.js`：待本轮执行。
+
+## 具体代码改动
+
+### `modules/operation-diagnostics.js`
+
+```diff
+@@
+-  'property_key', 'expression', 'scale', 'timeout_ms', 'sql', 'command', 'script',
++  'property_key', 'expression', 'scale', 'timeout_ms', 'sql', 'command', 'script', 'read_mode',
++  'regex_group', 'replace_from', 'replace_to', 'datetime', 'offset_seconds', 'timestamp_unit',
++  'keep_trailing_zeros',
+ ]);
+```
+
+### `tests/operation-contract.test.js`
+
+```diff
+@@
+ test('CueCast execution result adds the shared operation detail without exposing restricted input', () => {
+@@
+ });
++
++test('CueCast 目录参数完整进入变量执行详情', () => {
++  const result = attachOperationDiagnostic(
++    { action_type: 'global_variable_date', status: 'passed' },
++    {
++      method_code: 'global.variable.date',
++      action_type: 'global_variable_date',
++      variable_name: 'run.date',
++      date_mode: 'offset',
++      format: 'yyyy-MM-dd',
++      datetime: '2026-08-06T00:00:00+08:00',
++      offset_seconds: 60,
++      timestamp_unit: 'second',
++    },
++  );
++  assert.deepEqual(
++    result.details.operation.inputs.map((item) => item.key),
++    ['variable_name', 'format', 'date_mode', 'datetime', 'offset_seconds', 'timestamp_unit'],
++  );
++});
+```
+
 # 2026-08-04 CueCast 批次冻结配置单一事实源
 
 ## 涉及文件
@@ -7591,6 +8766,82 @@ node --experimental-default-type=module --input-type=module -e "import { Cuecast
 + if (isCuecastLocalVariableAction(actionType)) {
 +   await this._executeLocalVariableAction(playTabId, executableStep, variableContext);
 + }
+```
+
+# 2026-07-31 CueCast 基础设施变量绑定与高权限动作扩展
+
+## 涉及文件
+
+- modules/canonical-action-registry.js
+- modules/variable-context.js
+- modules/player-manager.js
+- commit/git-commit-log.md
+
+## 变更内容
+
+1. 将 `host_command`、`host_file_lookup`、`host_file_delete`、`server_file_upload` 明确登记为 `admin_infrastructure`，不会落入 CDP 或内容脚本。
+2. 每次回放变量上下文新增步骤引用扫描和 `runtimeBindings` 生成；基础设施任务只携带当前冻结步骤实际引用的根变量。
+3. 文件查询、数据库查询和系统/IP 步骤在 Admin 返回显式变量结果时写回当前回放变量上下文；任务结果不会写入扩展存储或回放报告。
+
+## 修改原因
+
+浏览器回放端不能把已经解析出的变量值直接拼进命令、SQL 或文件配置，也不能把本机/服务器动作误当作 CDP 操作。此次补齐与 Playwright Runner 相同的“一次性绑定、后端冻结步骤解析、用例内存变量回写”边界。
+
+## 验证
+
+已执行：
+
+```powershell
+node --check modules/canonical-action-registry.js
+node --check modules/variable-context.js
+node --check modules/player-manager.js
+node --experimental-default-type=module --input-type=module -e "import { CuecastVariableContext } from './modules/variable-context.js'; const variables = new CuecastVariableContext({ rows: [{ id: '7' }] }); const reference = String.fromCharCode(36) + '{rows[0].id}'; const bindings = variables.bindingsForStep({ sql: reference }); if (bindings.rows[0].id !== '7') process.exit(1);"
+```
+
+结果：三个模块语法检查通过；嵌套变量引用能只生成根变量绑定。
+
+## 具体代码改动
+
+### `modules/canonical-action-registry.js`
+
+```diff
+   { actionType: 'database_native', route: 'admin_infrastructure' },
++  { actionType: 'host_command', route: 'admin_infrastructure' },
++  { actionType: 'host_file_lookup', route: 'admin_infrastructure' },
++  { actionType: 'host_file_delete', route: 'admin_infrastructure' },
++  { actionType: 'server_file_upload', route: 'admin_infrastructure' },
+ ].map((entry) => Object.freeze(entry)));
+```
+
+### `modules/variable-context.js`
+
+```diff
+   resolveStep(step) {
+     return resolveRuntimeValue(step, this, true);
+   }
++
++  bindingsForStep(step) {
++    const bindings = {};
++    for (const reference of this.referencesInStep(step)) {
++      const { root } = this._parseReference(reference);
++      bindings[root] = this.get(root);
++    }
++    return bindings;
++  }
+```
+
+### `modules/player-manager.js`
+
+```diff
+   if (isInfrastructureStep(executableStep)) {
+     const infrastructureResult = await this._executeInfrastructureStep(sourceCaseKey, executableStep, {
+       projectEnvironmentId: executionSnapshot.project_environment_id,
++      runtimeBindings: variableContext.bindingsForStep(step),
+     });
+   }
++  ...(options.runtimeBindings && Object.keys(options.runtimeBindings).length > 0
++    ? { runtimeBindings: options.runtimeBindings }
++    : {}),
 ```
 
 # 2026-07-30 CueCast canonical action 注册表与 Admin 能力握手
@@ -9187,256 +10438,3 @@ node --check modules/recorder-manager.js
 +      saveContext,
      });
 ```
-# 2026-07-31 CueCast 基础设施变量绑定与高权限动作扩展
-
-## 涉及文件
-
-- modules/canonical-action-registry.js
-- modules/variable-context.js
-- modules/player-manager.js
-- commit/git-commit-log.md
-
-## 变更内容
-
-1. 将 `host_command`、`host_file_lookup`、`host_file_delete`、`server_file_upload` 明确登记为 `admin_infrastructure`，不会落入 CDP 或内容脚本。
-2. 每次回放变量上下文新增步骤引用扫描和 `runtimeBindings` 生成；基础设施任务只携带当前冻结步骤实际引用的根变量。
-3. 文件查询、数据库查询和系统/IP 步骤在 Admin 返回显式变量结果时写回当前回放变量上下文；任务结果不会写入扩展存储或回放报告。
-
-## 修改原因
-
-浏览器回放端不能把已经解析出的变量值直接拼进命令、SQL 或文件配置，也不能把本机/服务器动作误当作 CDP 操作。此次补齐与 Playwright Runner 相同的“一次性绑定、后端冻结步骤解析、用例内存变量回写”边界。
-
-## 验证
-
-已执行：
-
-```powershell
-node --check modules/canonical-action-registry.js
-node --check modules/variable-context.js
-node --check modules/player-manager.js
-node --experimental-default-type=module --input-type=module -e "import { CuecastVariableContext } from './modules/variable-context.js'; const variables = new CuecastVariableContext({ rows: [{ id: '7' }] }); const reference = String.fromCharCode(36) + '{rows[0].id}'; const bindings = variables.bindingsForStep({ sql: reference }); if (bindings.rows[0].id !== '7') process.exit(1);"
-```
-
-结果：三个模块语法检查通过；嵌套变量引用能只生成根变量绑定。
-
-## 具体代码改动
-
-### `modules/canonical-action-registry.js`
-
-```diff
-   { actionType: 'database_native', route: 'admin_infrastructure' },
-+  { actionType: 'host_command', route: 'admin_infrastructure' },
-+  { actionType: 'host_file_lookup', route: 'admin_infrastructure' },
-+  { actionType: 'host_file_delete', route: 'admin_infrastructure' },
-+  { actionType: 'server_file_upload', route: 'admin_infrastructure' },
- ].map((entry) => Object.freeze(entry)));
-```
-
-### `modules/variable-context.js`
-
-```diff
-   resolveStep(step) {
-     return resolveRuntimeValue(step, this, true);
-   }
-+
-+  bindingsForStep(step) {
-+    const bindings = {};
-+    for (const reference of this.referencesInStep(step)) {
-+      const { root } = this._parseReference(reference);
-+      bindings[root] = this.get(root);
-+    }
-+    return bindings;
-+  }
-```
-
-### `modules/player-manager.js`
-
-```diff
-   if (isInfrastructureStep(executableStep)) {
-     const infrastructureResult = await this._executeInfrastructureStep(sourceCaseKey, executableStep, {
-       projectEnvironmentId: executionSnapshot.project_environment_id,
-+      runtimeBindings: variableContext.bindingsForStep(step),
-     });
-   }
-+  ...(options.runtimeBindings && Object.keys(options.runtimeBindings).length > 0
-+    ? { runtimeBindings: options.runtimeBindings }
-+    : {}),
-```
-# 2026-08-06 CueCast 补齐目录参数的统一执行详情
-
-## 涉及文件
-
-- modules/operation-diagnostics.js
-- tests/operation-contract.test.js
-- commit/git-commit-log.md
-
-## 变更内容
-
-1. 将目录中变量操作的读取模式、正则替换、日期时间、时间戳单位、计算尾零策略等参数加入统一执行详情。
-2. 让 CueCast 详情字段与 Admin `automation-operation-catalog.json` 的参数定义保持一致，便于手动添加和录制步骤使用相同展示模型。
-3. 增加目录参数完整性契约测试，确认日期变量的全部参数进入步骤详情。
-
-## 验证
-
-- `node --check modules/operation-diagnostics.js`：通过。
-- `node --experimental-default-type=module --test tests/operation-contract.test.js`：待本轮执行。
-
-## 具体代码改动
-
-### `modules/operation-diagnostics.js`
-
-```diff
-@@
--  'property_key', 'expression', 'scale', 'timeout_ms', 'sql', 'command', 'script',
-+  'property_key', 'expression', 'scale', 'timeout_ms', 'sql', 'command', 'script', 'read_mode',
-+  'regex_group', 'replace_from', 'replace_to', 'datetime', 'offset_seconds', 'timestamp_unit',
-+  'keep_trailing_zeros',
- ]);
-```
-
-### `tests/operation-contract.test.js`
-
-```diff
-@@
- test('CueCast execution result adds the shared operation detail without exposing restricted input', () => {
-@@
- });
-+
-+test('CueCast 目录参数完整进入变量执行详情', () => {
-+  const result = attachOperationDiagnostic(
-+    { action_type: 'global_variable_date', status: 'passed' },
-+    {
-+      method_code: 'global.variable.date',
-+      action_type: 'global_variable_date',
-+      variable_name: 'run.date',
-+      date_mode: 'offset',
-+      format: 'yyyy-MM-dd',
-+      datetime: '2026-08-06T00:00:00+08:00',
-+      offset_seconds: 60,
-+      timestamp_unit: 'second',
-+    },
-+  );
-+  assert.deepEqual(
-+    result.details.operation.inputs.map((item) => item.key),
-+    ['variable_name', 'format', 'date_mode', 'datetime', 'offset_seconds', 'timestamp_unit'],
-+  );
-+});
-```
-# 2026-09-11 CDP 与 Playwright Runner 图片属性断言期望值恢复修复
-
-## 涉及文件
-
-- `modules/player-manager.js`
-- `tests/operation-contract.test.js`
-- `commit/git-commit-log.md`
-
-## 变更原因
-
-录制的图片 `src` 断言将完整 data URL 保存在 `expect`。当兼容字段 `value` 为空时，CDP 未继续读取录制元数据的断言预览，导致统一元素属性断言的期望值丢失；空字符串“包含”断言还可能产生误通过。
-
-## 验证
-
-```powershell
-node --experimental-default-type=module --test tests/operation-contract.test.js tests/cuecast-recording-compatibility.test.js
-node --check modules/player-manager.js
-```
-
-结果：待本次修改后执行。
-
-## 具体代码改动
-
-### `modules/player-manager.js`
-
-```diff
-@@
--        expect: matchMode === 'visible' ? '' : String(step.expect ?? step.value ?? ''),
-+        expect: matchMode === 'visible' ? '' : PlayerManager._resolveAssertionExpectedValue(step),
-@@
--    const expectedValue = step.expect ?? step.value;
--    const expected = expectedValue != null ? String(expectedValue) : '';
-+    const expected = PlayerManager._resolveAssertionExpectedValue(step);
-```
-
-### `tests/operation-contract.test.js`
-
-```diff
-@@
-+test('CueCast 属性断言优先使用 expect 并兼容录制元数据预览', () => {
-+  const dataUrl = `data:image/jpg;base64,${'a'.repeat(2048)}`;
-+  assert.equal(PlayerManager._adaptRecordedStep(step).expect, dataUrl);
-+  assert.equal(PlayerManager._resolveAssertionExpectedValue({ ...step, expect: '' }), dataUrl);
-+});
-```
-# 2026-09-22 增加日期全局变量的 script 计算偏移兼容
-
-## 涉及文件
-
-- `modules/player-manager.js`
-- `tests/operation-contract.test.js`
-- `commit/git-commit-log.md`
-
-## 变更原因
-
-Admin 日期全局操作新增了旧版 `web-setdate` 使用的 `script` 日期偏移表达式。CueCast 回放此前只读取数字 `offset_seconds`，无法执行 `60*60*24*7` 等合法计算配置。
-
-## 变更内容
-
-- 日期全局变量优先读取 `script`，使用受限算术表达式计算秒数，禁止执行任意 JavaScript。
-- 更新目录字段数量契约测试，覆盖新增日期计算字段。
-
-## 验证
-
-- `node --check modules/player-manager.js`
-- `node --test tests/operation-contract.test.js`：24 个测试通过。
-
-## 具体代码改动
-
-### `modules/player-manager.js`
-
-```diff
-@@
--      const offsetSeconds = Number(step?.offset_seconds ?? 0);
--      if (!Number.isFinite(offsetSeconds)) throw new Error('offset_seconds 必须是有效数字');
-+      const offsetExpression = step?.script ?? step?.offset_seconds ?? 0;
-+      const offsetSeconds = evaluateArithmeticExpression(offsetExpression, variableContext);
-```
-
-### `tests/operation-contract.test.js`
-
-```diff
-@@
--  assert.equal(fieldCount, 137);
-+  assert.equal(fieldCount, 148);
-```
-
----
-# 2026-09-22 支持日期 script 引用全局变量
-
-## 涉及文件
-
-- `modules/player-manager.js`
-- `commit/git-commit-log.md`
-
-## 变更原因
-
-日期偏移脚本需要支持 `60*60*24*{{date}}` 这类由前序步骤生成天数的配置。
-
-## 变更内容
-
-CueCast 日期变量执行改为通过当前 `variableContext` 解析 `${name}` / `{{name}}` 后再执行受限算术表达式。
-
-## 验证
-
-`node --test tests/operation-contract.test.js`：24 个测试通过。
-
-## 具体代码改动
-
-### `modules/player-manager.js`
-
-```diff
-@@
--      const offsetSeconds = evaluateArithmeticExpression(offsetExpression);
-+      const offsetSeconds = evaluateArithmeticExpression(offsetExpression, variableContext);
-```
-
----

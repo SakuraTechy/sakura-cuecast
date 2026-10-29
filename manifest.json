@@ -36,12 +36,8 @@
   "content_scripts": [
     {
       "matches": [
-        "https://app.icuecast.com/*",
-        "http://app.icuecast.com/*",
-        "https://app.icuecast.ai/*",
-        "http://app.icuecast.ai/*",
-        "http://localhost/*",
-        "http://127.0.0.1/*"
+        "http://*/*",
+        "https://*/*"
       ],
       "js": ["content/bridge.js"],
       "run_at": "document_start",

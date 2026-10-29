@@ -1,3 +1,98 @@
+# 2026-10-28 修复服务器部署页面无法检测扩展
+
+## 涉及文件
+
+- `background.js`
+- `manifest.json`
+- `test/platform-config.test.js`
+- `commit/git-commit-log.md`
+
+## 变更原因
+
+扩展升级后本地 `localhost` 页面可以检测到插件，但服务器页面 `http://172.19.5.228:5183/automation/automationUiScene` 无法检测。原因是 Manifest V3 内容脚本只匹配正式域名、`localhost` 和 `127.0.0.1`，服务器页面没有注入 `content/bridge.js`；后台信任规则也没有覆盖 RFC1918 私网部署地址。
+
+## 变更内容
+
+- 内容脚本匹配 HTTP/HTTPS 页面，使私网服务器页面能够注入桥接脚本。
+- 后台增加 RFC1918 私网 IPv4 判断，支持 `10.0.0.0/8`、`172.16.0.0/12` 和 `192.168.0.0/16` 的 HTTP/HTTPS 部署地址。
+- 保留官方域名、本机地址和显式配置实例的信任逻辑；已保存的本地实例配置不再阻断私网服务器页面。
+- 增加服务器地址、私网边界、公网拒绝和 Manifest 匹配范围回归测试。
+
+## 验证
+
+- `node --check background.js`
+- `node --test test/platform-config.test.js`
+- `npm test`
+- `git diff --check`
+- `npm run build`
+
+## 具体代码改动
+
+### `background.js`
+
+```diff
++function isPrivateIpv4Host(hostname) {
++  const parts = String(hostname || '').split('.');
++  if (parts.length !== 4 || parts.some((part) => !/^\d+$/.test(part))) return false;
++  const octets = parts.map(Number);
++  if (octets.some((part) => part < 0 || part > 255)) return false;
++  return octets[0] === 10
++    || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31)
++    || (octets[0] === 192 && octets[1] === 168);
++}
+@@
+-    if (configuredPlatformOrigin) return url.origin === configuredPlatformOrigin;
++    if (configuredPlatformOrigin && url.origin === configuredPlatformOrigin) return true;
+@@
+-    return url.protocol === 'http:' && (url.hostname === 'localhost' || url.hostname === '127.0.0.1');
++    return (url.protocol === 'http:' || url.protocol === 'https:')
++      && (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || isPrivateIpv4Host(url.hostname));
+```
+
+### `manifest.json`
+
+```diff
+       "matches": [
+-        "https://app.icuecast.com/*",
+-        "http://app.icuecast.com/*",
+-        "https://app.icuecast.ai/*",
+-        "http://app.icuecast.ai/*",
+-        "http://localhost/*",
+-        "http://127.0.0.1/*"
++        "http://*/*",
++        "https://*/*"
+       ],
+```
+
+### `test/platform-config.test.js`
+
+```diff
+ test('background trusts the configured exact origin and dynamically injects the bridge', () => {
+   const source = fs.readFileSync(path.join(root, 'background.js'), 'utf8').replace(/\r\n/g, '\n');
+   assert.match(source, /url\.origin === configuredPlatformOrigin/);
++  assert.match(source, /isPrivateIpv4Host/);
+@@
++test('background trusts private deployment origins but rejects public HTTP origins', () => {
++  const source = fs.readFileSync(path.join(root, 'background.js'), 'utf8').replace(/\r\n/g, '\n');
++  const start = source.indexOf('function isPrivateIpv4Host(');
++  const end = source.indexOf('\n}\n\nasync function loadPlatformConfig', start) + 2;
++  const isTrustedPlatformUrl = new Function(
++    `let configuredPlatformOrigin = '';\n${source.slice(start, end)}; return isTrustedPlatformUrl;`,
++  )();
++  assert.equal(isTrustedPlatformUrl('http://172.19.5.228:5183/automation/automationUiScene'), true);
++  assert.equal(isTrustedPlatformUrl('https://192.168.1.20/automation'), true);
++  assert.equal(isTrustedPlatformUrl('http://172.32.5.228:5183/automation'), false);
++  assert.equal(isTrustedPlatformUrl('https://203.0.113.20/automation'), false);
++});
++
++test('manifest injects the bridge on HTTP and HTTPS deployment pages', () => {
++  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8'));
++  assert.deepEqual(manifest.content_scripts[0].matches, ['http://*/*', 'https://*/*']);
++});
+```
+
+---
+
 # 2026-10-27 修复 CDP 执行摘要缺少实际命中定位器
 
 ## 涉及文件

@@ -32,17 +32,28 @@ function normalizePlatformOrigin(input) {
   }
 }
 
+function isPrivateIpv4Host(hostname) {
+  const parts = String(hostname || '').split('.');
+  if (parts.length !== 4 || parts.some((part) => !/^\d+$/.test(part))) return false;
+  const octets = parts.map(Number);
+  if (octets.some((part) => part < 0 || part > 255)) return false;
+  return octets[0] === 10
+    || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31)
+    || (octets[0] === 192 && octets[1] === 168);
+}
+
 function isTrustedPlatformUrl(input) {
   try {
     const url = new URL(String(input || ''));
-    // 一旦用户显式配置实例，只信任该精确 origin；换址后旧地址立即失效。
-    if (configuredPlatformOrigin) return url.origin === configuredPlatformOrigin;
-    // 支持通过 Hosts 将正式域名映射至本机的 HTTP 调试环境。
+    // 显式配置优先锁定正式实例；私网部署地址允许在同一浏览器中切换，避免旧的本地配置阻断服务器页面。
+    if (configuredPlatformOrigin && url.origin === configuredPlatformOrigin) return true;
+    // 支持通过 Hosts 将正式域名映射至本机的 HTTP 调试环境，以及 RFC1918 私网部署地址。
     if (
       (url.hostname === 'app.icuecast.com' || url.hostname === 'app.icuecast.ai')
       && (url.protocol === 'https:' || url.protocol === 'http:')
     ) return true;
-    return url.protocol === 'http:' && (url.hostname === 'localhost' || url.hostname === '127.0.0.1');
+    return (url.protocol === 'http:' || url.protocol === 'https:')
+      && (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || isPrivateIpv4Host(url.hostname));
   } catch {
     return false;
   }
